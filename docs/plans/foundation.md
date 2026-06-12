@@ -211,6 +211,19 @@ That is a deliberate tradeoff and it is bought back structurally, not by hope:
 - Every slice ends with something that boots, restores, or measures on real
   hardware.
 
+## Current Progress
+
+Slice 0 scaffolding has landed: Zig 0.16.0 pinned via mise, `zig build test`
+green (chunk-id module with BLAKE3 CAS identities and verification tests),
+`spore` CLI stub with `version`/`help`, founding docs (`README.md`,
+`SECURITY.md`, `AGENTS.md`, MIT `LICENSE`, `docs/spore-format.md` stub),
+Buildkite pipeline targeting the `cleanroom` and `cleanroom-mac` queues, and
+the QEMU cross-accelerator experiment designed in `docs/research.md`.
+
+Slice 0 remains open until the QEMU KVM↔HVF experiment has run on real hosts
+and its keep/adjust decision is recorded, and until the pipeline has gone
+green on both queues.
+
 ## Delivery Strategy
 
 Each slice is a reviewable unit with a runnable result. KVM work needs an
