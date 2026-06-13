@@ -117,7 +117,7 @@ test "identity features and mac config" {
     try std.testing.expectEqual(device_id, t.read(0x008));
     try std.testing.expectEqual(@as(u32, @truncate(feature_mac)), t.read(0x010));
     try std.testing.expectEqual(@as(u32, 0x4f_50_53_02), t.read(0x100));
-    try std.testing.expectEqual(@as(u32, 0x0000_4542), t.read(0x104));
+    try std.testing.expectEqual(@as(u32, 0x0000_4552), t.read(0x104));
     try std.testing.expectEqual(@as(u32, 0x0000_0045), t.read(0x105));
 }
 
