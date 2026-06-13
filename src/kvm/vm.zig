@@ -337,10 +337,26 @@ fn initVcpu(vm_fd: std.c.fd_t, vcpu_fd: std.c.fd_t) !void {
     _ = try kvm.ioctl(vm_fd, kvm.KVM_ARM_PREFERRED_TARGET, @intFromPtr(&init), "KVM_ARM_PREFERRED_TARGET");
     setFeature(&init, kvm.KVM_ARM_VCPU_PSCI_0_2);
     _ = try kvm.ioctl(vcpu_fd, kvm.KVM_ARM_VCPU_INIT, @intFromPtr(&init), "KVM_ARM_VCPU_INIT");
+    try maskPortableCpuFeatures(vcpu_fd);
 }
 
 fn setFeature(init: *kvm.VcpuInit, feature: u32) void {
     init.features[feature / 32] |= @as(u32, 1) << @intCast(feature % 32);
+}
+
+fn maskPortableCpuFeatures(vcpu_fd: std.c.fd_t) !void {
+    // KVM exposes the host CPU's RNDR feature on Graviton. Linux then patches
+    // in RNDRRS_EL0 (`MRS S3_3_C2_C4_1`) for entropy, but HVF does not expose
+    // that register to guests. Until the full CPU-profile contract lands, keep
+    // KVM at the common denominator by hiding ID_AA64ISAR0_EL1.RNDR.
+    const id_aa64isar0_el1 = kvm.sysReg(3, 0, 0, 6, 0);
+    const rndr_mask: u64 = @as(u64, 0xf) << 60;
+    const isar0 = try kvm.getOneRegU64(vcpu_fd, id_aa64isar0_el1);
+    const masked = isar0 & ~rndr_mask;
+    if (masked != isar0) {
+        std.log.debug("masking KVM ID_AA64ISAR0_EL1.RNDR for portability: 0x{x} -> 0x{x}", .{ isar0, masked });
+        try kvm.setOneRegU64(vcpu_fd, id_aa64isar0_el1, masked);
+    }
 }
 
 fn handleMmio(

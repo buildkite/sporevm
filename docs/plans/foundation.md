@@ -285,10 +285,13 @@ same shared register subset as KVM, records unsupported offsets, and confirms
 that HVF cannot yet emit a complete portable GIC state because there is no
 line-level getter and several redistributor/distributor offsets are not exposed.
 KVM→HVF now creates HVF's GIC at the manifest's KVM redistributor base and can
-apply portable GICv3 state far enough to resume the ticker workload at tick 6;
-the guest then oopses on an undefined CPU system-register read (`S3_3_C2_C4_1`),
-so the next blocker is CPU feature-ID/profile masking rather than GIC mapping.
-The four-way cross-hypervisor matrix (slice 4) remains next.
+apply portable GICv3 state. KVM masks the Graviton RNDR CPU feature before
+guest boot so Linux no longer patches in `RNDRRS_EL0` (`S3_3_C2_C4_1`), which
+Apple HVF does not expose to guests. With RNDR masked, a KVM snapshot resumes
+on HVF to `sporevm-tick 6`; the remaining observed blocker is virtual-counter
+frequency portability, because a guest booted against KVM's counter frequency
+runs slowly after restore on Apple HVF's 24MHz counter. The four-way
+cross-hypervisor matrix (slice 4) remains next.
 
 ## Delivery Strategy
 
