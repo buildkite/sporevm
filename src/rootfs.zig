@@ -133,7 +133,7 @@ fn parseBuildOptions(allocator: std.mem.Allocator, args: []const []const u8, std
 
     const out = output orelse return error.MissingOutputPath;
     const meta = metadata orelse try std.fmt.allocPrint(allocator, "{s}.json", .{out});
-    if (std.mem.eql(u8, out, meta)) return error.RootFSMetadataPathMatchesOutput;
+    if (try sameResolvedPath(allocator, out, meta)) return error.RootFSMetadataPathMatchesOutput;
     return .{
         .ref = image_ref orelse return error.MissingImageReference,
         .output = out,
@@ -142,6 +142,14 @@ fn parseBuildOptions(allocator: std.mem.Allocator, args: []const []const u8, std
         .mkfs = mkfs,
         .debugfs = debugfs,
     };
+}
+
+fn sameResolvedPath(allocator: std.mem.Allocator, a: []const u8, b: []const u8) !bool {
+    const resolved_a = try std.fs.path.resolve(allocator, &.{a});
+    defer allocator.free(resolved_a);
+    const resolved_b = try std.fs.path.resolve(allocator, &.{b});
+    defer allocator.free(resolved_b);
+    return std.mem.eql(u8, resolved_a, resolved_b);
 }
 
 const Ext4Tool = enum {
@@ -471,6 +479,7 @@ const PendingPax = struct {
     linkpath: ?[]u8 = null,
     uid: ?u32 = null,
     gid: ?u32 = null,
+    size: ?u64 = null,
 
     fn clear(self: *PendingPax, allocator: std.mem.Allocator) void {
         if (self.path) |p| allocator.free(p);
@@ -521,6 +530,12 @@ fn applyTarLayer(
             try readPaxHeader(allocator, reader, size, &pax);
             continue;
         }
+        if (kind == 'g') {
+            var global_pax: PendingPax = .{};
+            defer global_pax.clear(allocator);
+            try readPaxHeader(allocator, reader, size, &global_pax);
+            continue;
+        }
 
         limits.entries += 1;
         if (limits.entries > max_rootfs_archive_entries) return error.RootFSArchiveTooManyEntries;
@@ -532,6 +547,7 @@ fn applyTarLayer(
         else
             try tarFullName(allocator, &header);
         defer if (pax.path == null and long_name == null) allocator.free(raw_name);
+        const payload_size = pax.size orelse size;
         defer {
             if (long_name) |p| {
                 allocator.free(p);
@@ -547,7 +563,7 @@ fn applyTarLayer(
         const rel = safeTarPath(allocator, raw_name) catch |err| switch (err) {
             error.RootTarPath => {
                 if (kind != '5') return error.UnsafeTarPath;
-                try discardTarPayload(reader, size);
+                try discardTarPayload(reader, payload_size);
                 continue;
             },
             else => |e| return e,
@@ -556,39 +572,39 @@ fn applyTarLayer(
         const entry_ownership = try tarOwnership(&header, pax);
 
         if (try applyWhiteout(allocator, io, root, ownership, &created, rel)) {
-            try discardTarPayload(reader, size);
+            try discardTarPayload(reader, payload_size);
             continue;
         }
 
         switch (kind) {
             0, '0' => {
-                try addContentBytes(&limits, size);
-                try writeRegularFile(allocator, io, root, ownership, &created, rel, reader, size, try tarMode(&header));
+                try addContentBytes(&limits, payload_size);
+                try writeRegularFile(allocator, io, root, ownership, &created, rel, reader, payload_size, try tarMode(&header));
                 try ownership_mod.record(allocator, ownership, rel, entry_ownership);
                 try recordCreatedPath(allocator, &created, rel);
             },
             '5' => {
-                try discardTarPayload(reader, size);
+                try discardTarPayload(reader, payload_size);
                 try writeDirectory(allocator, io, root, ownership, &created, rel, try tarMode(&header));
                 try ownership_mod.record(allocator, ownership, rel, entry_ownership);
                 try recordCreatedPath(allocator, &created, rel);
             },
             '2' => {
-                try discardTarPayload(reader, size);
+                try discardTarPayload(reader, payload_size);
                 const raw_link = if (pax.linkpath) |p| p else if (long_link) |p| p else tarLinkName(&header);
                 try writeSymlink(allocator, io, root, ownership, &created, rel, raw_link);
                 try ownership_mod.record(allocator, ownership, rel, entry_ownership);
                 try recordCreatedPath(allocator, &created, rel);
             },
             '1' => {
-                try discardTarPayload(reader, size);
+                try discardTarPayload(reader, payload_size);
                 const raw_link = if (pax.linkpath) |p| p else if (long_link) |p| p else tarLinkName(&header);
                 try createHardlinkTarget(allocator, io, root, ownership, &created, rel, raw_link);
                 try recordHardlinkOwnership(allocator, io, root, ownership, rel, entry_ownership);
                 try recordCreatedPath(allocator, &created, rel);
             },
             else => {
-                try discardTarPayload(reader, size);
+                try discardTarPayload(reader, payload_size);
                 return error.UnsupportedTarEntryType;
             },
         }
@@ -625,6 +641,7 @@ fn writeRegularFile(
     mode: u32,
 ) !void {
     try ensureNoSymlinkPath(allocator, io, root, parentPath(rel), false);
+    try ensureNoCaseCollision(allocator, io, root, rel);
     try ensureParent(allocator, root, io, rel);
     try prepareEntryPath(allocator, io, root, ownership, created, rel, .non_directory);
     var file = try root.createFile(io, rel, .{ .permissions = permissionsFromMode(mode, .default_file) });
@@ -647,6 +664,7 @@ fn writeDirectory(
     mode: u32,
 ) !void {
     try ensureNoSymlinkPath(allocator, io, root, parentPath(rel), false);
+    try ensureNoCaseCollision(allocator, io, root, rel);
     try ensureParent(allocator, root, io, rel);
     try prepareEntryPath(allocator, io, root, ownership, created, rel, .directory);
     const permissions = permissionsFromMode(mode, .default_dir);
@@ -668,6 +686,7 @@ fn writeSymlink(
 ) !void {
     try validateSymlinkTarget(allocator, rel, raw_link);
     try ensureNoSymlinkPath(allocator, io, root, parentPath(rel), false);
+    try ensureNoCaseCollision(allocator, io, root, rel);
     try ensureParent(allocator, root, io, rel);
     try prepareEntryPath(allocator, io, root, ownership, created, rel, .non_directory);
     try root.symLink(io, raw_link, rel, .{});
@@ -685,9 +704,11 @@ fn createHardlinkTarget(
     const link_rel = try safeTarPath(allocator, raw_link);
     defer allocator.free(link_rel);
     try ensureNoSymlinkPath(allocator, io, root, link_rel, false);
+    try ensureNoCaseCollision(allocator, io, root, link_rel);
     const stat = try root.statFile(io, link_rel, .{ .follow_symlinks = false });
     if (stat.kind != .file) return error.BadHardlinkTarget;
     try ensureNoSymlinkPath(allocator, io, root, parentPath(rel), false);
+    try ensureNoCaseCollision(allocator, io, root, rel);
     try ensureParent(allocator, root, io, rel);
     try prepareEntryPath(allocator, io, root, ownership, created, rel, .non_directory);
     try Io.Dir.hardLink(root, link_rel, root, rel, io, .{});
@@ -982,6 +1003,33 @@ fn ensureNoSymlinkPath(allocator: std.mem.Allocator, io: Io, root: Io.Dir, rel: 
     }
 }
 
+fn ensureNoCaseCollision(allocator: std.mem.Allocator, io: Io, root: Io.Dir, rel: []const u8) !void {
+    _ = allocator;
+    if (rel.len == 0) return;
+    try ensureNoCaseCollisionInDir(io, root, rel);
+}
+
+fn ensureNoCaseCollisionInDir(io: Io, dir: Io.Dir, rel: []const u8) !void {
+    const slash = std.mem.indexOfScalar(u8, rel, '/');
+    const part = if (slash) |i| rel[0..i] else rel;
+    if (part.len == 0) return;
+
+    var exact_directory = false;
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (!std.ascii.eqlIgnoreCase(entry.name, part)) continue;
+        if (!std.mem.eql(u8, entry.name, part)) return error.CaseCollisionPath;
+        exact_directory = entry.kind == .directory;
+    }
+
+    if (slash) |i| {
+        if (!exact_directory) return;
+        var child = try dir.openDir(io, part, .{ .iterate = true, .follow_symlinks = false });
+        defer child.close(io);
+        try ensureNoCaseCollisionInDir(io, child, rel[i + 1 ..]);
+    }
+}
+
 fn validateSymlinkTarget(allocator: std.mem.Allocator, rel: []const u8, raw_link: []const u8) !void {
     if (raw_link.len == 0 or std.mem.indexOfScalar(u8, raw_link, 0) != null) return error.BadSymlinkTarget;
     var owned_candidate: ?[]u8 = null;
@@ -1116,8 +1164,12 @@ fn readPaxHeader(allocator: std.mem.Allocator, reader: *Io.Reader, size: u64, ou
                 out.uid = try parsePaxId(value);
             } else if (std.mem.eql(u8, key, "gid")) {
                 out.gid = try parsePaxId(value);
+            } else if (std.mem.eql(u8, key, "size")) {
+                out.size = try parsePaxSize(value);
             } else if (isPaxXattrKey(key)) {
                 return error.UnsupportedTarXattr;
+            } else if (isPaxSparseKey(key)) {
+                return error.UnsupportedTarSparse;
             }
         }
         index = line_start + line_len;
@@ -1129,10 +1181,18 @@ fn isPaxXattrKey(key: []const u8) bool {
         std.mem.startsWith(u8, key, "LIBARCHIVE.xattr.");
 }
 
+fn isPaxSparseKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, "GNU.sparse.");
+}
+
 fn parsePaxId(raw: []const u8) !u32 {
     const value = std.fmt.parseInt(u64, raw, 10) catch return error.BadPaxHeader;
     if (value > std.math.maxInt(u32)) return error.BadPaxHeader;
     return @intCast(value);
+}
+
+fn parsePaxSize(raw: []const u8) !u64 {
+    return std.fmt.parseInt(u64, raw, 10) catch return error.BadPaxHeader;
 }
 
 fn tarFullName(allocator: std.mem.Allocator, header: *const [512]u8) ![]u8 {
@@ -1299,6 +1359,16 @@ test "build options reject metadata path matching output path" {
             "rootfs.ext4",
             "--metadata",
             "rootfs.ext4",
+        }, &stdout.writer),
+    );
+    try std.testing.expectError(
+        error.RootFSMetadataPathMatchesOutput,
+        parseBuildOptions(allocator, &.{
+            "registry.example/repo@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--output",
+            "rootfs.ext4",
+            "--metadata",
+            "./rootfs.ext4",
         }, &stdout.writer),
     );
 }
@@ -1610,6 +1680,29 @@ test "nested directory entries use deterministic implicit parent mode" {
     }
 }
 
+test "case-colliding layer paths fail closed" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-rootfs-case-collision";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    var root = try Io.Dir.cwd().createDirPathOpen(io, tmp, .{ .open_options = .{ .iterate = true, .access_sub_paths = true } });
+    defer root.close(io);
+    try root.createDirPath(io, "bin");
+    try root.writeFile(io, .{ .sub_path = "bin/Foo", .data = "old" });
+    var ownership = OwnershipMap.init(allocator);
+    defer ownership_mod.deinit(allocator, &ownership);
+    var created = CreatedPathMap.init(allocator);
+    defer deinitCreatedPaths(allocator, &created);
+    var payload = [_]u8{0} ** 512;
+    payload[0] = 'x';
+    var reader: Io.Reader = .fixed(&payload);
+
+    try std.testing.expectError(
+        error.CaseCollisionPath,
+        writeRegularFile(allocator, io, root, &ownership, &created, "bin/foo", &reader, 1, 0o644),
+    );
+}
+
 test "hardlink entries preserve inode identity" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1743,6 +1836,46 @@ test "truncated tar headers fail closed" {
     try std.testing.expectError(error.TruncatedTarHeader, applyTarLayer(allocator, std.testing.io, tmp.dir, &reader, &ownership));
 }
 
+test "global pax headers are consumed before following entries" {
+    const allocator = std.testing.allocator;
+    var block = [_]u8{0} ** 2560;
+    const record = "13 comment=x\n";
+    makeTarHeader(block[0..512], "global-pax", 'g', record.len);
+    @memcpy(block[512 .. 512 + record.len], record);
+    makeTarHeader(block[1024..1536], "file", '0', 1);
+    block[1536] = 'x';
+    var reader: Io.Reader = .fixed(&block);
+    var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
+    defer tmp.cleanup();
+    var ownership = OwnershipMap.init(allocator);
+    defer ownership_mod.deinit(allocator, &ownership);
+
+    try applyTarLayer(allocator, std.testing.io, tmp.dir, &reader, &ownership);
+    const bytes = try tmp.dir.readFileAlloc(std.testing.io, "file", allocator, .limited(8));
+    defer allocator.free(bytes);
+    try std.testing.expectEqualStrings("x", bytes);
+}
+
+test "pax size overrides ustar file size" {
+    const allocator = std.testing.allocator;
+    var block = [_]u8{0} ** 2560;
+    const record = "10 size=5\n";
+    makeTarHeader(block[0..512], "pax", 'x', record.len);
+    @memcpy(block[512 .. 512 + record.len], record);
+    makeTarHeader(block[1024..1536], "file", '0', 0);
+    @memcpy(block[1536..1541], "hello");
+    var reader: Io.Reader = .fixed(&block);
+    var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
+    defer tmp.cleanup();
+    var ownership = OwnershipMap.init(allocator);
+    defer ownership_mod.deinit(allocator, &ownership);
+
+    try applyTarLayer(allocator, std.testing.io, tmp.dir, &reader, &ownership);
+    const bytes = try tmp.dir.readFileAlloc(std.testing.io, "file", allocator, .limited(16));
+    defer allocator.free(bytes);
+    try std.testing.expectEqualStrings("hello", bytes);
+}
+
 test "root directory tar entry is ignored" {
     const allocator = std.testing.allocator;
     var block = [_]u8{0} ** 1024;
@@ -1789,6 +1922,18 @@ test "pax xattr records fail closed" {
     defer pax.clear(allocator);
 
     try std.testing.expectError(error.UnsupportedTarXattr, readPaxHeader(allocator, &reader, record.len, &pax));
+}
+
+test "pax sparse records fail closed" {
+    const allocator = std.testing.allocator;
+    const record = "20 GNU.sparse.map=0\n";
+    var block = [_]u8{0} ** 512;
+    @memcpy(block[0..record.len], record);
+    var reader: Io.Reader = .fixed(&block);
+    var pax: PendingPax = .{};
+    defer pax.clear(allocator);
+
+    try std.testing.expectError(error.UnsupportedTarSparse, readPaxHeader(allocator, &reader, record.len, &pax));
 }
 
 test "oversized binary tar numbers fail closed" {
