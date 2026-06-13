@@ -195,6 +195,33 @@ print_tail() {
   echo "--- end tail ---" >&2
 }
 
+now_ms() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import time; print(time.monotonic_ns() // 1_000_000)'
+  else
+    echo "$(( $(date +%s) * 1000 ))"
+  fi
+}
+
+metric_value() {
+  local name="$1"
+  local line="$2"
+  sed -nE "s/.*(^| )${name}=([0-9]+)( |$).*/\2/p" <<<"${line}"
+}
+
+assert_kvm_restore_metrics() {
+  local line="$1"
+  [[ "${line}" =~ (^|[[:space:]])mode=eager_chunks([[:space:]]|$) ]] || die "unexpected KVM restore mode in metrics: ${line}"
+  for field in chunks memory_ms state_ms pre_run_ms; do
+    local value
+    value="$(metric_value "${field}" "${line}")"
+    [[ -n "${value}" ]] || die "KVM restore metrics missing numeric ${field}: ${line}"
+    if [[ "${field}" == "chunks" && "${value}" == "0" ]]; then
+      die "KVM restore metrics reported zero chunks: ${line}"
+    fi
+  done
+}
+
 run_with_deadline() {
   local seconds="$1"
   local log="$2"
@@ -266,12 +293,25 @@ resume() {
   local cmd=("${boot_bin}" "${kernel}" --mem-mib "${mem_mib}" --resume "${spore_dir}")
 
   set +e
+  local resume_start_ms
+  resume_start_ms="$(now_ms)"
   run_with_deadline "${resume_seconds}" "${log}" "${cmd[@]}"
   local status="$?"
+  local resume_wall_ms=$(( $(now_ms) - resume_start_ms ))
   set -e
   if [[ "${status}" != "0" && "${status}" != "124" ]]; then
     print_tail "${log}"
     die "resume failed with status ${status}"
+  fi
+
+  local restore_metrics=""
+  if [[ "${backend}" == "kvm" ]]; then
+    restore_metrics="$(grep -E 'kvm restore metrics:' "${log}" | tail -1 || true)"
+    if [[ -z "${restore_metrics}" ]]; then
+      print_tail "${log}"
+      die "resume log did not contain kvm restore metrics"
+    fi
+    assert_kvm_restore_metrics "${restore_metrics}"
   fi
 
   local max_tick
@@ -284,7 +324,10 @@ resume() {
     print_tail "${log}"
     die "highest observed tick ${max_tick} was below --min-tick ${min_tick}"
   fi
-  echo "resume ok: backend=${backend} max_tick=${max_tick} log=${log}"
+  echo "resume ok: backend=${backend} max_tick=${max_tick} resume_process_wall_ms=${resume_wall_ms} log=${log}"
+  if [[ -n "${restore_metrics}" ]]; then
+    echo "restore metrics: ${restore_metrics}"
+  fi
 }
 
 case "${mode}" in

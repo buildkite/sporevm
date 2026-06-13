@@ -221,8 +221,10 @@ That is a deliberate tradeoff and it is bought back structurally, not by hope:
   processes, not broad process introspection permissions. A forkable parent is
   a deliberately managed runtime state, not a reason to make VM processes
   generally dumpable or inspectable.
-- Chunks are verified against their blake3 id before being mapped into guest
-  memory; a malicious peer can deny service but not inject state.
+- Chunks loaded from CAS or peers are verified against their blake3 id before
+  guest use; a malicious peer can deny service but not inject state. Trusted
+  same-host RAM backing is a local acceleration capability, not a portable
+  verification root.
 - No secrets ever enter the VMM process or the spore format.
 - `SECURITY.md` records this posture as a founding document and is updated
   when the attack surface changes.
@@ -316,12 +318,13 @@ store; `spore fork` propagates that backing to children only when the local file
 is still available, otherwise it drops the optional metadata and leaves children
 restorable from chunks. The KVM boot harness requires an explicit trusted
 same-host opt-in before opening `ram.backing`, then passes the already-open fd
-into the KVM backend for `MAP_PRIVATE` mapping, so imported or untrusted spores
-still materialize through verified chunks and the backend no longer resolves
-manifest paths. This remains an interim path/symlink harness adapter that proves
-the CoW resume path; the sealed-fd / `SCM_RIGHTS` monitor shape remains the
-robust target before we claim the final trust boundary. The memory-sampled KVM
-run on the `m7g.metal` host used
+into the KVM backend for `MAP_PRIVATE` mapping. That trusted fd path checks the
+manifest shape but does not re-hash the backing contents; imported or untrusted
+spores still materialize through verified chunks and the backend no longer
+resolves manifest paths. This remains an interim path/symlink harness adapter
+that proves the CoW resume path; the sealed-fd / `SCM_RIGHTS` monitor shape
+remains the robust target before we claim the final trust boundary. The
+memory-sampled KVM run on the `m7g.metal` host used
 `--count 100 --parallel 100 --mem-mib 512 --memory-sample-seconds 2`, reported
 file_backed_children=100, host_memory_sampled_children=100,
 host_pss_kib=778524, host_rss_kib=1699988, child_resume_min_ms=138, and
@@ -334,7 +337,12 @@ process for smoke sampling and cleanup. A 100-child fdpass-mode KVM run reported
 file_backed_children=100, host_memory_sampled_children=100, host_pss_kib=782723,
 child_resume_min_ms=137, and child_resume_max_ms=195. This is still a harness
 bridge, not the long-running product monitor/control socket. Remaining Slice 5
-work is monitor wiring and cold lazy restore over CAS.
+work is monitor wiring and cold lazy restore over CAS. The first cold-lazy prep
+step has split eager CAS restore into validated per-chunk helpers and added KVM
+restore phase metrics (`memory_ms`, `state_ms`, `pre_run_ms`) to establish the
+baseline that `userfaultfd` lazy restore must beat. On the `m7g.metal` host, a
+512MiB same-host eager restore reported mode=eager_chunks, chunks=256,
+nonzero_chunks=14, memory_ms=512, and pre_run_ms=513.
 
 Cross-backend restore is intentionally secondary. KVM→HVF can map portable
 vCPU, virtio, generation, CPU-profile, and GIC apply state, but `m7g.metal`
@@ -420,10 +428,11 @@ manifest paths. The fdpass harness mode proves the same `SCM_RIGHTS` handoff
 shape the monitor will use, but the robust monitor wiring still has to replace
 the harness path opener with a sealed `memfd`/file-backed mapping owned by the
 monitor; on HVF use the closest private remap/file-backed path or fail closed
-until supported. Then layer cold lazy restore over CAS: restore maps memory empty
-and materializes pages on fault with userfaultfd on Linux and unmapped-memory
-exits on HVF. Record an access trace on first resume; use it for readahead on
-later resumes. Benchmark resume time-to-first-instruction and time-to-useful-work
+until supported. For cold lazy restore, first keep eager behaviour but expose
+validated per-chunk CAS loading plus restore metrics; then map memory empty and
+materialize chunks on fault with userfaultfd on Linux and unmapped-memory exits
+on HVF. Record an access trace on first resume; use it for readahead on later
+resumes. Benchmark resume time-to-first-instruction and time-to-useful-work
 against slice 3's eager restore.
 
 Done when: 100 concurrent same-host forks of one 512MiB spore run distinct

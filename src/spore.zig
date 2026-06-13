@@ -113,6 +113,17 @@ pub const MemoryManifest = struct {
     backing: ?MemoryBacking = null,
 };
 
+pub const MemoryPlan = struct {
+    chunk_size: usize,
+    chunk_count: usize,
+    nonzero_chunk_count: usize,
+};
+
+pub const MemoryChunkRange = struct {
+    start: usize,
+    end: usize,
+};
+
 pub const GenerationState = generation.State;
 
 pub const Manifest = struct {
@@ -294,26 +305,60 @@ fn saveMemoryInternal(allocator: std.mem.Allocator, dir: []const u8, ram: []cons
 /// Materialize guest memory from the chunk store. Verifies every chunk
 /// against its id; fails closed on mismatch.
 pub fn loadMemory(allocator: std.mem.Allocator, dir: []const u8, manifest: MemoryManifest, ram: []u8) Error!void {
-    if (manifest.chunk_size == 0 or manifest.chunk_size > 64 * 1024 * 1024) return error.BadManifest;
-    const csize: usize = @intCast(manifest.chunk_size);
-    const expected = (ram.len + csize - 1) / csize;
+    const plan = try validateMemoryForRam(manifest, ram.len);
+
+    var i: usize = 0;
+    while (i < plan.chunk_count) : (i += 1) {
+        const range = memoryChunkRangeFromPlan(plan, ram.len, i) catch return error.BadManifest;
+        try loadMemoryChunkRef(allocator, dir, manifest.chunks[i], ram[range.start..range.end]);
+    }
+}
+
+pub fn validateMemoryForRam(manifest: MemoryManifest, ram_len: usize) Error!MemoryPlan {
+    if (manifest.chunk_size != chunk_size) return error.BadManifest;
+    const csize: usize = chunk_size;
+    const expected = (ram_len + csize - 1) / csize;
     if (manifest.chunks.len != expected) return error.BadManifest;
 
-    for (manifest.chunks, 0..) |maybe_ref, i| {
-        const start = i * csize;
-        const end = @min(start + csize, ram.len);
-        const target = ram[start..end];
+    var nonzero: usize = 0;
+    for (manifest.chunks) |maybe_ref| {
         if (maybe_ref) |ref| {
-            const id = chunklib.ChunkId.fromHex(ref) catch return error.BadManifest;
-            const chunk_path = try pathZ(allocator, "{s}/chunks/{s}", .{ dir, ref });
-            const data = try readFileAll(allocator, chunk_path, csize);
-            defer allocator.free(data);
-            if (data.len != target.len) return error.BadChunk;
-            if (!id.matches(data)) return error.BadChunk;
-            @memcpy(target, data);
-        } else {
-            @memset(target, 0);
+            _ = chunklib.ChunkId.fromHex(ref) catch return error.BadManifest;
+            nonzero += 1;
         }
+    }
+    return .{ .chunk_size = csize, .chunk_count = manifest.chunks.len, .nonzero_chunk_count = nonzero };
+}
+
+pub fn memoryChunkRange(manifest: MemoryManifest, ram_len: usize, index: usize) Error!MemoryChunkRange {
+    const plan = try validateMemoryForRam(manifest, ram_len);
+    return memoryChunkRangeFromPlan(plan, ram_len, index) catch return error.BadManifest;
+}
+
+pub fn loadMemoryChunk(allocator: std.mem.Allocator, dir: []const u8, manifest: MemoryManifest, ram_len: usize, index: usize, target: []u8) Error!void {
+    const range = try memoryChunkRange(manifest, ram_len, index);
+    if (target.len != range.end - range.start) return error.BadManifest;
+    try loadMemoryChunkRef(allocator, dir, manifest.chunks[index], target);
+}
+
+fn memoryChunkRangeFromPlan(plan: MemoryPlan, ram_len: usize, index: usize) !MemoryChunkRange {
+    if (index >= plan.chunk_count) return error.BadManifest;
+    const start = index * plan.chunk_size;
+    const end = @min(start + plan.chunk_size, ram_len);
+    return .{ .start = start, .end = end };
+}
+
+fn loadMemoryChunkRef(allocator: std.mem.Allocator, dir: []const u8, maybe_ref: ?[]const u8, target: []u8) Error!void {
+    if (maybe_ref) |ref| {
+        const id = chunklib.ChunkId.fromHex(ref) catch return error.BadManifest;
+        const chunk_path = try pathZ(allocator, "{s}/chunks/{s}", .{ dir, ref });
+        const data = try readFileAll(allocator, chunk_path, target.len);
+        defer allocator.free(data);
+        if (data.len != target.len) return error.BadChunk;
+        if (!id.matches(data)) return error.BadChunk;
+        @memcpy(target, data);
+    } else {
+        @memset(target, 0);
     }
 }
 
@@ -623,6 +668,8 @@ fn validateManifest(manifest: Manifest) Error!void {
     {
         return error.BadManifest;
     }
+    if (manifest.platform.ram_size > std.math.maxInt(usize)) return error.BadManifest;
+    _ = try validateMemoryForRam(manifest.memory, @intCast(manifest.platform.ram_size));
     if (manifest.memory.backing) |backing| {
         try validateMemoryBacking(backing, manifest.platform.ram_size);
     }
@@ -660,11 +707,33 @@ test "memory round-trips through the chunk store with zero elision" {
     try std.testing.expect(mm.chunks[1] == null);
     try std.testing.expect(mm.chunks[3] != null);
     try std.testing.expect(mm.chunks[5] != null);
+    const plan = try validateMemoryForRam(mm, ram.len);
+    try std.testing.expectEqual(@as(usize, chunk_size), plan.chunk_size);
+    try std.testing.expectEqual(@as(usize, 6), plan.chunk_count);
+    try std.testing.expectEqual(@as(usize, 3), plan.nonzero_chunk_count);
+    const tail_range = try memoryChunkRange(mm, ram.len, 5);
+    try std.testing.expectEqual(@as(usize, 5 * chunk_size), tail_range.start);
+    try std.testing.expectEqual(ram.len, tail_range.end);
 
     const out = try arena.alloc(u8, ram.len);
     @memset(out, 0xAA);
     try loadMemory(arena, dir, mm, out);
     try std.testing.expectEqualSlices(u8, ram, out);
+
+    const zero_chunk = try arena.alloc(u8, chunk_size);
+    @memset(zero_chunk, 0xAA);
+    try loadMemoryChunk(arena, dir, mm, ram.len, 1, zero_chunk);
+    try std.testing.expect(std.mem.allEqual(u8, zero_chunk, 0));
+
+    const nonzero_chunk = try arena.alloc(u8, chunk_size);
+    @memset(nonzero_chunk, 0xAA);
+    try loadMemoryChunk(arena, dir, mm, ram.len, 3, nonzero_chunk);
+    try std.testing.expectEqualSlices(u8, ram[3 * chunk_size .. 4 * chunk_size], nonzero_chunk);
+
+    const tail_chunk = try arena.alloc(u8, ram.len - 5 * chunk_size);
+    @memset(tail_chunk, 0xAA);
+    try loadMemoryChunk(arena, dir, mm, ram.len, 5, tail_chunk);
+    try std.testing.expectEqualSlices(u8, ram[5 * chunk_size ..], tail_chunk);
 }
 
 test "memory backing is sparse local acceleration metadata" {
@@ -717,6 +786,30 @@ test "memory backing rejects non-canonical paths" {
     }
 }
 
+test "memory manifest validation rejects non-canonical chunks" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = try testDir(arena);
+    const ram = try arena.alloc(u8, chunk_size);
+    @memset(ram, 0x42);
+    const mm = try saveMemory(arena, dir, ram);
+
+    var wrong_size = mm;
+    wrong_size.chunk_size = chunk_size / 2;
+    try std.testing.expectError(error.BadManifest, validateMemoryForRam(wrong_size, ram.len));
+
+    var malformed_refs = try arena.alloc(?[]const u8, mm.chunks.len);
+    @memcpy(malformed_refs, mm.chunks);
+    malformed_refs[0] = "not-a-blake3-id";
+    var malformed = mm;
+    malformed.chunks = malformed_refs;
+    try std.testing.expectError(error.BadManifest, validateMemoryForRam(malformed, ram.len));
+    try std.testing.expectError(error.BadManifest, loadMemory(arena, dir, malformed, ram));
+}
+
 test "corrupted chunk fails closed" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -736,6 +829,7 @@ test "corrupted chunk fails closed" {
 
     const out = try arena.alloc(u8, ram.len);
     try std.testing.expectError(error.BadChunk, loadMemory(arena, dir, mm, out));
+    try std.testing.expectError(error.BadChunk, loadMemoryChunk(arena, dir, mm, ram.len, 0, out));
 }
 
 fn fuzzManifestParse(_: void, s: *std.testing.Smith) !void {
@@ -779,6 +873,7 @@ test "manifest json round-trip" {
     const arena = arena_state.allocator();
 
     const dir = try testDir(arena);
+    var memory_chunks = [_]?[]const u8{null} ** ((1 << 29) / chunk_size);
     var queues = [_]QueueState{.{
         .size = 64,
         .ready = true,
@@ -834,7 +929,7 @@ test "manifest json round-trip" {
             .interrupt_status = generation.irq_generation_changed,
             .params_b64 = "",
         },
-        .memory = .{ .chunk_size = chunk_size, .chunks = &.{} },
+        .memory = .{ .chunk_size = chunk_size, .chunks = &memory_chunks },
     };
     try saveManifest(arena, dir, manifest);
     const parsed = try loadManifest(arena, dir);
@@ -1013,6 +1108,7 @@ test "backend-private GIC state json round-trip" {
     const arena = arena_state.allocator();
 
     const dir = try testDir(arena);
+    var memory_chunks = [_]?[]const u8{null} ** ((1 << 29) / chunk_size);
     const manifest = Manifest{
         .platform = .{
             .cpu_profile = "sporevm-aarch64-v0",
@@ -1044,7 +1140,7 @@ test "backend-private GIC state json round-trip" {
         },
         .devices = &.{},
         .generation = .{ .generation = 0, .interrupt_status = 0, .params_b64 = "" },
-        .memory = .{ .chunk_size = chunk_size, .chunks = &.{} },
+        .memory = .{ .chunk_size = chunk_size, .chunks = &memory_chunks },
     };
     try saveManifest(arena, dir, manifest);
     const parsed = try loadManifest(arena, dir);
