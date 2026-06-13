@@ -300,10 +300,7 @@ fn resolveBackend(backend: Backend) !Backend {
 
 fn resultFromStream(allocator: std.mem.Allocator, backend: Backend, opts: Options, stream: *const vsock.HostStream) !Result {
     const output = stream.outputSlice();
-    const exit_code = parseExitCode(output) orelse return error.BadRunExitFrame;
-    if (exit_code < 0 or exit_code > 255) return error.BadRunExitFrame;
-    const timing_src = guestTimingObject(output) orelse return error.BadRunExitFrame;
-    const error_src = guestErrorValue(output);
+    const frame = try parseExitFrame(allocator, output);
     const start_ms = stream.start_ms orelse 0;
     const connect_ms = stream.connect_ms orelse stream.elapsedMs();
     const response_ms = stream.response_ms orelse stream.elapsedMs();
@@ -313,9 +310,9 @@ fn resultFromStream(allocator: std.mem.Allocator, backend: Backend, opts: Option
         .vsock_connect_ms = connect_ms,
         .exec_response_ms = response_ms,
         .probe_duration_ms = if (response_ms >= connect_ms) response_ms - connect_ms else 0,
-        .exit_code = exit_code,
-        .error_json = if (error_src) |value| try allocator.dupe(u8, value) else null,
-        .guest_timing_json = try allocator.dupe(u8, timing_src),
+        .exit_code = frame.exit_code,
+        .error_json = frame.error_json,
+        .guest_timing_json = frame.guest_timing_json,
         .vcpus = opts.vcpus,
         .memory_mib = opts.memory_mib,
     };
@@ -364,63 +361,49 @@ fn takeValue(args: []const []const u8, i: *usize, name: []const u8) []const u8 {
     return args[i.*];
 }
 
-fn parseExitCode(output: []const u8) ?i32 {
-    const key = "\"exit_code\":";
-    const pos = std.mem.indexOf(u8, output, key) orelse return null;
-    var i = pos + key.len;
-    var sign: i32 = 1;
-    if (i < output.len and output[i] == '-') {
-        sign = -1;
-        i += 1;
-    }
-    const start = i;
-    while (i < output.len and output[i] >= '0' and output[i] <= '9') : (i += 1) {}
-    if (i == start) return null;
-    const parsed = std.fmt.parseInt(i32, output[start..i], 10) catch return null;
-    return parsed * sign;
-}
+const ExitFrame = struct {
+    type: []const u8,
+    exit_code: i64,
+    @"error": ?[]const u8,
+    guest_timing_ms: std.json.Value,
+};
 
-fn guestErrorValue(output: []const u8) ?[]const u8 {
-    const key = "\"error\":";
-    const pos = std.mem.indexOf(u8, output, key) orelse return null;
-    var i = pos + key.len;
-    if (std.mem.startsWith(u8, output[i..], "null")) return null;
-    if (i >= output.len or output[i] != '"') return null;
-    i += 1;
-    var escaped = false;
-    while (i < output.len) : (i += 1) {
-        if (escaped) {
-            escaped = false;
-            continue;
-        }
-        if (output[i] == '\\') {
-            escaped = true;
-            continue;
-        }
-        if (output[i] == '"') return output[pos + key.len .. i + 1];
-    }
-    return null;
-}
+const ParsedExitFrame = struct {
+    exit_code: i32,
+    error_json: ?[]const u8,
+    guest_timing_json: []const u8,
 
-fn guestTimingObject(output: []const u8) ?[]const u8 {
-    const key = "\"guest_timing_ms\":";
-    const pos = std.mem.indexOf(u8, output, key) orelse return null;
-    var i = pos + key.len;
-    if (i >= output.len or output[i] != '{') return null;
-    const start = i;
-    var depth: usize = 0;
-    while (i < output.len) : (i += 1) {
-        switch (output[i]) {
-            '{' => depth += 1,
-            '}' => {
-                if (depth == 0) return null;
-                depth -= 1;
-                if (depth == 0) return output[start .. i + 1];
-            },
-            else => {},
-        }
+    fn deinit(self: ParsedExitFrame, allocator: std.mem.Allocator) void {
+        if (self.error_json) |value| allocator.free(value);
+        allocator.free(self.guest_timing_json);
     }
-    return null;
+};
+
+fn parseExitFrame(allocator: std.mem.Allocator, output: []const u8) !ParsedExitFrame {
+    var parsed = std.json.parseFromSlice(ExitFrame, allocator, output, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch return error.BadRunExitFrame;
+    defer parsed.deinit();
+
+    const frame = parsed.value;
+    if (!std.mem.eql(u8, frame.type, "exit")) return error.BadRunExitFrame;
+    if (frame.exit_code < 0 or frame.exit_code > 255) return error.BadRunExitFrame;
+    switch (frame.guest_timing_ms) {
+        .object => {},
+        else => return error.BadRunExitFrame,
+    }
+
+    const timing_json = try std.json.Stringify.valueAlloc(allocator, frame.guest_timing_ms, .{});
+    errdefer allocator.free(timing_json);
+    const error_json = if (frame.@"error") |value| try std.json.Stringify.valueAlloc(allocator, value, .{}) else null;
+    errdefer if (error_json) |value| allocator.free(value);
+
+    return .{
+        .exit_code = @intCast(frame.exit_code),
+        .error_json = error_json,
+        .guest_timing_json = timing_json,
+    };
 }
 
 fn printHarnessUsage(backend: Backend) void {
@@ -467,17 +450,42 @@ test "run harness parser shares common options" {
 test "run result parser extracts exit and timing" {
     const output =
         "{\"type\":\"exit\",\"exit_code\":0,\"error\":null,\"guest_timing_ms\":{\"guest_init_start\":1,\"guest_command_exit\":9}}\n";
-    try std.testing.expectEqual(@as(?i32, 0), parseExitCode(output));
-    try std.testing.expectEqualStrings("{\"guest_init_start\":1,\"guest_command_exit\":9}", guestTimingObject(output).?);
-    try std.testing.expect(guestErrorValue(output) == null);
+    const frame = try parseExitFrame(std.testing.allocator, output);
+    defer frame.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(i32, 0), frame.exit_code);
+    try std.testing.expectEqualStrings("{\"guest_init_start\":1,\"guest_command_exit\":9}", frame.guest_timing_json);
+    try std.testing.expect(frame.error_json == null);
+}
+
+test "run result parser reads top-level exit code" {
+    const output =
+        "{\"type\":\"exit\",\"metadata\":{\"exit_code\":0},\"exit_code\":1,\"error\":null,\"guest_timing_ms\":{\"guest_command_exit\":9}}\n";
+    const frame = try parseExitFrame(std.testing.allocator, output);
+    defer frame.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(i32, 1), frame.exit_code);
+}
+
+test "run result parser preserves timing strings with braces" {
+    const output =
+        "{\"type\":\"exit\",\"exit_code\":0,\"error\":null,\"guest_timing_ms\":{\"note\":\"}\",\"guest_command_exit\":9}}\n";
+    const frame = try parseExitFrame(std.testing.allocator, output);
+    defer frame.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("{\"note\":\"}\",\"guest_command_exit\":9}", frame.guest_timing_json);
+}
+
+test "run result parser rejects malformed timing value" {
+    try std.testing.expectError(error.BadRunExitFrame, parseExitFrame(
+        std.testing.allocator,
+        "{\"type\":\"exit\",\"exit_code\":0,\"error\":null,\"guest_timing_ms\":\"not an object\"}\n",
+    ));
 }
 
 fn fuzzRunResultParsing(_: void, s: *std.testing.Smith) !void {
     var buf: [4096]u8 = undefined;
     const len = s.slice(&buf);
-    _ = parseExitCode(buf[0..len]);
-    _ = guestErrorValue(buf[0..len]);
-    _ = guestTimingObject(buf[0..len]);
+    if (parseExitFrame(std.testing.allocator, buf[0..len])) |frame| {
+        frame.deinit(std.testing.allocator);
+    } else |_| {}
 }
 
 test "fuzz run result parsing" {
