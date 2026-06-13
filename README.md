@@ -44,6 +44,7 @@ mise install
 mise run build    # zig build
 mise run test     # zig build test
 mise exec -- zig build hvf-boot   # build/sign the HVF kernel boot harness
+mise exec -- zig build hvf-gic-probe # probe HVF GICv3 portable-state support
 mise exec -- zig build kvm-boot   # build the KVM kernel boot harness on Linux/aarch64
 ```
 

@@ -26,6 +26,55 @@ pub const LineLevel = struct {
     asserted: bool,
 };
 
+pub const RegSpec = struct {
+    offset: u32,
+    width_bits: u8,
+};
+
+pub const fixed_dist_reg_specs = [_]RegSpec{
+    .{ .offset = 0x000, .width_bits = 32 }, // GICD_CTLR
+    .{ .offset = 0x084, .width_bits = 32 }, // GICD_IGROUPR1
+    .{ .offset = 0x104, .width_bits = 32 }, // GICD_ISENABLER1
+    .{ .offset = 0x204, .width_bits = 32 }, // GICD_ISPENDR1
+    .{ .offset = 0x304, .width_bits = 32 }, // GICD_ISACTIVER1
+    .{ .offset = 0xd04, .width_bits = 32 }, // GICD_IGRPMODR1
+};
+
+pub const fixed_redist_reg_specs = [_]RegSpec{
+    .{ .offset = 0x0000, .width_bits = 32 }, // GICR_CTLR
+    .{ .offset = 0x0014, .width_bits = 32 }, // GICR_WAKER
+    .{ .offset = 0x10080, .width_bits = 32 }, // GICR_IGROUPR0
+    .{ .offset = 0x10100, .width_bits = 32 }, // GICR_ISENABLER0
+    .{ .offset = 0x10200, .width_bits = 32 }, // GICR_ISPENDR0
+    .{ .offset = 0x10300, .width_bits = 32 }, // GICR_ISACTIVER0
+    .{ .offset = 0x10d00, .width_bits = 32 }, // GICR_IGRPMODR0
+};
+
+pub fn appendDistRegSpecs(allocator: std.mem.Allocator, specs: *std.ArrayList(RegSpec)) !void {
+    try specs.appendSlice(allocator, &fixed_dist_reg_specs);
+
+    var off: u32 = 0x420; // GICD_IPRIORITYR for INTIDs 32..63.
+    while (off < 0x440) : (off += 4) try specs.append(allocator, .{ .offset = off, .width_bits = 32 });
+
+    off = 0xc08; // GICD_ICFGR for INTIDs 32..63.
+    while (off < 0xc10) : (off += 4) try specs.append(allocator, .{ .offset = off, .width_bits = 32 });
+
+    var intid: u32 = 32;
+    while (intid <= board.generationIntid()) : (intid += 1) {
+        try specs.append(allocator, .{ .offset = distRouterOffset(intid), .width_bits = 64 });
+    }
+}
+
+pub fn appendRedistRegSpecs(allocator: std.mem.Allocator, specs: *std.ArrayList(RegSpec)) !void {
+    try specs.appendSlice(allocator, &fixed_redist_reg_specs);
+
+    var off: u32 = 0x10400; // GICR_IPRIORITYR for SGIs/PPIs.
+    while (off < 0x10420) : (off += 4) try specs.append(allocator, .{ .offset = off, .width_bits = 32 });
+
+    off = 0x10c00; // GICR_ICFGR for SGIs/PPIs.
+    while (off < 0x10c08) : (off += 4) try specs.append(allocator, .{ .offset = off, .width_bits = 32 });
+}
+
 pub const GicV3State = struct {
     schema_version: u32 = schema_version,
     dist_regs: []const MmioReg,
@@ -106,15 +155,8 @@ fn expectedWidth(region: Region, offset: u32) ?u8 {
 }
 
 fn expectedDistWidth(offset: u32) ?u8 {
-    switch (offset) {
-        0x000, // GICD_CTLR
-        0x084, // GICD_IGROUPR1
-        0x104, // GICD_ISENABLER1
-        0x204, // GICD_ISPENDR1
-        0x304, // GICD_ISACTIVER1
-        0xd04, // GICD_IGRPMODR1
-        => return 32,
-        else => {},
+    for (fixed_dist_reg_specs) |spec| {
+        if (offset == spec.offset) return spec.width_bits;
     }
 
     if (offset >= 0x420 and offset < 0x440 and offset % 4 == 0) return 32; // GICD_IPRIORITYR 32..63
@@ -128,16 +170,8 @@ fn expectedDistWidth(offset: u32) ?u8 {
 }
 
 fn expectedRedistWidth(offset: u32) ?u8 {
-    switch (offset) {
-        0x0000, // GICR_CTLR
-        0x0014, // GICR_WAKER
-        0x10080, // GICR_IGROUPR0
-        0x10100, // GICR_ISENABLER0
-        0x10200, // GICR_ISPENDR0
-        0x10300, // GICR_ISACTIVER0
-        0x10d00, // GICR_IGRPMODR0
-        => return 32,
-        else => {},
+    for (fixed_redist_reg_specs) |spec| {
+        if (offset == spec.offset) return spec.width_bits;
     }
 
     if (offset >= 0x10400 and offset < 0x10420 and offset % 4 == 0) return 32; // GICR_IPRIORITYR SGI/PPI
@@ -163,6 +197,22 @@ test "validates portable GICv3 subset" {
         .{ .intid = board.generationIntid(), .asserted = true },
     };
     try validate(.{ .kind = .gicv3, .gicv3 = .{ .dist_regs = &dist, .redist_regs = &redist, .line_levels = &lines } });
+}
+
+test "register specs match validation schema" {
+    const allocator = std.testing.allocator;
+    var dist: std.ArrayList(RegSpec) = .empty;
+    defer dist.deinit(allocator);
+    var redist: std.ArrayList(RegSpec) = .empty;
+    defer redist.deinit(allocator);
+
+    try appendDistRegSpecs(allocator, &dist);
+    try appendRedistRegSpecs(allocator, &redist);
+
+    try std.testing.expect(dist.items.len > fixed_dist_reg_specs.len);
+    try std.testing.expect(redist.items.len > fixed_redist_reg_specs.len);
+    for (dist.items) |spec| try std.testing.expectEqual(spec.width_bits, expectedDistWidth(spec.offset).?);
+    for (redist.items) |spec| try std.testing.expectEqual(spec.width_bits, expectedRedistWidth(spec.offset).?);
 }
 
 test "rejects invalid GICv3 state" {

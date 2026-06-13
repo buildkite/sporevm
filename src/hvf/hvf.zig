@@ -16,6 +16,10 @@ pub const vm = if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)
     @import("vm.zig")
 else
     struct {};
+pub const gic = if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)
+    @import("gic.zig")
+else
+    struct {};
 
 pub const ReturnCode = i32; // hv_return_t
 pub const success: ReturnCode = 0; // HV_SUCCESS

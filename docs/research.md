@@ -69,6 +69,12 @@ answered the highest-risk state-normalization questions on the macOS side:
   until the KVM side landed. Current KVM snapshots emit a normalized
   `machine.gic` GICv3 register/line-level subset; HVF snapshots keep a tagged
   backend-private `hv_gic` blob until the HVF GICv3 mapping lands.
+- A local `zig build hvf-gic-probe` run on Apple Silicon/macOS 26.3 read most
+  of the shared portable subset but not all of it: distributor reads 40 ok / 1
+  unsupported, redistributor reads 14 ok / 3 unsupported, safe IROUTER
+  writebacks 25 ok / 0 unsupported, SPI set/lower works for the generation
+  device, and HVF exposes no line-level getter. That keeps HVF portable capture
+  gated; the current HVF path remains the tagged `hv_gic` blob.
 
 Decision: keep the architectural machine-state normalization design. Adjust
 the cross-hypervisor slice to treat GICv3 CPU-interface state and virtual

@@ -280,6 +280,10 @@ levels in `machine.gic`. HVF still uses a tagged backend-private `hv_gic` blob
 until its architectural GICv3 mapping lands. A real
 `m7g.metal` smoke test booted an Alpine BusyBox ticker, snapshotted after
 `sporevm-tick 4`, and resumed in a fresh KVM process at `sporevm-tick 5`.
+The first HVF GIC portability probe is now explicit and opt-in: it uses the
+same shared register subset as KVM, records unsupported offsets, and confirms
+that HVF cannot yet emit a complete portable GIC state because there is no
+line-level getter and several redistributor/distributor offsets are not exposed.
 The four-way cross-hypervisor matrix (slice 4) remains next.
 
 ## Delivery Strategy

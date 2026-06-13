@@ -76,6 +76,12 @@ pub fn build(b: *std.Build) void {
         const smoke_step = b.step("hvf-smoke", "Run the Hypervisor.framework smoke test (signs the binary)");
         smoke_step.dependOn(&run_smoke.step);
 
+        const run_gic_probe = b.addSystemCommand(&.{ b.getInstallPath(.bin, "hvf-smoke"), "--gic-probe" });
+        run_gic_probe.step.dependOn(&sign.step);
+
+        const gic_probe_step = b.step("hvf-gic-probe", "Probe Hypervisor.framework GICv3 portable-state support");
+        gic_probe_step.dependOn(&run_gic_probe.step);
+
         // Kernel boot harness: builds and signs, does not run (needs a kernel).
         const boot_mod = b.createModule(.{
             .root_source_file = b.path("src/hvf_boot.zig"),

@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const hvf = @import("hvf.zig");
+const gicv3 = @import("../gicv3.zig");
 
 extern "c" fn hv_gic_get_distributor_reg(reg: u16, value: *u64) hvf.ReturnCode;
 extern "c" fn hv_gic_set_distributor_reg(reg: u16, value: u64) hvf.ReturnCode;
@@ -17,6 +18,33 @@ extern "c" fn hv_gic_get_redistributor_reg(vcpu: hvf.VcpuHandle, reg: u32, value
 extern "c" fn hv_gic_set_redistributor_reg(vcpu: hvf.VcpuHandle, reg: u32, value: u64) hvf.ReturnCode;
 
 pub const Region = enum { distributor, redistributor };
+
+pub const StrictAccessError = error{UnsupportedGicRegister};
+
+/// Strict snapshot/probe read path. Unlike `mmioRead`, unsupported offsets are
+/// errors because callers are trying to prove whether a portable state mapping
+/// is complete.
+pub fn readRegStrict(region: Region, vcpu: hvf.VcpuHandle, spec: gicv3.RegSpec) StrictAccessError!gicv3.MmioReg {
+    var value: u64 = 0;
+    const ret = switch (region) {
+        .distributor => hv_gic_get_distributor_reg(@intCast(spec.offset & 0xffff), &value),
+        .redistributor => hv_gic_get_redistributor_reg(vcpu, spec.offset, &value),
+    };
+    if (ret != hvf.success) return error.UnsupportedGicRegister;
+    if (spec.width_bits == 32) value &= 0xffff_ffff;
+    return .{ .offset = spec.offset, .width_bits = spec.width_bits, .value = value };
+}
+
+/// Strict snapshot/probe write path. This is not used by guest MMIO emulation;
+/// it exists so future portable restore code can fail closed on unsupported
+/// HVF GIC offsets instead of silently dropping state.
+pub fn writeRegStrict(region: Region, vcpu: hvf.VcpuHandle, reg: gicv3.MmioReg) StrictAccessError!void {
+    const ret = switch (region) {
+        .distributor => hv_gic_set_distributor_reg(@intCast(reg.offset & 0xffff), reg.value),
+        .redistributor => hv_gic_set_redistributor_reg(vcpu, reg.offset, reg.value),
+    };
+    if (ret != hvf.success) return error.UnsupportedGicRegister;
+}
 
 /// Service a trapped read from a GIC frame. Unknown registers read as zero.
 pub fn mmioRead(region: Region, vcpu: hvf.VcpuHandle, offset: u64, size_log2: u2) u64 {
