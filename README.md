@@ -56,6 +56,8 @@ Use an initrd-capable kernel such as the `cleanroom-kernels` `initrd` profile;
 the default `rootfs` profile intentionally ignores external initrds.
 Build the tiny ticker initrd used by smoke tests with
 `scripts/make-smoke-initrd.sh /tmp/sporevm-smoke.cpio`.
+Run same-host restore smokes, or split cross-host capture/resume legs, with
+`scripts/smoke-restore-leg.sh`.
 
 KVM work needs an aarch64 Linux host with KVM; Hypervisor.framework work needs
 an Apple Silicon Mac on macOS 15+.

@@ -304,8 +304,10 @@ initrd in `/chosen/linux,initrd-{start,end}`, and place it after the kernel so
 the first positive cross-hypervisor smoke can be diskless when using the
 `cleanroom-kernels` `initrd` profile (the default `rootfs` kernel profile
 intentionally ignores external initrds). `scripts/make-smoke-initrd.sh` builds
-the tiny ticker initrd used for those smokes. The four-way cross-hypervisor
-matrix (slice 4) remains next.
+the tiny ticker initrd used for those smokes, and
+`scripts/smoke-restore-leg.sh` runs same-host or split capture/resume legs for
+the matrix without hiding cross-host spore transfer. The four-way
+cross-hypervisor matrix (slice 4) remains next.
 
 ## Delivery Strategy
 
