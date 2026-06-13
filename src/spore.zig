@@ -33,6 +33,10 @@ pub const Platform = struct {
     ram_size: u64,
     gic_dist_base: u64,
     gic_redist_base: u64,
+    /// Architected counter frequency in Hz. `machine.vtimer` values are in
+    /// this tick domain; restore requires an exact match until cross-frequency
+    /// timer virtualization has a real design.
+    counter_frequency_hz: u64,
 };
 
 pub const QueueState = struct {
@@ -236,6 +240,11 @@ pub fn loadManifest(allocator: std.mem.Allocator, dir: []const u8) Error!std.jso
 
 fn validateManifest(manifest: Manifest) Error!void {
     if (manifest.version != format_version) return error.BadManifest;
+    if (manifest.platform.counter_frequency_hz == 0 or
+        manifest.platform.counter_frequency_hz > std.math.maxInt(u32))
+    {
+        return error.BadManifest;
+    }
     gicv3.validate(manifest.machine.gic) catch return error.BadManifest;
 }
 
@@ -366,6 +375,7 @@ test "manifest json round-trip" {
             .ram_size = 1 << 29,
             .gic_dist_base = 0x0800_0000,
             .gic_redist_base = 0x0801_0000,
+            .counter_frequency_hz = 24_000_000,
         },
         .machine = .{
             .gprs = [_]u64{0} ** 31,
@@ -399,6 +409,7 @@ test "manifest json round-trip" {
     defer parsed.deinit();
     try std.testing.expectEqual(@as(u32, 0), parsed.value.version);
     try std.testing.expectEqual(@as(u64, 0x8000_0000), parsed.value.platform.ram_base);
+    try std.testing.expectEqual(@as(u64, 24_000_000), parsed.value.platform.counter_frequency_hz);
     try std.testing.expectEqual(@as(u64, 123), parsed.value.machine.vtimer.cntvct);
     try std.testing.expectEqualStrings("sctlr_el1", parsed.value.machine.sys_regs[0].name);
     try std.testing.expectEqual(gicv3.StateKind.gicv3, parsed.value.machine.gic.kind);
@@ -421,6 +432,7 @@ test "backend-private GIC state json round-trip" {
             .ram_size = 1 << 29,
             .gic_dist_base = 0x0800_0000,
             .gic_redist_base = 0x0801_0000,
+            .counter_frequency_hz = 24_000_000,
         },
         .machine = .{
             .gprs = [_]u64{0} ** 31,
@@ -451,4 +463,42 @@ test "backend-private GIC state json round-trip" {
     try std.testing.expectEqual(gicv3.StateKind.backend_private, parsed.value.machine.gic.kind);
     try std.testing.expectEqual(gicv3.BackendKind.hvf, parsed.value.machine.gic.backend_private.?.backend);
     try std.testing.expectEqualStrings(gicv3.hvf_backend_private_format, parsed.value.machine.gic.backend_private.?.format);
+}
+
+test "manifest rejects invalid counter frequency" {
+    var manifest = Manifest{
+        .platform = .{
+            .device_model_version = 4,
+            .ram_base = 0x8000_0000,
+            .ram_size = 1 << 29,
+            .gic_dist_base = 0x0800_0000,
+            .gic_redist_base = 0x0801_0000,
+            .counter_frequency_hz = 0,
+        },
+        .machine = .{
+            .gprs = [_]u64{0} ** 31,
+            .pc = 0,
+            .cpsr = 0,
+            .fpcr = 0,
+            .fpsr = 0,
+            .simd = [_][2]u64{.{ 0, 0 }} ** 32,
+            .sys_regs = &.{},
+            .icc_regs = &.{},
+            .vtimer = .{ .cntvct = 0, .cntv_ctl = 0, .cntv_cval = 0 },
+            .gic = .{
+                .kind = .backend_private,
+                .backend_private = .{
+                    .backend = .hvf,
+                    .format = gicv3.hvf_backend_private_format,
+                    .data_b64 = "AAAA",
+                },
+            },
+        },
+        .devices = &.{},
+        .generation = .{ .generation = 0, .interrupt_status = 0, .params_b64 = "" },
+        .memory = .{ .chunk_size = chunk_size, .chunks = &.{} },
+    };
+    try std.testing.expectError(error.BadManifest, validateManifest(manifest));
+    manifest.platform.counter_frequency_hz = @as(u64, std.math.maxInt(u32)) + 1;
+    try std.testing.expectError(error.BadManifest, validateManifest(manifest));
 }

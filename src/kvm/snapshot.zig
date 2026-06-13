@@ -68,6 +68,12 @@ pub fn hostCounter() u64 {
     );
 }
 
+pub fn hostCounterFreq() u64 {
+    return asm volatile ("mrs %[ret], cntfrq_el0"
+        : [ret] "=r" (-> u64),
+    );
+}
+
 pub fn captureMachine(allocator: std.mem.Allocator, gic_fd: std.c.fd_t, vcpu_fd: std.c.fd_t) !spore.MachineState {
     var state: spore.MachineState = undefined;
 

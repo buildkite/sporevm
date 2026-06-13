@@ -148,6 +148,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     if (config.resume_dir) |spore_dir| {
         // Restore: memory, device, GIC, and vCPU state from the spore.
         const m = resume_parsed.?.value;
+        const host_counter_frequency_hz = snapshot.hostCounterFreq();
         if (m.version != spore.format_version or
             m.platform.device_model_version != board.device_model_version or
             m.platform.ram_base != board.ram_base or
@@ -156,6 +157,13 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             m.platform.gic_redist_base != vcpu_redist_base or
             m.devices.len != transports.len)
         {
+            return error.PlatformMismatch;
+        }
+        if (m.platform.counter_frequency_hz != host_counter_frequency_hz) {
+            std.log.err(
+                "counter frequency mismatch: spore={d}Hz host={d}Hz; cross-frequency architected timer restore unsupported",
+                .{ m.platform.counter_frequency_hz, host_counter_frequency_hz },
+            );
             return error.PlatformMismatch;
         }
         try spore.loadMemory(allocator, spore_dir, m.memory, ram_bytes);
@@ -297,6 +305,7 @@ fn takeSnapshot(
             .ram_size = platform.ram_size,
             .gic_dist_base = platform.dist_base,
             .gic_redist_base = platform.redist_base,
+            .counter_frequency_hz = snapshot.hostCounterFreq(),
         },
         .machine = machine,
         .devices = devices,
