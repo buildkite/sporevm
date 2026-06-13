@@ -159,19 +159,25 @@ pub const Blk = struct {
         switch (req_type) {
             req_in, req_out => {
                 const want_writable = req_type == req_in;
-                var offset = sector * sector_size;
+                const capacity_bytes = self.capacity_sectors * sector_size;
+                var offset = std.math.mul(u64, sector, sector_size) catch return failStatus(status);
                 var moved: u32 = 0;
                 for (data) |seg| {
                     if (seg.writable != want_writable) return failStatus(status);
                     if (seg.data.len % sector_size != 0) return failStatus(status);
-                    if (offset + seg.data.len > self.capacity_sectors * sector_size) return failStatus(status);
+                    const seg_len = std.math.cast(u64, seg.data.len) orelse return failStatus(status);
+                    const end = std.math.add(u64, offset, seg_len) catch return failStatus(status);
+                    if (end > capacity_bytes) return failStatus(status);
                     const ok = if (want_writable)
                         self.backend.readAt(seg.data, offset)
                     else
                         self.backend.writeAt(seg.data, offset);
                     if (!ok) return failStatus(status);
-                    offset += seg.data.len;
-                    if (want_writable) moved += @intCast(seg.data.len);
+                    offset = end;
+                    if (want_writable) {
+                        const written = std.math.cast(u32, seg.data.len) orelse return failStatus(status);
+                        moved = std.math.add(u32, moved, written) catch return failStatus(status);
+                    }
                 }
                 status.data[0] = status_ok;
                 return moved + 1;
@@ -189,7 +195,8 @@ pub const Blk = struct {
                     @memset(seg.data, 0);
                     const n = @min(seg.data.len, id.len);
                     @memcpy(seg.data[0..n], id[0..n]);
-                    moved += @intCast(seg.data.len);
+                    const written = std.math.cast(u32, seg.data.len) orelse return failStatus(status);
+                    moved = std.math.add(u32, moved, written) catch return failStatus(status);
                 }
                 status.data[0] = status_ok;
                 return moved + 1;
@@ -294,6 +301,56 @@ test "malformed framing and unknown types are safe" {
     });
     _ = blk.handleRequest(&chain);
     try std.testing.expectEqual(status_unsupp, status[0]);
+}
+
+test "huge sector fails closed" {
+    var disk = [_]u8{0} ** sector_size;
+    var blk = Blk.init(.{ .memory = &disk });
+
+    var header: [16]u8 = [_]u8{0} ** 16;
+    std.mem.writeInt(u32, header[0..4], req_in, .little);
+    std.mem.writeInt(u64, header[8..16], std.math.maxInt(u64), .little);
+    var data: [sector_size]u8 = undefined;
+    var status: [1]u8 = .{0xff};
+
+    const chain = makeChain(&.{
+        .{ .data = &header, .writable = false },
+        .{ .data = &data, .writable = true },
+        .{ .data = &status, .writable = true },
+    });
+    _ = blk.handleRequest(&chain);
+    try std.testing.expectEqual(status_ioerr, status[0]);
+}
+
+fn fuzzBlkRequest(_: void, s: *std.testing.Smith) !void {
+    // Request headers, segment writability, lengths, and data are guest
+    // controlled. The block parser must fail closed rather than crash or walk
+    // outside its backend.
+    var disk = [_]u8{0} ** (4 * sector_size);
+    var blk = Blk.init(.{ .memory = &disk });
+
+    var seg_bufs: [6][1024]u8 = undefined;
+    for (&seg_bufs) |*buf| {
+        @memset(buf, 0);
+        _ = s.slice(buf);
+    }
+
+    var chain = queue.Chain{ .head = 0, .segments = .{} };
+    const segment_count: usize = @intCast(s.value(u8) % (seg_bufs.len + 1));
+    var i: usize = 0;
+    while (i < segment_count) : (i += 1) {
+        const len: usize = @intCast(s.value(u16) % (seg_bufs[i].len + 1));
+        chain.segments.append(.{
+            .data = seg_bufs[i][0..len],
+            .writable = (s.value(u8) & 1) != 0,
+        }) catch unreachable;
+    }
+
+    _ = blk.handleRequest(&chain);
+}
+
+test "fuzz block request handling" {
+    try std.testing.fuzz({}, fuzzBlkRequest, .{});
 }
 
 test "config space reports capacity in sectors" {

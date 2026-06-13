@@ -26,5 +26,13 @@ pub const version = "0.0.0";
 
 test {
     // Ensure all referenced modules' tests are discovered.
-    @import("std").testing.refAllDecls(@This());
+    const testing = @import("std").testing;
+    testing.refAllDecls(@This());
+    testing.refAllDecls(virtio.queue);
+    testing.refAllDecls(virtio.mmio);
+    testing.refAllDecls(virtio.console);
+    testing.refAllDecls(virtio.blk);
+    testing.refAllDecls(virtio.net);
+    testing.refAllDecls(virtio.rng);
+    testing.refAllDecls(virtio.vsock);
 }
