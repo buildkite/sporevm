@@ -198,45 +198,31 @@ fn applyGic(gic_fd: std.c.fd_t, state: gicv3.State) !void {
 }
 
 fn appendDistRegs(allocator: std.mem.Allocator, regs: *std.ArrayList(gicv3.MmioReg), gic_fd: std.c.fd_t) !void {
-    const one_word_offsets = [_]u32{
-        0x000, // GICD_CTLR
-        0x084, // GICD_IGROUPR1
-        0x104, // GICD_ISENABLER1
-        0x204, // GICD_ISPENDR1
-        0x304, // GICD_ISACTIVER1
-        0xd04, // GICD_IGRPMODR1
-    };
-    for (one_word_offsets) |offset| try appendDistReg32(allocator, regs, gic_fd, offset);
+    var specs: std.ArrayList(gicv3.RegSpec) = .empty;
+    defer specs.deinit(allocator);
+    try gicv3.appendDistRegSpecs(allocator, &specs);
 
-    var off: u32 = 0x420; // GICD_IPRIORITYR for INTIDs 32..63.
-    while (off < 0x440) : (off += 4) try appendDistReg32(allocator, regs, gic_fd, off);
-
-    off = 0xc08; // GICD_ICFGR for INTIDs 32..63.
-    while (off < 0xc10) : (off += 4) try appendDistReg32(allocator, regs, gic_fd, off);
-
-    var intid: u32 = 32;
-    while (intid <= board.generationIntid()) : (intid += 1) {
-        try appendDistReg64(allocator, regs, gic_fd, gicv3.distRouterOffset(intid));
+    for (specs.items) |spec| {
+        switch (spec.width_bits) {
+            32 => try appendDistReg32(allocator, regs, gic_fd, spec.offset),
+            64 => try appendDistReg64(allocator, regs, gic_fd, spec.offset),
+            else => unreachable,
+        }
     }
 }
 
 fn appendRedistRegs(allocator: std.mem.Allocator, regs: *std.ArrayList(gicv3.MmioReg), gic_fd: std.c.fd_t) !void {
-    const one_word_offsets = [_]u32{
-        0x0000, // GICR_CTLR
-        0x0014, // GICR_WAKER
-        0x10080, // GICR_IGROUPR0
-        0x10100, // GICR_ISENABLER0
-        0x10200, // GICR_ISPENDR0
-        0x10300, // GICR_ISACTIVER0
-        0x10d00, // GICR_IGRPMODR0
-    };
-    for (one_word_offsets) |offset| try appendRedistReg32(allocator, regs, gic_fd, offset);
+    var specs: std.ArrayList(gicv3.RegSpec) = .empty;
+    defer specs.deinit(allocator);
+    try gicv3.appendRedistRegSpecs(allocator, &specs);
 
-    var off: u32 = 0x10400; // GICR_IPRIORITYR for SGIs/PPIs.
-    while (off < 0x10420) : (off += 4) try appendRedistReg32(allocator, regs, gic_fd, off);
-
-    off = 0x10c00; // GICR_ICFGR for SGIs/PPIs.
-    while (off < 0x10c08) : (off += 4) try appendRedistReg32(allocator, regs, gic_fd, off);
+    for (specs.items) |spec| {
+        switch (spec.width_bits) {
+            32 => try appendRedistReg32(allocator, regs, gic_fd, spec.offset),
+            64 => try appendRedistReg64(allocator, regs, gic_fd, spec.offset),
+            else => unreachable,
+        }
+    }
 }
 
 fn appendLevelRegs(allocator: std.mem.Allocator, levels: *std.ArrayList(gicv3.LineLevel), gic_fd: std.c.fd_t) !void {
@@ -264,6 +250,12 @@ fn appendDistReg64(allocator: std.mem.Allocator, regs: *std.ArrayList(gicv3.Mmio
 fn appendRedistReg32(allocator: std.mem.Allocator, regs: *std.ArrayList(gicv3.MmioReg), gic_fd: std.c.fd_t, offset: u32) !void {
     if (try kvm.getDeviceAttrMaybeU32(gic_fd, kvm.KVM_DEV_ARM_VGIC_GRP_REDIST_REGS, redistAttr(offset), "get vgic redist reg")) |value| {
         try regs.append(allocator, .{ .offset = offset, .width_bits = 32, .value = value });
+    }
+}
+
+fn appendRedistReg64(allocator: std.mem.Allocator, regs: *std.ArrayList(gicv3.MmioReg), gic_fd: std.c.fd_t, offset: u32) !void {
+    if (try kvm.getDeviceAttrMaybeU64(gic_fd, kvm.KVM_DEV_ARM_VGIC_GRP_REDIST_REGS, redistAttr(offset), "get vgic redist reg")) |value| {
+        try regs.append(allocator, .{ .offset = offset, .width_bits = 64, .value = value });
     }
 }
 

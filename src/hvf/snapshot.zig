@@ -184,6 +184,11 @@ fn captureGic(allocator: std.mem.Allocator) ![]const u8 {
 
 fn applyGic(allocator: std.mem.Allocator, state: gicv3.State) !void {
     try gicv3.validate(state);
+    if (state.kind == .gicv3) {
+        std.log.err("HVF portable GICv3 restore is not enabled; refusing cross-backend GIC state", .{});
+        return error.PlatformMismatch;
+    }
+
     const private = state.backend_private orelse return error.PlatformMismatch;
     if (private.backend != .hvf or !std.mem.eql(u8, private.format, gicv3.hvf_backend_private_format)) {
         return error.PlatformMismatch;
