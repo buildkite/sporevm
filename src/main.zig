@@ -1,7 +1,6 @@
 //! The `spore` CLI.
 //!
-//! Temporary narrow surface. Lifecycle commands land with their slices; see
-//! docs/plans/foundation.md.
+//! Lifecycle commands land with their slices; see docs/plans/foundation.md.
 
 const std = @import("std");
 const Io = std.Io;
@@ -11,6 +10,7 @@ const usage =
     \\Usage: spore <command>
     \\
     \\Commands:
+    \\  rootfs              Build rootfs images from OCI images
     \\  version             Print the sporevm version
     \\  host-info           Print this host's platform facts as JSON
     \\  inspect <spore-dir> Print a spore manifest summary as JSON
@@ -33,7 +33,9 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const command = args[1];
-    if (std.mem.eql(u8, command, "version")) {
+    if (std.mem.eql(u8, command, "rootfs")) {
+        try sporevm.rootfs.run(init, args[2..], stdout);
+    } else if (std.mem.eql(u8, command, "version")) {
         try stdout.print("spore {s}\n", .{sporevm.version});
     } else if (std.mem.eql(u8, command, "host-info")) {
         try printJson(arena, stdout, try sporevm.platform.hostInfo());
@@ -88,6 +90,7 @@ fn inspectSummary(manifest: sporevm.spore.Manifest) InspectSummary {
 }
 
 test "usage names every command" {
+    try std.testing.expect(std.mem.indexOf(u8, usage, "rootfs") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "version") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "host-info") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "inspect") != null);
