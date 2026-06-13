@@ -257,13 +257,12 @@ test "not-ready queue is rejected" {
     try std.testing.expectError(error.QueueNotReady, t.q.popAvail(t.ram()));
 }
 
-fn fuzzPop(_: void, input: []const u8) !void {
+fn fuzzPop(_: void, s: *std.testing.Smith) !void {
     // Treat fuzz input as raw guest memory: rings and descriptors are fully
     // attacker controlled. popAvail must never crash, hang, or touch memory
     // outside the provided region.
     var buf: [4096]u8 = [_]u8{0} ** 4096;
-    const n = @min(input.len, buf.len);
-    @memcpy(buf[0..n], input[0..n]);
+    _ = s.slice(&buf);
     var q = VirtQueue{
         .size = 8,
         .ready = true,

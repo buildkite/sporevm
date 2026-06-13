@@ -123,9 +123,67 @@ pub const SysReg = enum(u16) {
     midr_el1 = 0xc000,
     mpidr_el1 = 0xc005,
     sctlr_el1 = 0xc080,
+    cpacr_el1 = 0xc082,
+    ttbr0_el1 = 0xc100,
+    ttbr1_el1 = 0xc101,
+    tcr_el1 = 0xc102,
+    spsr_el1 = 0xc200,
+    elr_el1 = 0xc201,
+    sp_el0 = 0xc208,
+    afsr0_el1 = 0xc288,
+    afsr1_el1 = 0xc289,
+    esr_el1 = 0xc290,
+    far_el1 = 0xc300,
+    par_el1 = 0xc3a0,
+    mair_el1 = 0xc510,
+    amair_el1 = 0xc518,
+    vbar_el1 = 0xc600,
+    contextidr_el1 = 0xc681,
+    tpidr_el1 = 0xc684,
+    cntkctl_el1 = 0xc708,
+    csselr_el1 = 0xd000,
+    tpidr_el0 = 0xde82,
+    tpidrro_el0 = 0xde83,
+    cntv_ctl_el0 = 0xdf19,
     cntv_cval_el0 = 0xdf1a,
+    sp_el1 = 0xe208,
     _,
 };
+
+/// 16-byte SIMD&FP register value (hv_simd_fp_uchar16_t).
+pub const SimdReg = extern struct {
+    bytes: [16]u8 align(16),
+};
+
+pub extern "c" fn hv_vcpu_get_simd_fp_reg(vcpu: VcpuHandle, reg: u32, value: *SimdReg) ReturnCode;
+pub extern "c" fn hv_vcpu_set_simd_fp_reg(vcpu: VcpuHandle, reg: u32, value: SimdReg) ReturnCode;
+pub extern "c" fn hv_vcpu_get_vtimer_offset(vcpu: VcpuHandle, offset: *u64) ReturnCode;
+pub extern "c" fn hv_vcpu_set_vtimer_offset(vcpu: VcpuHandle, offset: u64) ReturnCode;
+
+/// hv_gic_icc_reg_t (u16): per-vCPU GIC CPU-interface system registers.
+/// These are not part of the hv_gic state blob and must be saved/restored
+/// individually.
+pub const IccReg = enum(u16) {
+    pmr_el1 = 0xc230,
+    bpr0_el1 = 0xc643,
+    ap0r0_el1 = 0xc644,
+    ap1r0_el1 = 0xc648,
+    bpr1_el1 = 0xc663,
+    ctlr_el1 = 0xc664,
+    sre_el1 = 0xc665,
+    igrpen0_el1 = 0xc666,
+    igrpen1_el1 = 0xc667,
+    _,
+};
+
+pub extern "c" fn hv_gic_get_icc_reg(vcpu: VcpuHandle, reg: IccReg, value: *u64) ReturnCode;
+pub extern "c" fn hv_gic_set_icc_reg(vcpu: VcpuHandle, reg: IccReg, value: u64) ReturnCode;
+
+// GIC state save/restore (macOS 15+).
+pub extern "c" fn hv_gic_state_create() ?*anyopaque;
+pub extern "c" fn hv_gic_state_get_size(state: *anyopaque, size: *usize) ReturnCode;
+pub extern "c" fn hv_gic_state_get_data(state: *anyopaque, data: [*]u8) ReturnCode;
+pub extern "c" fn hv_gic_set_state(data: [*]const u8, size: usize) ReturnCode;
 pub extern "c" fn hv_vcpus_exit(vcpus: [*]VcpuHandle, vcpu_count: u32) ReturnCode;
 
 // GICv3 (macOS 15+). hv_gic_create must run after hv_vm_create and before

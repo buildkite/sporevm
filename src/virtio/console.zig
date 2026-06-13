@@ -9,6 +9,7 @@ const queue = @import("queue.zig");
 const mmio = @import("mmio.zig");
 
 pub const device_id: u32 = 3;
+const rx_queue = 0;
 const tx_queue = 1;
 
 pub const Console = struct {
@@ -24,6 +25,30 @@ pub const Console = struct {
             .queue_count = 2,
             .notifyFn = notify,
         };
+    }
+
+    /// Push host input into the guest's receive queue. Returns the number of
+    /// bytes consumed (0 when the guest has no buffers posted); the caller
+    /// raises the device interrupt when non-zero and marks interrupt status.
+    pub fn feed(self: *Console, t: *mmio.Transport, ram: guestmem.GuestRam, bytes: []const u8) usize {
+        _ = self;
+        const q = &t.queues[rx_queue];
+        var consumed: usize = 0;
+        while (consumed < bytes.len) {
+            const maybe_chain = q.popAvail(ram) catch return consumed;
+            const chain = maybe_chain orelse break;
+            var written: u32 = 0;
+            for (chain.segments.slice()) |seg| {
+                if (!seg.writable or consumed >= bytes.len) continue;
+                const n = @min(seg.data.len, bytes.len - consumed);
+                @memcpy(seg.data[0..n], bytes[consumed..][0..n]);
+                consumed += n;
+                written += @intCast(n);
+            }
+            q.pushUsed(ram, chain.head, written) catch return consumed;
+            if (written > 0) t.interrupt_status |= 1;
+        }
+        return consumed;
     }
 
     fn notify(ctx: *anyopaque, queue_index: u8, q: *queue.VirtQueue, ram: guestmem.GuestRam) bool {

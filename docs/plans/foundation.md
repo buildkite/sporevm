@@ -242,6 +242,24 @@ and PSCI. HVF bring-up findings now encoded in `src/hvf/`:
 - The cleanroom kernel has no PL011, so the first console is virtio-mmio
   virtio-console (hvc0) and early boot is blind until virtio probes.
 
+Slice 2 has since reached an interactive shell on HVF: virtio-blk against a
+cleanroom-built alpine ext4 rootfs, console input (rx queue plus idle-exit
+stdin polling), and `init=/bin/sh` workloads run end to end. net, vsock, and
+rng remain open within slice 2's device set.
+
+Slice 3 has landed on the HVF side: spore manifest v0 (`docs/spore-format.md`,
+`src/spore.zig`) with content-addressed zero-elided memory chunks, normalized
+machine state (GPRs, SIMD, EL1 sysregs, ICC regs, virtual-timer re-anchoring),
+hv_gic state blob capture/restore, and virtio transport state. Demonstrated: a
+shell counter loop snapshotted at tick 8 resumes at tick 9 in a fresh process
+(`hvf-boot --snapshot-after-ms/--spore/--resume`). A 512MiB idle guest spores
+to ~26MB. Key finding: GIC ICC (CPU-interface) registers are not part of the
+hv_gic state blob and must be saved per-vCPU via `hv_gic_{get,set}_icc_reg` —
+without them the resumed guest hangs with all interrupts masked. v0 does not
+capture disk state: resume requires the unmodified backing disk file
+(documented in the format doc). KVM-side suspend/restore and the four-way
+matrix (slice 4) wait on the arm64 dev host.
+
 ## Delivery Strategy
 
 Each slice is a reviewable unit with a runnable result. KVM work needs an

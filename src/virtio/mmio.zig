@@ -264,18 +264,18 @@ test "status write of zero resets transport state" {
     try std.testing.expectEqual(@as(u16, 0), t.queues[0].size);
 }
 
-fn fuzzMmio(_: void, input: []const u8) !void {
-    // Random register program: alternating offset/value pairs. Must never
-    // crash regardless of order or content.
+fn fuzzMmio(_: void, s: *std.testing.Smith) !void {
+    // Random register program. Must never crash regardless of order or
+    // content of register accesses.
     var td = TestDev{};
     var t = Transport.init(td.dev());
     var buf: [4096]u8 = [_]u8{0} ** 4096;
     const ram = testRam(&buf);
-    var i: usize = 0;
-    while (i + 8 <= input.len) : (i += 8) {
-        const off = std.mem.readInt(u32, input[i..][0..4], .little) % 0x240;
-        const val = std.mem.readInt(u32, input[i + 4 ..][0..4], .little);
-        if (off % 2 == 0) {
+    var ops: usize = 64;
+    while (ops > 0 and !s.eos()) : (ops -= 1) {
+        const off = s.valueRangeLessThan(u32, 0, 0x240);
+        const val = s.value(u32);
+        if (s.boolWeighted(1, 1)) {
             _ = t.write(off, val, ram);
         } else {
             _ = t.read(off);
