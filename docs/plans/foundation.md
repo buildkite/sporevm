@@ -160,8 +160,23 @@ gateway/content-cache) can serve them.
 
 ### Memory and lifecycle model
 
-Guest RAM is a VMM-owned file-backed mapping registered with the hypervisor.
-Three mechanisms hang off that:
+Guest RAM is a VMM-owned mapping registered with the hypervisor. The target
+model has two materialization modes:
+
+- **Same-host hot fork**: keep the paused parent's sealed RAM backing alive and
+  map each child privately over it. Child reads share the parent's physical
+  pages; child writes fault into private CoW pages. On Linux this should be a
+  `memfd`/file-backed RAM object passed explicitly to child monitors over the
+  unix control socket with `SCM_RIGHTS`, then mapped `MAP_PRIVATE` before
+  `KVM_SET_USER_MEMORY_REGION`. HVF needs the backend-equivalent private
+  remap/file-backed path; until it exists, it fails closed to the eager or
+  lazy-CAS path rather than pretending to be elastic. This is the primary
+  identical-host fan-out path.
+- **Portable or cold restore**: materialize from the spore memory manifest and
+  CAS. The eager v0 path copies every chunk up front; the lazy path below
+  faults chunks in only when touched.
+
+Three lifecycle mechanisms hang off those backing modes:
 
 - **Dirty tracking**: KVM dirty ring on Linux; write-protection fault exits on
   HVF. A background thread seals dirty pages into CAS chunks on an epoch
@@ -171,10 +186,12 @@ Three mechanisms hang off that:
   unmapped-memory vm-exits on HVF — backed by local CAS, then peers, then
   origin. The access trace drives readahead so the guest does useful work
   while the tail faults in.
-- **Fork**: mint a new manifest referencing the parent's chunks (CoW), assign
-  a new VM identity, resume with the generation counter incremented. The guest
-  agent reacts: machine-id/hostname/MAC fixups, RNG reseed via virtio-rng,
-  forced clock step, "generation changed" signal to userspace.
+- **Fork**: mint a new manifest referencing the parent's chunks and, on the
+  same host, optionally retain a private CoW RAM backing handle for immediate
+  child resume. Assign a new VM identity and resume with the generation counter
+  incremented. The guest agent reacts: machine-id/hostname/MAC fixups, RNG
+  reseed via virtio-rng, forced clock step, "generation changed" signal to
+  userspace.
 
 ### Ownership boundaries
 
@@ -200,6 +217,10 @@ That is a deliberate tradeoff and it is bought back structurally, not by hope:
 - The monitor process is jailed: seccomp allowlist on Linux, sandbox profile
   and minimal entitlements on macOS. The jail lands before the first release,
   not after.
+- Same-host RAM sharing uses explicit fd transfer between trusted monitor
+  processes, not broad process introspection permissions. A forkable parent is
+  a deliberately managed runtime state, not a reason to make VM processes
+  generally dumpable or inspectable.
 - Chunks are verified against their blake3 id before being mapped into guest
   memory; a malicious peer can deny service but not inject state.
 - No secrets ever enter the VMM process or the spore format.
@@ -278,9 +299,11 @@ machine-id, entropy and clock fixups, then acks the generation interrupt last;
 `scripts/smoke-fork-fanout.sh` exercises parent capture plus same-host child
 fan-out. HVF and KVM now pass `--count 8` same-host fan-out smokes, with KVM
 validated on the `m7g.metal` host using the `cleanroom-kernels` v0.3.0
-`sporevm-arm64-linux-6.1.155-Image` asset. The remaining slice-4 gap is scaling
-that smoke from the current small fan-out harness to the 100-concurrent-fork
-target and recording the latency measurement.
+`sporevm-arm64-linux-6.1.155-Image` asset. The remaining slice-4 gap is
+recording fork/resume latency and, at most, bounded-parallel correctness. A
+true 100-concurrent 512MiB fork storm with reasonable host RSS belongs after
+the same-host CoW RAM backing lands; otherwise the test mostly proves the host
+has enough RAM for eager restores.
 
 Cross-backend restore is intentionally secondary. KVM→HVF can map portable
 vCPU, virtio, generation, CPU-profile, and GIC apply state, but `m7g.metal`
@@ -349,23 +372,33 @@ The release-critical result. `spore fork --count N` mints manifests CoW for an
 already-captured spore and resumes each child on an identical host class with an
 incremented generation. Generation device, in-guest fixup helper (machine-id,
 hostname, MAC, RNG reseed, clock step, userspace signal). Same-host fork storm
-test first; identical-host fleet fan-out follows once distribution lands.
+correctness first; identical-host fleet fan-out follows once elastic RAM
+backing and distribution land.
 
-Done when: 100 concurrent same-host forks of one spore run distinct workloads
-with distinct identities, no entropy or clock anomalies, and fork latency is
-measured in milliseconds.
+Done when: a same-host fan-out smoke runs a representative batch of children
+with distinct identities, no entropy or clock anomalies, and fork/resume latency
+is recorded. The high-concurrency memory-efficiency gate moves to Slice 5 so we
+do not mistake eager restore host capacity for fork architecture.
 
-### Slice 5: Lazy restore for identical host classes
+### Slice 5: Elastic same-host RAM and lazy restore
 
-Restore maps memory empty and materializes pages on fault: userfaultfd on
-Linux, unmapped-memory exits on HVF. Record an access trace on first resume;
-use it for readahead on later resumes. Benchmark resume time-to-first-
-instruction and time-to-useful-work against slice 3's eager restore.
+First land the identical-host hot fork path: parent RAM is file-backed and
+sealed while children map it privately CoW, so N children cost parent RAM plus
+dirty child pages rather than N × declared guest RAM. On Linux this is a
+`memfd`/file-backed mapping passed to child monitors with `SCM_RIGHTS`; on HVF
+use the closest private remap/file-backed path or fail closed until supported.
+Then layer cold lazy restore over CAS: restore maps memory empty and
+materializes pages on fault with userfaultfd on Linux and unmapped-memory exits
+on HVF. Record an access trace on first resume; use it for readahead on later
+resumes. Benchmark resume time-to-first-instruction and time-to-useful-work
+against slice 3's eager restore.
 
-Done when: resume TTFI is independent of RAM size on the primary KVM host class
-and the benchmark harness tracks it in CI (or a recorded manual run where CI
-hardware does not exist). HVF remains useful as a second implementation path,
-but does not block identical-host fan-out.
+Done when: 100 concurrent same-host forks of one 512MiB spore run distinct
+workloads with host RSS proportional to the parent's RAM plus dirty child
+working sets, not N × RAM; resume TTFI is independent of RAM size on the
+primary KVM host class; and the benchmark harness tracks it in CI (or a
+recorded manual run where CI hardware does not exist). HVF remains useful as a
+second implementation path, but does not block identical-host fan-out.
 
 ### Slice 6: Identical-host fan-out distribution
 
@@ -415,9 +448,12 @@ one positive cross-backend direction works on compatible timer-profile hosts.
   inputs. Fuzz targets are added in the same slice as the parsing code and run
   continuously in CI.
 - Smoke (real hardware): boot on KVM and HVF; suspend/resume matrix; fork
-  storm; lazy-restore TTFI. Scripts in `scripts/` so they run identically in
-  CI and by hand. Hosts come from the `cleanroom-ops` fleet (aarch64 KVM dev
-  boxes; Apple Silicon for the HVF side).
+  storm; lazy-restore TTFI. Fork-storm smokes must report child count,
+  fork/resume latency, host RSS, and dirty-child working-set estimates so we
+  distinguish real CoW sharing from simply provisioning more RAM. Scripts in
+  `scripts/` run identically in CI and by hand. Hosts come from the
+  `cleanroom-ops` fleet (aarch64 KVM dev boxes; Apple Silicon for the HVF
+  side).
 - Benchmarks: suspend latency vs RAM size, fork latency, resume TTFI and
   time-to-useful-work, dirty-tracking steady-state overhead. Tracked from the
   slice that introduces each mechanism, regressions visible in CI output.
@@ -430,6 +466,11 @@ one positive cross-backend direction works on compatible timer-profile hosts.
   Cross-backend portability remains useful for inspecting failed runs and
   detecting backend-private leaks in the state contract, but it must not pull
   effort away from identical-host fork, lazy restore, and distribution.
+- A 100-child eager-restore smoke mostly measures host RAM capacity. The
+  architecture gate for high-concurrency same-host fan-out is elastic RAM:
+  children must CoW-share the paused parent's backing and pay only for dirty
+  child pages. Slice 4 therefore proves generation correctness; Slice 5 proves
+  memory economics.
 - HVF dirty-tracking cost is unknown and could be materially worse than KVM's
   dirty ring. Slice 7 carries an explicit fallback (suspend-time scanning on
   macOS) and a measurement gate, so the always-checkpoint-ready property can
@@ -462,6 +503,10 @@ one positive cross-backend direction works on compatible timer-profile hosts.
 - SporeVM is standalone; cleanroom integrates via an adapter in its own repo.
 - Cross-backend restore is a diagnostic portability track, not the release
   gate for fork/fan-out on identical hosts.
+- Same-host fan-out uses explicit RAM-backing transfer and private CoW mappings
+  before claiming high-concurrency memory efficiency. Linux starts with
+  `memfd`/file-backed RAM plus `SCM_RIGHTS`; HVF support may follow with a
+  backend-specific equivalent, but KVM proves the release-critical economics.
 - MIT licensed from the first commit, but the repository stays private for
   now. The identical-host fork/fan-out demo is the natural moment to revisit
   going public.
