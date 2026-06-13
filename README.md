@@ -66,6 +66,10 @@ Build the tiny ticker initrd used by smoke tests with
 `scripts/make-smoke-initrd.sh /tmp/sporevm-smoke.cpio`.
 Run same-host restore smokes, or split cross-host capture/resume legs, with
 `scripts/smoke-restore-leg.sh`.
+Fork fan-out smokes use the separate `cleanroom-kernels` SporeVM kernel asset
+(`sporevm-arm64-linux-<version>-Image`) because the fork-aware initrd needs
+`/dev/mem` access to the fixed generation MMIO window:
+`scripts/smoke-fork-fanout.sh --backend hvf --kernel /tmp/sporevm-arm64-linux-<version>-Image`.
 Fork an already-captured spore with
 `zig-out/bin/spore fork /tmp/spore --count 100 --out /tmp/forks`; children are
 named `000000`, `000001`, and so on, and share the parent's chunk store.

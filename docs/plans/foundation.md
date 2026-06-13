@@ -261,14 +261,20 @@ HVF locally each resume the ticker through `sporevm-initrd-tick 7` via
 compatibility checks are shared, and `spore host-info` / `spore inspect` expose
 the host and spore contract fields needed to pick compatible smoke hosts.
 
-Slice 4 has started with the metadata fork path: `spore fork <spore-dir>
---count N --out DIR` writes child spore manifests named `000000`, `000001`,
-and so on, sharing the parent's chunk store with a `chunks` symlink. Each child
-gets a unique incremented generation, a pending generation-change interrupt,
-and a small JSON resume-parameter payload. KVM and HVF restore now reassert the
-generation SPI when the restored generation state is pending. The remaining
-slice-4 work is the guest-side fixup helper and a real same-host fork-storm
-smoke that proves distinct guest identities, entropy, and clock behaviour.
+Slice 4 is in progress. `spore fork <spore-dir> --count N --out DIR` writes
+child spore manifests named `000000`, `000001`, and so on, sharing the parent's
+chunk store with a `chunks` symlink. Each child gets a unique incremented
+generation, a pending generation-change interrupt, and JSON resume parameters
+with stable fork identity (`fork_batch_id`, `vm_id`, hostname, MAC seed/address).
+KVM and HVF restore reassert the generation SPI when the restored generation
+state is pending and inject volatile resume-time fields (host timestamp and
+fresh entropy seed) into the generation params page at actual resume time. The
+fork-aware smoke initrd polls the generation device, applies/logs hostname,
+machine-id, entropy and clock fixups, then acks the generation interrupt last;
+`scripts/smoke-fork-fanout.sh` exercises parent capture plus same-host child
+fan-out. The remaining slice-4 gap is scaling that smoke from the current small
+fan-out harness to the 100-concurrent-fork target and recording the latency
+measurement.
 
 Cross-backend restore is intentionally secondary. KVM→HVF can map portable
 vCPU, virtio, generation, CPU-profile, and GIC apply state, but `m7g.metal`
@@ -459,11 +465,14 @@ one positive cross-backend direction works on compatible timer-profile hosts.
   until then results are recorded manually in the plan.
 - Zig toolchain pinned via mise to the latest stable release at slice 0,
   upgraded deliberately per release.
-- Guest kernels are built and published by the `cleanroom-kernels` repo via
-  `rootfs` and `initrd` profiles suitable for SporeVM smokes. Kernel build ID
-  is not yet in the platform contract; adding it is required before claiming
-  cross-host disk-backed restore. Vendoring the config into this repo remains
-  the recorded fallback if SporeVM must be self-contained when it goes public.
+- Guest kernels are built and published by the `cleanroom-kernels` repo.
+  Cleanroom-owned `rootfs` and `initrd` profiles cover normal boot/restore
+  smokes; separate `sporevm-arm64-linux-<version>` kernel assets cover fork
+  smokes that need userspace access to SporeVM's fixed generation MMIO window.
+  Kernel build ID is not yet in the platform contract; adding it is required
+  before claiming cross-host disk-backed restore. Vendoring the config into
+  this repo remains the recorded fallback if SporeVM must be self-contained
+  when it goes public.
 - With the aarch64 KVM dev host available, proceed with a direct KVM backend
   first. Keep the QEMU-assisted GICv3 cross-check as a diagnostic fallback,
   not as a blocker before KVM restore.
