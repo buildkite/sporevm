@@ -336,26 +336,23 @@ that monitor-shaped handoff while keeping the original `kvm-boot` PID as the VM
 process for smoke sampling and cleanup. A 100-child fdpass-mode KVM run reported
 file_backed_children=100, host_memory_sampled_children=100, host_pss_kib=782723,
 child_resume_min_ms=137, and child_resume_max_ms=195. This is still a harness
-bridge, not the long-running product monitor/control socket. Remaining Slice 5
-work is monitor wiring and cold lazy restore over CAS. The first cold-lazy prep
-step split eager CAS restore into validated per-chunk helpers and added KVM
-restore phase metrics (`memory_ms`, `state_ms`, `pre_run_ms`) to establish the
-baseline that lazy restore must beat. On the `m7g.metal` host, a 512MiB
-same-host eager restore reported mode=eager_chunks, chunks=256,
-nonzero_chunks=14, memory_ms=512, and pre_run_ms=513. The first KVM lazy cut
-keeps eager restore as the default and adds an explicit `kvm-boot --lazy-ram`
-harness path that registers anonymous guest RAM with `userfaultfd` and
-materializes verified 2MiB CAS chunks on first fault. The same host smoke now
-boots in that mode with mode=lazy_chunks, chunks=256, nonzero_chunks=14,
-memory_ms=0, and pre_run_ms=2; corrupt chunk contents fail closed with
-BadChunk. The smoke harness also writes a local lazy trace with one line per
-faulted chunk and reports `ttfi_ms` (time to first KVM_RUN), `ttuw_ms` (time to
-first guest ticker), `lazy_faults`, and `lazy_unique_chunks`. On `m7g.metal`,
-512MiB eager restore reported ttfi_ms=512 and ttuw_ms=1565; 512MiB lazy restore
-reported ttfi_ms=2, ttuw_ms=1226, lazy_faults=9, and lazy_unique_chunks=9; 4GiB
-lazy restore reported ttfi_ms=3, ttuw_ms=1228, lazy_faults=10, and
-lazy_unique_chunks=10. Readahead and clean cross-thread error propagation remain
-follow-up work.
+bridge, not the long-running product monitor/control socket.
+
+Slice 5 is complete for the primary KVM same-host/fan-out proof. KVM has an
+explicit `kvm-boot --lazy-ram` harness path that keeps eager restore as the
+default, registers anonymous guest RAM with `userfaultfd`, and materializes
+verified 2MiB CAS chunks on first fault. The same host smoke boots in that mode
+with mode=lazy_chunks, chunks=256, nonzero_chunks=14, memory_ms=0, and
+pre_run_ms=2; corrupt chunk contents fail closed with BadChunk. The smoke
+harness also writes a local lazy trace with one line per faulted chunk and
+reports `ttfi_ms` (time to first KVM_RUN), `ttuw_ms` (time to first guest
+ticker), `lazy_faults`, and `lazy_unique_chunks`. On `m7g.metal`, 512MiB eager
+restore reported ttfi_ms=512 and ttuw_ms=1565; 512MiB lazy restore reported
+ttfi_ms=2, ttuw_ms=1226, lazy_faults=9, and lazy_unique_chunks=9; 4GiB lazy
+restore reported ttfi_ms=3, ttuw_ms=1228, lazy_faults=10, and
+lazy_unique_chunks=10. Product monitor wiring, readahead, and clean cross-thread
+pager error propagation remain follow-up hardening work rather than blockers for
+the release-critical identical-host path.
 
 Cross-backend restore is intentionally secondary. KVM→HVF can map portable
 vCPU, virtio, generation, CPU-profile, and GIC apply state, but `m7g.metal`
