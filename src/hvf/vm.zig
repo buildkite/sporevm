@@ -1,9 +1,9 @@
 //! HVF virtual machine: board assembly and vCPU run loop.
 //!
 //! Single-vCPU bring-up scope: boots the pinned kernel with the SporeVM
-//! board (GICv3 via hv_gic, virtio-mmio console), handles MMIO data aborts,
-//! PSCI over HVC, vtimer exits, and WFI. Multi-vCPU, snapshot, and the rest
-//! of the device set land in later slices.
+//! board (GICv3 via hv_gic, virtio-mmio console/blk/rng), handles MMIO data
+//! aborts, PSCI over HVC, vtimer exits, WFI, and HVF snapshot/resume.
+//! Multi-vCPU and the rest of the device set land in later slices.
 
 const std = @import("std");
 const hvf = @import("hvf.zig");
@@ -14,6 +14,7 @@ const guestmem = @import("../guestmem.zig");
 const mmio = @import("../virtio/mmio.zig");
 const console = @import("../virtio/console.zig");
 const blk = @import("../virtio/blk.zig");
+const rng = @import("../virtio/rng.zig");
 const spore = @import("../spore.zig");
 const snapshot = @import("snapshot.zig");
 
@@ -90,10 +91,11 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     );
     const ram = guestmem.GuestRam{ .bytes = ram_bytes, .base = board.ram_base };
 
-    // Devices: console is virtio-mmio slot 0, disk (if any) slot 1.
+    // Devices: console is virtio-mmio slot 0, disk (if any) follows, rng last.
     var con = console.Console{ .sink = config.console_sink };
     var blk_dev: blk.Blk = undefined;
-    var transports_buf: [2]mmio.Transport = undefined;
+    var rng_dev = rng.Rng{};
+    var transports_buf: [3]mmio.Transport = undefined;
     transports_buf[0] = mmio.Transport.init(con.device());
     var transport_count: usize = 1;
     if (config.disk_fd) |fd| {
@@ -101,6 +103,8 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         transports_buf[1] = mmio.Transport.init(blk_dev.device());
         transport_count = 2;
     }
+    transports_buf[transport_count] = mmio.Transport.init(rng_dev.device());
+    transport_count += 1;
     const transports = transports_buf[0..transport_count];
 
     // vCPU. Created before the DTB because the framework assigns the
