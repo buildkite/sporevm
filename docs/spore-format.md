@@ -24,15 +24,18 @@ A spore is a directory:
 - `version`: format version, currently 0. Consumers reject unknown versions.
 - `platform`: contract the restoring host must satisfy exactly — `arch`
   (aarch64), `device_model_version`, `ram_base`, `ram_size`,
-  `gic_dist_base`, `gic_redist_base`. Restore fails closed on any mismatch.
-  Device model version 4 includes the fixed virtio-mmio range plus the
-  generation MMIO device at `0x0c001000`, size `0x1000`, SPI 24 / INTID 56.
+  `gic_dist_base`, `gic_redist_base`, and `counter_frequency_hz`. Restore
+  fails closed on any mismatch. Device model version 4 includes the fixed
+  virtio-mmio range plus the generation MMIO device at `0x0c001000`, size
+  `0x1000`, SPI 24 / INTID 56.
 - `machine`: normalized architectural state for one vCPU — `gprs` (x0–x30),
   `pc`, `cpsr`, `fpcr`, `fpsr`, `simd` (32 Q registers as u64 pairs),
   `sys_regs` (EL1 context registers by architectural name), `icc_regs`
   (GICv3 CPU-interface registers by name), and `vtimer` as the guest's
-  virtual counter value plus `CNTV_CTL`/`CNTV_CVAL`. Restore re-anchors the
-  counter so guest time continues from the snapshot.
+  virtual counter value plus `CNTV_CTL`/`CNTV_CVAL`, all in the platform's
+  `counter_frequency_hz` tick domain. Restore re-anchors the counter so guest
+  time continues from the snapshot only when the target backend exposes the
+  same architected counter frequency.
 - `machine.gic`: interrupt-controller state. `kind: "gicv3"` carries a
   normalized single-vCPU GICv3 subset: distributor and redistributor register
   values by architectural MMIO offset plus sampled PPI/SPI line levels. KVM
@@ -59,6 +62,9 @@ A spore is a directory:
 - Access traces (lazy-restore prefetch hints): slice 5.
 - Multi-vCPU machine state.
 - Kernel identity in the platform contract (pinned-build enforcement).
+- Cross-frequency architected timer restore: v0 records and enforces the
+  counter frequency, but cannot translate a running Linux guest between
+  different `CNTFRQ_EL0` domains.
 
 ## Invariants that hold regardless of version
 
