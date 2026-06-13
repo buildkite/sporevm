@@ -15,6 +15,7 @@ const board = @import("board.zig");
 const chunklib = @import("chunk.zig");
 const generation = @import("generation.zig");
 const gicv3 = @import("gicv3.zig");
+const Blake3 = std.crypto.hash.Blake3;
 
 pub const format_version: u32 = 0;
 pub const chunk_size: usize = 2 * 1024 * 1024;
@@ -296,6 +297,8 @@ pub fn fork(allocator: std.mem.Allocator, options: ForkOptions) Error!ForkResult
     const shared_chunks = try realpathAlloc(allocator, parent_chunks);
     try ensureDir(try pathZ(allocator, "{s}", .{options.out_dir}));
 
+    const fork_batch_id = try randomHex(allocator, 16);
+
     var i: usize = 0;
     while (i < options.count) : (i += 1) {
         const child_dir = try pathZ(allocator, "{s}/{d:0>6}", .{ options.out_dir, i });
@@ -305,7 +308,19 @@ pub fn fork(allocator: std.mem.Allocator, options: ForkOptions) Error!ForkResult
 
         var child = parent;
         const child_generation = parent.generation.generation + i + 1;
-        const params_b64 = try forkParamsB64(allocator, parent.generation.generation, child_generation, i, options.count);
+        const identity = try childIdentity(allocator, fork_batch_id, i);
+        const params_b64 = try forkParamsB64(allocator, .{
+            .schema_version = 0,
+            .parent_generation = parent.generation.generation,
+            .generation = child_generation,
+            .fork_index = i,
+            .fork_count = options.count,
+            .fork_batch_id = fork_batch_id,
+            .vm_id = identity.vm_id,
+            .hostname = identity.hostname,
+            .mac_seed = identity.mac_seed,
+            .mac_address = identity.mac_address,
+        });
         defer allocator.free(params_b64);
         child.generation = .{
             .generation = child_generation,
@@ -330,20 +345,42 @@ pub fn fork(allocator: std.mem.Allocator, options: ForkOptions) Error!ForkResult
     };
 }
 
-fn forkParamsB64(
-    allocator: std.mem.Allocator,
+const ForkStableParams = struct {
+    schema_version: u32,
     parent_generation: u64,
-    child_generation: u64,
+    generation: u64,
     fork_index: usize,
     fork_count: usize,
-) Error![]const u8 {
-    const payload = .{
-        .schema_version = @as(u32, 0),
-        .parent_generation = parent_generation,
-        .generation = child_generation,
-        .fork_index = fork_index,
-        .fork_count = fork_count,
-    };
+    fork_batch_id: []const u8,
+    vm_id: []const u8,
+    hostname: []const u8,
+    mac_seed: []const u8,
+    mac_address: []const u8,
+};
+
+const ForkResumeParams = struct {
+    schema_version: u32,
+    parent_generation: u64,
+    generation: u64,
+    fork_index: usize,
+    fork_count: usize,
+    fork_batch_id: []const u8,
+    vm_id: []const u8,
+    hostname: []const u8,
+    mac_seed: []const u8,
+    mac_address: []const u8,
+    resume_time_unix_ns: u64,
+    resume_entropy_seed: []const u8,
+};
+
+const ChildIdentity = struct {
+    vm_id: []const u8,
+    hostname: []const u8,
+    mac_seed: []const u8,
+    mac_address: []const u8,
+};
+
+fn forkParamsB64(allocator: std.mem.Allocator, payload: ForkStableParams) Error![]const u8 {
     const json = std.json.Stringify.valueAlloc(allocator, payload, .{}) catch return error.OutOfMemory;
     defer allocator.free(json);
     if (json.len > generation.params_size) return error.BadManifest;
@@ -352,6 +389,113 @@ fn forkParamsB64(
     const out = allocator.alloc(u8, enc.calcSize(json.len)) catch return error.OutOfMemory;
     _ = enc.encode(out, json);
     return out;
+}
+
+/// Add resume-time volatile fields to the generation parameter page. Forked
+/// manifests carry stable child identity; entropy and wall-clock samples are
+/// minted only when a child actually resumes on a host.
+pub fn refreshResumeParams(allocator: std.mem.Allocator, gen_dev: *generation.Device) Error!void {
+    var end = gen_dev.params.len;
+    while (end > 0 and gen_dev.params[end - 1] == 0) : (end -= 1) {}
+    if (end == 0) return;
+
+    const parsed = std.json.parseFromSlice(ForkStableParams, allocator, gen_dev.params[0..end], .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch return error.BadManifest;
+    defer parsed.deinit();
+    if (parsed.value.schema_version != 0) return error.BadManifest;
+
+    const entropy_seed = try randomHex(allocator, 16);
+    defer allocator.free(entropy_seed);
+    const payload = ForkResumeParams{
+        .schema_version = parsed.value.schema_version,
+        .parent_generation = parsed.value.parent_generation,
+        .generation = parsed.value.generation,
+        .fork_index = parsed.value.fork_index,
+        .fork_count = parsed.value.fork_count,
+        .fork_batch_id = parsed.value.fork_batch_id,
+        .vm_id = parsed.value.vm_id,
+        .hostname = parsed.value.hostname,
+        .mac_seed = parsed.value.mac_seed,
+        .mac_address = parsed.value.mac_address,
+        .resume_time_unix_ns = try realtimeUnixNs(),
+        .resume_entropy_seed = entropy_seed,
+    };
+
+    const json = std.json.Stringify.valueAlloc(allocator, payload, .{}) catch return error.OutOfMemory;
+    defer allocator.free(json);
+    _ = gen_dev.setResume(parsed.value.generation, json) catch return error.BadManifest;
+}
+
+fn childIdentity(allocator: std.mem.Allocator, fork_batch_id: []const u8, fork_index: usize) Error!ChildIdentity {
+    const input = std.fmt.allocPrint(allocator, "{s}:{d}", .{ fork_batch_id, fork_index }) catch return error.OutOfMemory;
+    defer allocator.free(input);
+
+    var digest: [Blake3.digest_length]u8 = undefined;
+    Blake3.hash(input, &digest, .{});
+
+    const vm_id_hex = try hexAlloc(allocator, digest[0..16]);
+    const vm_id = std.fmt.allocPrint(allocator, "spore-{s}", .{vm_id_hex}) catch return error.OutOfMemory;
+    const hostname = std.fmt.allocPrint(allocator, "spore-{s}-{d:0>6}", .{ fork_batch_id[0..8], fork_index }) catch return error.OutOfMemory;
+    const mac_seed = try hexAlloc(allocator, digest[16..32]);
+    var mac: [6]u8 = digest[0..6].*;
+    mac[0] = (mac[0] | 0x02) & 0xfe; // locally administered, unicast
+    const mac_address = try macString(allocator, mac);
+    return .{
+        .vm_id = vm_id,
+        .hostname = hostname,
+        .mac_seed = mac_seed,
+        .mac_address = mac_address,
+    };
+}
+
+fn randomHex(allocator: std.mem.Allocator, comptime byte_count: usize) Error![]const u8 {
+    var bytes: [byte_count]u8 = undefined;
+    try fillRandom(&bytes);
+    return hexAlloc(allocator, &bytes);
+}
+
+fn fillRandom(out: []u8) Error!void {
+    const fd = std.c.open("/dev/urandom", .{ .ACCMODE = .RDONLY }, @as(c_uint, 0));
+    if (fd < 0) return error.IoFailed;
+    defer _ = std.c.close(fd);
+
+    var done: usize = 0;
+    while (done < out.len) {
+        const n = std.c.read(fd, out.ptr + done, out.len - done);
+        if (n <= 0) return error.IoFailed;
+        done += @intCast(n);
+    }
+}
+
+fn realtimeUnixNs() Error!u64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.REALTIME, &ts) != 0) return error.IoFailed;
+    if (ts.sec < 0 or ts.nsec < 0) return error.IoFailed;
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+fn hexAlloc(allocator: std.mem.Allocator, bytes: []const u8) Error![]const u8 {
+    const digits = "0123456789abcdef";
+    const out = allocator.alloc(u8, bytes.len * 2) catch return error.OutOfMemory;
+    for (bytes, 0..) |byte, i| {
+        out[i * 2] = digits[byte >> 4];
+        out[i * 2 + 1] = digits[byte & 0x0f];
+    }
+    return out;
+}
+
+fn macString(allocator: std.mem.Allocator, mac: [6]u8) Error![]const u8 {
+    const hex = try hexAlloc(allocator, &mac);
+    return std.fmt.allocPrint(allocator, "{s}:{s}:{s}:{s}:{s}:{s}", .{
+        hex[0..2],
+        hex[2..4],
+        hex[4..6],
+        hex[6..8],
+        hex[8..10],
+        hex[10..12],
+    }) catch return error.OutOfMemory;
 }
 
 fn forkGicState(allocator: std.mem.Allocator, state: gicv3.State) Error!gicv3.State {
@@ -650,6 +794,31 @@ test "fork mints child manifests with shared chunks and pending generation" {
     try dec.decode(decoded, second.value.generation.params_b64);
     try std.testing.expect(std.mem.indexOf(u8, decoded, "\"fork_index\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, decoded, "\"fork_count\":2") != null);
+    const stable = try std.json.parseFromSlice(ForkStableParams, arena, decoded, .{ .allocate = .alloc_always });
+    defer stable.deinit();
+    try std.testing.expectEqual(@as(u32, 0), stable.value.schema_version);
+    try std.testing.expectEqual(@as(u64, 41), stable.value.parent_generation);
+    try std.testing.expectEqual(@as(u64, 43), stable.value.generation);
+    try std.testing.expectEqual(@as(usize, 1), stable.value.fork_index);
+    try std.testing.expectEqual(@as(usize, 2), stable.value.fork_count);
+    try std.testing.expectEqual(@as(usize, 32), stable.value.fork_batch_id.len);
+    try std.testing.expect(std.mem.startsWith(u8, stable.value.vm_id, "spore-"));
+    try std.testing.expect(std.mem.startsWith(u8, stable.value.hostname, "spore-"));
+    try std.testing.expectEqual(@as(usize, 32), stable.value.mac_seed.len);
+    try std.testing.expectEqual(@as(usize, 17), stable.value.mac_address.len);
+
+    var gen_dev = generation.Device{};
+    try gen_dev.restore(arena, second.value.generation);
+    try refreshResumeParams(arena, &gen_dev);
+    try std.testing.expectEqual(@as(u32, generation.irq_generation_changed), gen_dev.interrupt_status);
+    var params_end = gen_dev.params.len;
+    while (params_end > 0 and gen_dev.params[params_end - 1] == 0) : (params_end -= 1) {}
+    const resumed_params = try std.json.parseFromSlice(ForkResumeParams, arena, gen_dev.params[0..params_end], .{ .allocate = .alloc_always });
+    defer resumed_params.deinit();
+    try std.testing.expectEqualStrings(stable.value.vm_id, resumed_params.value.vm_id);
+    try std.testing.expectEqualStrings(stable.value.hostname, resumed_params.value.hostname);
+    try std.testing.expect(resumed_params.value.resume_time_unix_ns > 0);
+    try std.testing.expectEqual(@as(usize, 32), resumed_params.value.resume_entropy_seed.len);
 
     const out = try arena.alloc(u8, ram.len);
     @memset(out, 0);

@@ -161,6 +161,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         try spore.loadMemory(allocator, spore_dir, m.memory, ram_bytes);
         try applyTransports(transports, m.devices);
         try gen_dev.restore(allocator, m.generation);
+        try spore.refreshResumeParams(allocator, &gen_dev);
         try snapshot.applyMachine(allocator, vcpu, m.machine);
         try raiseGenerationIrqIfPending(&gen_dev);
     } else {

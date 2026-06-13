@@ -56,8 +56,11 @@ A spore is a directory:
   resume-parameter bytes with trailing zeroes elided). `spore fork` increments
   the counter per child, sets `interrupt_status` to
   `irq_generation_changed`, and writes a JSON resume-parameter payload with
-  `schema_version`, `parent_generation`, `generation`, `fork_index`, and
-  `fork_count`.
+  stable child identity fields: `schema_version`, `parent_generation`,
+  `generation`, `fork_index`, `fork_count`, `fork_batch_id`, `vm_id`,
+  `hostname`, `mac_seed`, and `mac_address`. Backend restore refreshes the
+  params page at actual resume time with volatile `resume_time_unix_ns` and
+  `resume_entropy_seed` values before reasserting the generation interrupt.
 - `memory`: `chunk_size` plus one entry per chunk — a blake3-hex chunk
   reference, or null for an all-zero chunk.
 
@@ -70,9 +73,10 @@ A spore is a directory:
 - Access traces (lazy-restore prefetch hints): slice 5.
 - Multi-vCPU machine state.
 - Kernel identity in the platform contract (pinned-build enforcement).
-- Guest identity fixup state beyond the generation counter and resume
-  parameters; the in-guest helper that turns fork metadata into hostname,
-  machine-id, MAC, entropy, and clock updates is still planned.
+- Durable disk/device identity fixup beyond the current diskless helper. The
+  fork-aware smoke initrd consumes generation params for hostname, machine-id,
+  MAC, entropy, and clock fixups, but the product guest-agent contract for
+  disk-backed workloads is not final.
 - Cross-frequency architected timer restore: v0 records and enforces the
   counter frequency, but cannot translate a running Linux guest between
   different `CNTFRQ_EL0` domains.
