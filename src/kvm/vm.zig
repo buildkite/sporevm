@@ -44,6 +44,18 @@ pub const Config = struct {
 
 pub const ExitCause = enum { guest_off, guest_reset, snapshotted };
 
+const RestoreStats = struct {
+    start_ms: u64,
+    manifest_ms: u64 = 0,
+    map_ram_ms: u64 = 0,
+    memory_ms: u64 = 0,
+    state_ms: u64 = 0,
+    pre_run_ms: u64 = 0,
+    mode: []const u8 = "none",
+    chunk_count: usize = 0,
+    nonzero_chunk_count: usize = 0,
+};
+
 const gic_dist_base: u64 = 0x0800_0000;
 const gic_dist_size: u64 = 0x0001_0000;
 const gic_redist_base: u64 = 0x0802_0000;
@@ -61,8 +73,14 @@ const RamMapping = struct {
 pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     var resume_parsed: ?std.json.Parsed(spore.Manifest) = null;
     defer if (resume_parsed) |*parsed| parsed.deinit();
+    var restore_stats: ?RestoreStats = null;
     if (config.resume_dir) |spore_dir| {
+        const manifest_start = try monotonicMs();
         resume_parsed = try spore.loadManifest(allocator, spore_dir);
+        restore_stats = .{
+            .start_ms = manifest_start,
+            .manifest_ms = (try monotonicMs()) - manifest_start,
+        };
     }
 
     const kvm_fd = try kvm.openDevKvm();
@@ -79,7 +97,9 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     const vm_fd: std.c.fd_t = @intCast(try kvm.ioctl(kvm_fd, kvm.KVM_CREATE_VM, 0, "KVM_CREATE_VM"));
     defer closeFd(vm_fd);
 
+    const map_ram_start = try monotonicMs();
     const ram_mapping = try mapRam(allocator, config, if (resume_parsed) |parsed| parsed.value else null);
+    if (restore_stats) |*stats| stats.map_ram_ms = (try monotonicMs()) - map_ram_start;
     defer ram_mapping.deinit();
     const ram_bytes = ram_mapping.bytes;
     const ram = guestmem.GuestRam{ .bytes = ram_bytes, .base = board.ram_base };
@@ -136,14 +156,26 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         });
         // The file-backed path is only enabled for trusted same-host forks.
         // Otherwise RAM is materialized through verified chunks.
-        if (!ram_mapping.file_backed) {
-            try spore.loadMemory(allocator, config.resume_dir.?, m.memory, ram_bytes);
+        const memory_plan = try spore.validateMemoryForRam(m.memory, ram_bytes.len);
+        if (restore_stats) |*stats| {
+            stats.chunk_count = memory_plan.chunk_count;
+            stats.nonzero_chunk_count = memory_plan.nonzero_chunk_count;
         }
+        if (!ram_mapping.file_backed) {
+            if (restore_stats) |*stats| stats.mode = "eager_chunks";
+            const memory_start = try monotonicMs();
+            try spore.loadMemory(allocator, config.resume_dir.?, m.memory, ram_bytes);
+            if (restore_stats) |*stats| stats.memory_ms = (try monotonicMs()) - memory_start;
+        } else if (restore_stats) |*stats| {
+            stats.mode = "trusted_file_backed";
+        }
+        const state_start = try monotonicMs();
         try applyTransports(transports, m.devices);
         try gen_dev.restore(allocator, m.generation);
         try spore.refreshResumeParams(allocator, &gen_dev);
         try snapshot.applyMachine(allocator, vm_fd, @intCast(gic_dev.fd), vcpu_fd, m.machine);
         try raiseGenerationIrqIfPending(vm_fd, &gen_dev);
+        if (restore_stats) |*stats| stats.state_ms = (try monotonicMs()) - state_start;
     } else {
         const initrd_range = if (config.initrd) |initrd| try boot.planInitrd(ram_bytes.len, board.ram_base, config.kernel, initrd.len) else null;
         const dtb = try board.buildDtb(allocator, .{
@@ -179,6 +211,23 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     defer std.posix.munmap(run_bytes);
 
     const start_ms = try monotonicMs();
+    if (restore_stats) |*stats| {
+        stats.pre_run_ms = start_ms - stats.start_ms;
+        std.log.info(
+            "kvm restore metrics: mode={s} ram_mib={d} chunks={d} nonzero_chunks={d} manifest_ms={d} map_ram_ms={d} memory_ms={d} state_ms={d} pre_run_ms={d}",
+            .{
+                stats.mode,
+                config.ram_size / 1024 / 1024,
+                stats.chunk_count,
+                stats.nonzero_chunk_count,
+                stats.manifest_ms,
+                stats.map_ram_ms,
+                stats.memory_ms,
+                stats.state_ms,
+                stats.pre_run_ms,
+            },
+        );
+    }
     var pending_kvm_completion = false;
     while (true) {
         if (config.snapshot_after_ms) |after_ms| {
