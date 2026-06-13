@@ -303,11 +303,17 @@ the HVF boot harness). The boot harnesses now accept `--initrd`, describe the
 initrd in `/chosen/linux,initrd-{start,end}`, and place it after the kernel so
 the first positive cross-hypervisor smoke can be diskless when using the
 `cleanroom-kernels` `initrd` profile (the default `rootfs` kernel profile
-intentionally ignores external initrds). `scripts/make-smoke-initrd.sh` builds
-the tiny ticker initrd used for those smokes, and
+intentionally ignores external initrds). `cleanroom-kernels` v0.2.0 now
+publishes that `initrd` profile alongside `rootfs`. `scripts/make-smoke-initrd.sh`
+builds the tiny ticker initrd used for those smokes, including local
+`CC="zig cc -target aarch64-linux-musl"` builds, and
 `scripts/smoke-restore-leg.sh` runs same-host or split capture/resume legs for
-the matrix without hiding cross-host spore transfer. The four-way
-cross-hypervisor matrix (slice 4) remains next.
+the matrix without hiding cross-host spore transfer. Diskless same-host smokes
+now pass on both available sides: KVM on the `m7g.metal` host and HVF locally
+each resume the initrd ticker through `sporevm-initrd-tick 7`. The four-way
+cross-hypervisor matrix (slice 4) remains next; its positive KVM→HVF leg still
+needs a 24MHz KVM producer host, while the current `m7g.metal` host remains the
+negative cross-frequency test host.
 
 ## Delivery Strategy
 
