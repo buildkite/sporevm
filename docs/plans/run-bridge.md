@@ -95,13 +95,16 @@ runtime semantics that the foundation plan says SporeVM should not own.
 
 ## Current State
 
-- `src/run.zig` accepts `--kernel`, `--initrd`, and one argv request.
+- `src/run.zig` accepts optional `--kernel`, optional `--initrd`, and one argv
+  request. When omitted, the CLI resolves default run assets before boot.
 - Backend selection already defaults to `auto`, resolving to HVF on Darwin
   arm64 and KVM on Linux/aarch64.
 - `scripts/ensure-managed-kernel.sh initrd` resolves, downloads, verifies, and
   caches the managed cleanroom-kernels initrd-profile kernel.
 - `scripts/make-minimal-exec-initrd.sh` builds a tiny initrd with the guest
   exec agent and fixed helper binaries.
+- `zig build` installs that minimal exec initrd at
+  `share/sporevm/minimal-exec-initrd.cpio`.
 - The run output slice adds bounded stdout/stderr to the exit frame.
 - `hvf-boot`, `kvm-boot`, `hvf.vm`, and `kvm.vm` already support an optional
   disk fd backed by virtio-blk.
@@ -208,6 +211,8 @@ rootfs identity, and cache policy need a foundation-level decision.
 ## Delivery Strategy
 
 ### Slice A: Default Run Assets
+
+Status: implemented.
 
 Scope:
 
@@ -334,7 +339,7 @@ policy.
 
 ## Open Questions And Recommended Defaults
 
-### Blocking Slice A
+### Resolved Slice A Defaults
 
 - Managed kernel resolver: start by reusing the existing
   `scripts/ensure-managed-kernel.sh` behavior for the worktree/dev build, but

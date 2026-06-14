@@ -18,6 +18,7 @@ const max_guest_arg_len = 255;
 const max_guest_request_len = 2047;
 const max_guest_port = 65535;
 const max_guest_output_bytes = 16 * 1024;
+const default_run_initrd_name = "minimal-exec-initrd.cpio";
 
 pub const Backend = enum {
     auto,
@@ -85,10 +86,21 @@ const SharedOptions = struct {
     console_log_path: ?[]const u8 = null,
 
     fn complete(self: SharedOptions, backend: Backend, command: []const []const u8, emit_json: bool) Options {
+        return self.completeWithAssets(backend, self.kernel_path.?, self.initrd_path.?, command, emit_json);
+    }
+
+    fn completeWithAssets(
+        self: SharedOptions,
+        backend: Backend,
+        kernel_path: []const u8,
+        initrd_path: []const u8,
+        command: []const []const u8,
+        emit_json: bool,
+    ) Options {
         return .{
             .backend = backend,
-            .kernel_path = self.kernel_path.?,
-            .initrd_path = self.initrd_path.?,
+            .kernel_path = kernel_path,
+            .initrd_path = initrd_path,
             .command = command,
             .memory_mib = self.memory_mib,
             .vcpus = self.vcpus,
@@ -100,12 +112,21 @@ const SharedOptions = struct {
     }
 };
 
+pub const CliOptions = struct {
+    backend: Backend = .auto,
+    shared: SharedOptions = .{},
+    command: []const []const u8,
+    emit_json: bool = false,
+};
+
 const cli_usage =
     \\Usage:
-    \\  spore run --kernel Image --initrd root.cpio [options] -- <argv...>
+    \\  spore run [--kernel Image] [--initrd root.cpio] [options] -- <argv...>
     \\
     \\Options:
     \\  --backend auto|hvf|kvm  Backend to run (default: auto)
+    \\  --kernel Image          Kernel Image path (default: managed initrd-profile kernel)
+    \\  --initrd root.cpio      Initrd path (default: installed minimal exec initrd)
     \\  --memory-mib N          Guest memory in MiB (default: 1024)
     \\  --vcpus N               Guest vCPU count; must be 1 today
     \\  --guest-port N          Guest vsock listen port (default: 10700)
@@ -123,7 +144,8 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     }
 
     const arena = init.arena.allocator();
-    const opts = try parseCliArgs(args);
+    const parsed = try parseCliArgs(args);
+    const opts = try resolveCliOptions(init, arena, parsed);
     try openConsoleLog(opts.console_log_path);
     defer closeConsoleLog();
 
@@ -138,7 +160,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     if (code != 0) std.process.exit(code);
 }
 
-pub fn parseCliArgs(args: []const []const u8) !Options {
+pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     var backend: Backend = .auto;
     var shared = SharedOptions{};
     var emit_json = false;
@@ -169,12 +191,144 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
     }
 
     const argv = command orelse &.{};
-    if (shared.kernel_path == null or shared.initrd_path == null or argv.len == 0) {
+    if (argv.len == 0) {
         std.debug.print("{s}", .{cli_usage});
         std.process.exit(2);
     }
 
-    return shared.complete(backend, argv, emit_json);
+    return .{
+        .backend = backend,
+        .shared = shared,
+        .command = argv,
+        .emit_json = emit_json,
+    };
+}
+
+fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parsed: CliOptions) !Options {
+    const kernel_path = parsed.shared.kernel_path orelse try resolveDefaultKernelPath(init, allocator);
+    const initrd_path = parsed.shared.initrd_path orelse try resolveDefaultInitrdPath(init, allocator);
+    return parsed.shared.completeWithAssets(parsed.backend, kernel_path, initrd_path, parsed.command, parsed.emit_json);
+}
+
+fn resolveDefaultKernelPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
+    if (init.environ_map.get("SPOREVM_KERNEL_IMAGE")) |path| {
+        if (!try readablePath(init.io, path)) {
+            failRunSetup("spore run: SPOREVM_KERNEL_IMAGE not found: {s}", .{path});
+        }
+        return path;
+    }
+
+    const helper = try sourceTreeKernelHelperPath(init, allocator);
+    if (!try executablePath(init.io, helper)) {
+        failRunSetup(
+            "spore run: default kernel resolver not found at {s}; pass --kernel or set SPOREVM_KERNEL_IMAGE",
+            .{helper},
+        );
+    }
+
+    const result = std.process.run(allocator, init.io, .{
+        .argv = &.{ helper, "initrd" },
+        .stdout_limit = .limited(16 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    }) catch |err| {
+        failRunSetup("spore run: default kernel resolver failed before exec: {s}", .{@errorName(err)});
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try writeSetupStderr(init, result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code == 0) {
+            const trimmed = std.mem.trimEnd(u8, result.stdout, "\r\n");
+            if (trimmed.len == 0) {
+                failRunSetup("spore run: default kernel resolver returned an empty path", .{});
+            }
+            return allocator.dupe(u8, trimmed);
+        },
+        else => {},
+    }
+    failRunSetup(
+        "spore run: default kernel resolver failed; pass --kernel or set SPOREVM_KERNEL_IMAGE",
+        .{},
+    );
+}
+
+fn resolveDefaultInitrdPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
+    if (init.environ_map.get("SPOREVM_RUN_INITRD")) |path| {
+        if (!try readablePath(init.io, path)) {
+            failRunSetup("spore run: SPOREVM_RUN_INITRD not found: {s}", .{path});
+        }
+        return path;
+    }
+
+    const prefix = try installPrefixPath(init, allocator);
+    const path = try defaultInitrdPathFromPrefix(allocator, prefix);
+    if (!try readablePath(init.io, path)) {
+        failRunSetup(
+            "spore run: default initrd not found at {s}; run 'mise run build', pass --initrd, or set SPOREVM_RUN_INITRD",
+            .{path},
+        );
+    }
+    return path;
+}
+
+fn sourceTreeKernelHelperPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
+    const prefix = try installPrefixPath(init, allocator);
+    return sourceTreeKernelHelperPathFromPrefix(allocator, prefix);
+}
+
+fn defaultInitrdPathFromPrefix(allocator: std.mem.Allocator, prefix: []const u8) ![]const u8 {
+    return std.fs.path.join(allocator, &.{ prefix, "share", "sporevm", default_run_initrd_name });
+}
+
+fn sourceTreeKernelHelperPathFromPrefix(allocator: std.mem.Allocator, prefix: []const u8) ![]const u8 {
+    const repo_root = std.fs.path.dirname(prefix) orelse {
+        failRunSetup("spore run: cannot resolve source tree from install prefix {s}", .{prefix});
+    };
+    return std.fs.path.join(allocator, &.{ repo_root, "scripts", "ensure-managed-kernel.sh" });
+}
+
+fn installPrefixPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
+    const exe_dir = try std.process.executableDirPathAlloc(init.io, allocator);
+    return std.fs.path.dirname(exe_dir) orelse {
+        failRunSetup("spore run: cannot resolve install prefix from executable directory {s}", .{exe_dir});
+    };
+}
+
+fn readablePath(io: Io, path: []const u8) !bool {
+    return accessPath(io, path, .{ .read = true });
+}
+
+fn executablePath(io: Io, path: []const u8) !bool {
+    return accessPath(io, path, .{ .execute = true });
+}
+
+fn accessPath(io: Io, path: []const u8, options: Io.Dir.AccessOptions) !bool {
+    if (Io.Dir.path.isAbsolute(path)) {
+        Io.Dir.accessAbsolute(io, path, options) catch |err| switch (err) {
+            error.FileNotFound, error.AccessDenied, error.PermissionDenied, error.SymLinkLoop => return false,
+            else => |e| return e,
+        };
+        return true;
+    }
+    Io.Dir.cwd().access(io, path, options) catch |err| switch (err) {
+        error.FileNotFound, error.AccessDenied, error.PermissionDenied, error.SymLinkLoop => return false,
+        else => |e| return e,
+    };
+    return true;
+}
+
+fn writeSetupStderr(init: std.process.Init, bytes: []const u8) !void {
+    if (bytes.len == 0) return;
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr_file_writer: Io.File.Writer = .init(.stderr(), init.io, &stderr_buffer);
+    const stderr = &stderr_file_writer.interface;
+    try stderr.writeAll(bytes);
+    try stderr.flush();
+}
+
+fn failRunSetup(comptime fmt: []const u8, args: anytype) noreturn {
+    std.debug.print(fmt ++ "\n", args);
+    std.process.exit(2);
 }
 
 pub fn parseHarnessArgs(backend: Backend, args: []const []const u8) !Options {
@@ -555,10 +709,31 @@ test "run request rejects encoded line overflow" {
 test "run cli parser accepts command after separator" {
     const opts = try parseCliArgs(&.{ "--backend", "hvf", "--kernel", "Image", "--initrd", "root.cpio", "--", "/bin/true" });
     try std.testing.expectEqual(Backend.hvf, opts.backend);
-    try std.testing.expectEqualStrings("Image", opts.kernel_path);
-    try std.testing.expectEqualStrings("root.cpio", opts.initrd_path);
+    try std.testing.expectEqualStrings("Image", opts.shared.kernel_path.?);
+    try std.testing.expectEqualStrings("root.cpio", opts.shared.initrd_path.?);
     try std.testing.expectEqual(@as(usize, 1), opts.command.len);
     try std.testing.expectEqualStrings("/bin/true", opts.command[0]);
+}
+
+test "run cli parser allows default boot assets" {
+    const opts = try parseCliArgs(&.{ "--json", "--", "/bin/writeout" });
+    try std.testing.expectEqual(Backend.auto, opts.backend);
+    try std.testing.expect(opts.shared.kernel_path == null);
+    try std.testing.expect(opts.shared.initrd_path == null);
+    try std.testing.expect(opts.emit_json);
+    try std.testing.expectEqual(@as(usize, 1), opts.command.len);
+    try std.testing.expectEqualStrings("/bin/writeout", opts.command[0]);
+}
+
+test "run default asset paths derive from install prefix" {
+    const allocator = std.testing.allocator;
+    const initrd = try defaultInitrdPathFromPrefix(allocator, "/repo/zig-out");
+    defer allocator.free(initrd);
+    try std.testing.expectEqualStrings("/repo/zig-out/share/sporevm/minimal-exec-initrd.cpio", initrd);
+
+    const helper = try sourceTreeKernelHelperPathFromPrefix(allocator, "/repo/zig-out");
+    defer allocator.free(helper);
+    try std.testing.expectEqualStrings("/repo/scripts/ensure-managed-kernel.sh", helper);
 }
 
 test "run harness parser shares common options" {

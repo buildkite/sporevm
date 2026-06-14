@@ -96,14 +96,12 @@ bundle downloads.
 Run a single command in a throwaway VM with the minimal agent initrd:
 
 ```bash
-scripts/make-minimal-exec-initrd.sh /tmp/sporevm-minimal.cpio
-zig-out/bin/spore run \
-  --backend hvf \
-  --kernel "$(scripts/ensure-managed-kernel.sh initrd)" \
-  --initrd /tmp/sporevm-minimal.cpio \
-  -- /bin/writeout
+zig-out/bin/spore run -- /bin/writeout
 ```
 
+`spore run` defaults to the managed initrd-profile kernel and the minimal exec
+initrd installed by `zig build`. Pass `--kernel` and `--initrd`, or set
+`SPOREVM_KERNEL_IMAGE` and `SPOREVM_RUN_INITRD`, to use explicit boot assets.
 The minimal agent captures up to 16 KiB each of command stdout and stderr. In
 normal mode those bytes are forwarded to the host streams and `spore run` exits
 with the guest command status. With `--json`, command output is reported as
