@@ -329,10 +329,11 @@ packed_chunks="\$(find "\${workdir}/spore.bundle/chunkpacks" -type f | wc -l | t
 bundle_archive_bytes=0
 source_peer_url=""
 if [[ -n "\${source_peer_ip}" ]]; then
-  tar -cf "\${workdir}/spore.bundle.tar" -C "\${workdir}" spore.bundle
-  bundle_archive_bytes="\$(wc -c <"\${workdir}/spore.bundle.tar" | tr -d ' ')"
+  mkdir -p "\${workdir}/peer-www"
+  tar -cf "\${workdir}/peer-www/spore.bundle.tar" -C "\${workdir}" spore.bundle
+  bundle_archive_bytes="\$(wc -c <"\${workdir}/peer-www/spore.bundle.tar" | tr -d ' ')"
   source_peer_url="http://\${source_peer_ip}:\${source_peer_port}/spore.bundle.tar"
-  nohup python3 -m http.server "\${source_peer_port}" --bind 0.0.0.0 --directory "\${workdir}" >"\${workdir}/peer-http.log" 2>&1 &
+  nohup python3 -m http.server "\${source_peer_port}" --bind 0.0.0.0 --directory "\${workdir}/peer-www" >"\${workdir}/peer-http.log" 2>&1 &
   printf '%s\n' "\$!" >"\${workdir}/peer-http.pid"
   sleep 1
   if ! kill -0 "\$(cat "\${workdir}/peer-http.pid")" 2>/dev/null; then
@@ -432,6 +433,15 @@ with urllib.request.urlopen(url, timeout=300) as response, open(out_path, "wb") 
 PY
     local peer_download_size
     peer_download_size="\$(wc -c <"\${tar_path}" | tr -d ' ')"
+    while IFS= read -r member; do
+      case "\${member}" in
+        spore.bundle|spore.bundle/*) ;;
+        *) echo "unexpected peer bundle tar member: \${member}" >&2; exit 1 ;;
+      esac
+      case "\${member}" in
+        /*|..|../*|*/..|*/../*) echo "unsafe peer bundle tar member: \${member}" >&2; exit 1 ;;
+      esac
+    done < <(tar -tf "\${tar_path}")
     tar -xf "\${tar_path}" -C "\$(dirname "\${out_dir}")"
     rm -f "\${tar_path}"
     [[ -d "\${out_dir}" ]] || { echo "peer bundle extraction did not create \${out_dir}" >&2; exit 1; }
