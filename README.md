@@ -82,6 +82,7 @@ Pack a spore into the first local distribution format with
 `zig-out/bin/spore pack /tmp/spore --out /tmp/spore.bundle`; unpack it back
 into a normal spore directory with
 `zig-out/bin/spore unpack /tmp/spore.bundle --out /tmp/spore.unpacked`.
+Both commands report a `bundle_digest` for cache identity.
 To exercise the first cross-host bundle path over SSM and S3, use
 `scripts/smoke-remote-bundle.sh --region REGION --source-instance ID --dest-instance ID --bucket BUCKET`.
 It stages tracked `HEAD` plus the current tracked/staged diff; stage new files

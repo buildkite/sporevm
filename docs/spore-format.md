@@ -33,7 +33,10 @@ A local bundle is the first distribution form:
 Bundles are an implementation format for distribution, not a new machine-state
 contract. The BLAKE3 ids in `manifest.json` remain the restore-time trust root;
 the SHA256 values in the chunkpack index make each packed segment compatible
-with blob-store and later OCI-style descriptor verification.
+with blob-store and later OCI-style descriptor verification. `spore pack` and
+`spore unpack` also report a `bundle_digest`, a SHA256 digest over the exact
+bundle bytes (`manifest.json`, `chunkpack.index.json`, and pack blobs) for
+cache identity. It is not a replacement for per-chunk verification.
 
 ## Manifest v0
 

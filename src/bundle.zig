@@ -26,6 +26,7 @@ pub const PackOptions = struct {
 pub const PackResult = struct {
     source: []const u8,
     out_dir: []const u8,
+    bundle_digest: []const u8,
     chunk_count: usize,
     packed_chunk_count: usize,
     pack_count: usize,
@@ -40,6 +41,7 @@ pub const UnpackOptions = struct {
 pub const UnpackResult = struct {
     bundle: []const u8,
     out_dir: []const u8,
+    bundle_digest: []const u8,
     chunk_count: usize,
     unpacked_chunk_count: usize,
     payload_bytes: u64,
@@ -112,10 +114,12 @@ pub fn pack(allocator: std.mem.Allocator, options: PackOptions) Error!PackResult
         .chunk_size = spore.chunk_size,
         .chunks = entries[0..entry_count],
     });
+    const bundle_digest = try digestHex(allocator, options.out_dir);
 
     return .{
         .source = options.spore_dir,
         .out_dir = options.out_dir,
+        .bundle_digest = bundle_digest,
         .chunk_count = plan.chunk_count,
         .packed_chunk_count = entry_count,
         .pack_count = 1,
@@ -170,14 +174,34 @@ pub fn unpack(allocator: std.mem.Allocator, options: UnpackOptions) Error!Unpack
     }
 
     try spore.saveManifest(allocator, options.out_dir, manifest);
+    const bundle_digest = try digestHex(allocator, options.bundle_dir);
 
     return .{
         .bundle = options.bundle_dir,
         .out_dir = options.out_dir,
+        .bundle_digest = bundle_digest,
         .chunk_count = plan.chunk_count,
         .unpacked_chunk_count = unpacked_chunk_count,
         .payload_bytes = payload_bytes,
     };
+}
+
+pub fn digestHex(allocator: std.mem.Allocator, bundle_dir: []const u8) Error![]const u8 {
+    const parsed_index = try loadIndex(allocator, bundle_dir);
+    defer parsed_index.deinit();
+    _ = parsed_index.value.chunks.len;
+
+    var h = Sha256.init(.{});
+    h.update("sporevm-bundle-v0");
+    h.update(&[_]u8{0});
+    try updateHashWithFile(allocator, &h, bundle_dir, "manifest.json");
+    try updateHashWithFile(allocator, &h, bundle_dir, index_path);
+    try updateHashWithFile(allocator, &h, bundle_dir, pack_path);
+
+    var digest: [Sha256.digest_length]u8 = undefined;
+    h.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return allocator.dupe(u8, &hex) catch return error.OutOfMemory;
 }
 
 fn saveIndex(allocator: std.mem.Allocator, dir: []const u8, index: Index) Error!void {
@@ -287,6 +311,34 @@ fn readFileRange(allocator: std.mem.Allocator, path: [:0]const u8, offset: u64, 
     errdefer allocator.free(out);
     try preadFileAll(fd, start, out);
     return out;
+}
+
+fn updateHashWithFile(
+    allocator: std.mem.Allocator,
+    h: *Sha256,
+    dir: []const u8,
+    rel_path: []const u8,
+) Error!void {
+    const path = try pathZ(allocator, "{s}/{s}", .{ dir, rel_path });
+    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(c_uint, 0));
+    if (fd < 0) return error.IoFailed;
+    defer _ = std.c.close(fd);
+
+    const size = try seekFileSize(fd);
+    var size_buf: [32]u8 = undefined;
+    const size_str = std.fmt.bufPrint(&size_buf, "{d}", .{size}) catch unreachable;
+    h.update(rel_path);
+    h.update(&[_]u8{0});
+    h.update(size_str);
+    h.update(&[_]u8{0});
+
+    var buf: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = std.c.read(fd, buf[0..].ptr, buf.len);
+        if (n < 0) return error.IoFailed;
+        if (n == 0) break;
+        h.update(buf[0..@intCast(n)]);
+    }
 }
 
 fn seekFileSize(fd: std.c.fd_t) Error!usize {
@@ -411,6 +463,7 @@ test "pack and unpack chunkpack bundle strips local backing" {
     try std.testing.expectEqual(@as(usize, 2), pack_result.packed_chunk_count);
     try std.testing.expectEqual(@as(usize, 1), pack_result.pack_count);
     try std.testing.expectEqual(@as(u64, spore.chunk_size + 17), pack_result.payload_bytes);
+    try std.testing.expectEqual(@as(usize, Sha256.digest_length * 2), pack_result.bundle_digest.len);
 
     const bundle_manifest = try spore.loadManifest(arena, bundle_dir);
     defer bundle_manifest.deinit();
@@ -432,6 +485,7 @@ test "pack and unpack chunkpack bundle strips local backing" {
     try std.testing.expectEqual(@as(usize, 3), unpacked.chunk_count);
     try std.testing.expectEqual(@as(usize, 2), unpacked.unpacked_chunk_count);
     try std.testing.expectEqual(@as(u64, spore.chunk_size + 17), unpacked.payload_bytes);
+    try std.testing.expectEqualStrings(pack_result.bundle_digest, unpacked.bundle_digest);
 
     const restored_manifest = try spore.loadManifest(arena, out_dir);
     defer restored_manifest.deinit();
@@ -458,11 +512,14 @@ test "unpack rejects corrupted chunkpack payload" {
     const memory = try spore.saveMemory(arena, parent_dir, ram);
     try spore.saveManifest(arena, parent_dir, testManifest(memory, ram.len, 3));
     _ = try pack(arena, .{ .spore_dir = parent_dir, .out_dir = bundle_dir });
+    const clean_digest = try digestHex(arena, bundle_dir);
 
     const source_pack_path = try pathZ(arena, "{s}/{s}", .{ bundle_dir, pack_path });
     const data = try readFileAll(arena, source_pack_path, spore.chunk_size);
     data[100] ^= 0xFF;
     try writeFileAll(source_pack_path, data);
+    const corrupt_digest = try digestHex(arena, bundle_dir);
+    try std.testing.expect(!std.mem.eql(u8, clean_digest, corrupt_digest));
 
     try std.testing.expectError(error.BadChunk, unpack(arena, .{ .bundle_dir = bundle_dir, .out_dir = out_dir }));
 }
