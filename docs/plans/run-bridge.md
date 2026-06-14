@@ -99,15 +99,16 @@ runtime semantics that the foundation plan says SporeVM should not own.
   request. When omitted, the CLI resolves default run assets before boot.
 - Backend selection already defaults to `auto`, resolving to HVF on Darwin
   arm64 and KVM on Linux/aarch64.
-- `scripts/ensure-managed-kernel.sh initrd` resolves, downloads, verifies, and
-  caches the managed cleanroom-kernels initrd-profile kernel.
+- `scripts/ensure-managed-kernel.sh run` resolves, downloads, verifies, and
+  caches the managed cleanroom-kernels SporeVM run kernel. The run kernel
+  combines initrd boot with virtio-blk and ext4 support.
 - `scripts/make-minimal-exec-initrd.sh` builds a tiny initrd with the guest
   exec agent and fixed helper binaries.
 - `zig build` installs that minimal exec initrd at
   `share/sporevm/minimal-exec-initrd.cpio`.
 - The run output slice adds bounded stdout/stderr to the exit frame.
-- `hvf-boot`, `kvm-boot`, `hvf.vm`, and `kvm.vm` already support an optional
-  disk fd backed by virtio-blk.
+- `spore run --rootfs rootfs.ext4 -- <argv...>` attaches an ext4 rootfs
+  read-only through the existing virtio-blk device and chroots before exec.
 - `spore rootfs build` already materializes OCI images into deterministic ext4
   images and records metadata.
 
@@ -123,7 +124,7 @@ spore run --kernel Image --initrd minimal.cpio -- /bin/writeout
 
 When kernel or initrd are omitted, `run` resolves default run assets:
 
-- kernel: managed initrd-profile aarch64 kernel, honoring
+- kernel: managed SporeVM run aarch64 kernel, honoring
   `SPOREVM_KERNEL_IMAGE` as the explicit local override;
 - initrd: the installed minimal exec initrd, with `SPOREVM_RUN_INITRD` as the
   explicit local override.
@@ -238,6 +239,10 @@ output/result semantics unchanged.
 
 ### Slice B: Read-Only Rootfs Attach And Exec
 
+Status: implemented. Local validation used a SporeVM run kernel built from the
+matching `cleanroom-kernels` branch; default no-env resolution requires that
+kernel asset to be published on the configured cleanroom-kernels release.
+
 Scope:
 
 - Add `--rootfs PATH` to `spore run`.
@@ -351,15 +356,12 @@ policy.
   can locate from `zig-out/bin/spore`, while `SPOREVM_RUN_INITRD` remains the
   override.
 
-### Blocking Slice B
+### Resolved Slice B Defaults
 
-- Kernel profile: the managed `v0.3.0` cleanroom-kernels assets split the
-  required capabilities. The `initrd` and `sporevm` profiles have
-  `CONFIG_BLK_DEV_INITRD=y` but do not expose virtio-blk/ext4 in the smoke;
-  the `rootfs` profile has `CONFIG_VIRTIO_BLK=y` and `CONFIG_EXT4_FS=y` but no
-  `CONFIG_BLK_DEV_INITRD`, so it panics before the initrd agent can run. Slice
-  B needs a combined run-rootfs kernel profile before the SporeVM `--rootfs`
-  CLI should be exposed.
+- Kernel profile: use one managed SporeVM run kernel for both minimal initrd
+  commands and `--rootfs`. It combines `CONFIG_BLK_DEV_INITRD=y`,
+  `CONFIG_VIRTIO_BLK=y`, and `CONFIG_EXT4_FS=y`, avoiding a split between
+  cleanroom's separate `initrd` and `rootfs` profiles.
 - Rootfs device discovery: prefer mounting `devtmpfs` in the agent and waiting
   for the virtio-blk device node. A fixed `/dev/vda` mknod is acceptable only
   as a temporary smoke fallback if devtmpfs support is missing from the managed

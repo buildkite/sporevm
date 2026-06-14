@@ -45,6 +45,7 @@ pub const Options = struct {
     backend: Backend = .auto,
     kernel_path: []const u8,
     initrd_path: []const u8,
+    rootfs_path: ?[]const u8 = null,
     command: []const []const u8,
     memory_mib: u64 = 1024,
     vcpus: u32 = 1,
@@ -86,7 +87,7 @@ const SharedOptions = struct {
     console_log_path: ?[]const u8 = null,
 
     fn complete(self: SharedOptions, backend: Backend, command: []const []const u8, emit_json: bool) Options {
-        return self.completeWithAssets(backend, self.kernel_path.?, self.initrd_path.?, command, emit_json);
+        return self.completeWithAssets(backend, self.kernel_path.?, self.initrd_path.?, null, command, emit_json);
     }
 
     fn completeWithAssets(
@@ -94,6 +95,7 @@ const SharedOptions = struct {
         backend: Backend,
         kernel_path: []const u8,
         initrd_path: []const u8,
+        rootfs_path: ?[]const u8,
         command: []const []const u8,
         emit_json: bool,
     ) Options {
@@ -101,6 +103,7 @@ const SharedOptions = struct {
             .backend = backend,
             .kernel_path = kernel_path,
             .initrd_path = initrd_path,
+            .rootfs_path = rootfs_path,
             .command = command,
             .memory_mib = self.memory_mib,
             .vcpus = self.vcpus,
@@ -115,6 +118,7 @@ const SharedOptions = struct {
 pub const CliOptions = struct {
     backend: Backend = .auto,
     shared: SharedOptions = .{},
+    rootfs_path: ?[]const u8 = null,
     command: []const []const u8,
     emit_json: bool = false,
 };
@@ -125,8 +129,9 @@ const cli_usage =
     \\
     \\Options:
     \\  --backend auto|hvf|kvm  Backend to run (default: auto)
-    \\  --kernel Image          Kernel Image path (default: managed initrd-profile kernel)
+    \\  --kernel Image          Kernel Image path (default: managed SporeVM run kernel)
     \\  --initrd root.cpio      Initrd path (default: installed minimal exec initrd)
+    \\  --rootfs rootfs.ext4    Attach rootfs image read-only as virtio-blk
     \\  --memory-mib N          Guest memory in MiB (default: 1024)
     \\  --vcpus N               Guest vCPU count; must be 1 today
     \\  --guest-port N          Guest vsock listen port (default: 10700)
@@ -163,6 +168,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
 pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     var backend: Backend = .auto;
     var shared = SharedOptions{};
+    var rootfs_path: ?[]const u8 = null;
     var emit_json = false;
     var command: ?[]const []const u8 = null;
 
@@ -177,6 +183,8 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
                 std.debug.print("--backend must be auto, hvf, or kvm\n", .{});
                 std.process.exit(2);
             };
+        } else if (std.mem.eql(u8, args[i], "--rootfs")) {
+            rootfs_path = takeValue(args, &i, args[i]);
         } else if (try parseSharedOption(&shared, args, &i)) {
             continue;
         } else if (std.mem.eql(u8, args[i], "--json")) {
@@ -199,15 +207,21 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     return .{
         .backend = backend,
         .shared = shared,
+        .rootfs_path = rootfs_path,
         .command = argv,
         .emit_json = emit_json,
     };
 }
 
 fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parsed: CliOptions) !Options {
+    if (parsed.rootfs_path) |path| {
+        if (!try readablePath(init.io, path)) {
+            failRunSetup("spore run: rootfs not found: {s}", .{path});
+        }
+    }
     const kernel_path = parsed.shared.kernel_path orelse try resolveDefaultKernelPath(init, allocator);
     const initrd_path = parsed.shared.initrd_path orelse try resolveDefaultInitrdPath(init, allocator);
-    return parsed.shared.completeWithAssets(parsed.backend, kernel_path, initrd_path, parsed.command, parsed.emit_json);
+    return parsed.shared.completeWithAssets(parsed.backend, kernel_path, initrd_path, parsed.rootfs_path, parsed.command, parsed.emit_json);
 }
 
 fn resolveDefaultKernelPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
@@ -227,7 +241,7 @@ fn resolveDefaultKernelPath(init: std.process.Init, allocator: std.mem.Allocator
     }
 
     const result = std.process.run(allocator, init.io, .{
-        .argv = &.{ helper, "initrd" },
+        .argv = &.{ helper, "run" },
         .stdout_limit = .limited(16 * 1024),
         .stderr_limit = .limited(64 * 1024),
     }) catch |err| {
@@ -362,7 +376,11 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     const backend = try resolveBackend(opts.backend);
     const kernel = try std.Io.Dir.cwd().readFileAlloc(init.io, opts.kernel_path, allocator, .limited(max_file_size));
     const initrd = try std.Io.Dir.cwd().readFileAlloc(init.io, opts.initrd_path, allocator, .limited(max_file_size));
-    const boot_args = try cmdline(allocator, opts.guest_port);
+    const rootfs_fd = try openRootfsDisk(allocator, opts.rootfs_path);
+    defer {
+        if (rootfs_fd) |fd| _ = std.c.close(fd);
+    }
+    const boot_args = try cmdline(allocator, opts.guest_port, opts.rootfs_path != null);
     const request = try execRequest(allocator, opts.command);
     var stream = try vsock.HostStream.init(opts.guest_port, request);
 
@@ -376,6 +394,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .cmdline = boot_args,
                 .initrd = initrd,
                 .console_sink = consoleSink,
+                .disk_fd = rootfs_fd,
                 .exec_probe = &stream,
                 .exec_probe_timeout_ms = opts.timeout_ms,
             });
@@ -388,6 +407,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .cmdline = boot_args,
                 .initrd = initrd,
                 .console_sink = consoleSink,
+                .disk_fd = rootfs_fd,
                 .exec_probe = &stream,
                 .exec_probe_timeout_ms = opts.timeout_ms,
             });
@@ -396,6 +416,14 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     if (cause != .probe_complete) return error.ProbeDidNotComplete;
 
     return resultFromStream(allocator, backend, opts, &stream);
+}
+
+fn openRootfsDisk(allocator: std.mem.Allocator, rootfs_path: ?[]const u8) !?std.c.fd_t {
+    const path = rootfs_path orelse return null;
+    const pathz = try allocator.dupeZ(u8, path);
+    const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c_uint, 0));
+    if (fd < 0) return error.RootFSOpenFailed;
+    return fd;
 }
 
 pub fn writeJsonResult(allocator: std.mem.Allocator, writer: *Io.Writer, result: Result) !void {
@@ -491,8 +519,11 @@ pub fn execRequest(allocator: std.mem.Allocator, argv: []const []const u8) ![]co
     return std.fmt.allocPrint(allocator, "{s}\n", .{json});
 }
 
-pub fn cmdline(allocator: std.mem.Allocator, guest_port: u32) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "console=hvc0 rdinit=/init cleanroom_guest_port={d} cleanroom_guest_boot_timing=1", .{guest_port});
+pub fn cmdline(allocator: std.mem.Allocator, guest_port: u32, rootfs: bool) ![]const u8 {
+    return if (rootfs)
+        std.fmt.allocPrint(allocator, "console=hvc0 rdinit=/init cleanroom_guest_port={d} cleanroom_guest_boot_timing=1 spore_rootfs=1", .{guest_port})
+    else
+        std.fmt.allocPrint(allocator, "console=hvc0 rdinit=/init cleanroom_guest_port={d} cleanroom_guest_boot_timing=1", .{guest_port});
 }
 
 fn resolveBackend(backend: Backend) !Backend {
@@ -723,6 +754,24 @@ test "run cli parser allows default boot assets" {
     try std.testing.expect(opts.emit_json);
     try std.testing.expectEqual(@as(usize, 1), opts.command.len);
     try std.testing.expectEqualStrings("/bin/writeout", opts.command[0]);
+}
+
+test "run cli parser accepts rootfs path" {
+    const opts = try parseCliArgs(&.{ "--rootfs", "rootfs.ext4", "--", "/bin/echo", "hi" });
+    try std.testing.expectEqualStrings("rootfs.ext4", opts.rootfs_path.?);
+    try std.testing.expectEqual(@as(usize, 2), opts.command.len);
+    try std.testing.expectEqualStrings("/bin/echo", opts.command[0]);
+    try std.testing.expectEqualStrings("hi", opts.command[1]);
+}
+
+test "run cmdline marks rootfs mode" {
+    const without_rootfs = try cmdline(std.testing.allocator, 10700, false);
+    defer std.testing.allocator.free(without_rootfs);
+    try std.testing.expect(std.mem.indexOf(u8, without_rootfs, "spore_rootfs=1") == null);
+
+    const with_rootfs = try cmdline(std.testing.allocator, 10700, true);
+    defer std.testing.allocator.free(with_rootfs);
+    try std.testing.expect(std.mem.indexOf(u8, with_rootfs, "spore_rootfs=1") != null);
 }
 
 test "run default asset paths derive from install prefix" {

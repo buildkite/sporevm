@@ -99,13 +99,20 @@ Run a single command in a throwaway VM with the minimal agent initrd:
 zig-out/bin/spore run -- /bin/writeout
 ```
 
-`spore run` defaults to the managed initrd-profile kernel and the minimal exec
+`spore run` defaults to the managed SporeVM run kernel and the minimal exec
 initrd installed by `zig build`. Pass `--kernel` and `--initrd`, or set
 `SPOREVM_KERNEL_IMAGE` and `SPOREVM_RUN_INITRD`, to use explicit boot assets.
 The minimal agent captures up to 16 KiB each of command stdout and stderr. In
 normal mode those bytes are forwarded to the host streams and `spore run` exits
 with the guest command status. With `--json`, command output is reported as
 base64 fields alongside truncation metadata.
+
+Attach an ext4 rootfs read-only and execute an explicit argv from it with
+`--rootfs`:
+
+```bash
+zig-out/bin/spore run --rootfs rootfs.ext4 -- /bin/echo hi
+```
 
 For a lower-bound boot/exec probe comparable to Cleanroom's minimal
 `darwin-vz` benchmark, use the minimal benchmark wrapper. It builds a tiny
@@ -131,6 +138,8 @@ image. Inputs may be digest-pinned refs or registry tags.
 spore rootfs build ghcr.io/org/image:latest \
   --platform linux/arm64 \
   --output rootfs.ext4
+
+zig-out/bin/spore run --rootfs rootfs.ext4 -- /bin/echo hi
 ```
 
 See [docs/rootfs.md](docs/rootfs.md) for tag resolution, metadata, and ext4

@@ -112,6 +112,9 @@ static void mount_proc(void) {
 
 static void prepare_dev(void) {
   mkdir("/dev", 0755);
+  if (mount("devtmpfs", "/dev", "devtmpfs", 0, "") != 0 && errno != EBUSY) {
+    dprintf(2, "mount devtmpfs failed: errno=%d\n", errno);
+  }
   if (mknod("/dev/null", S_IFCHR | 0666, (dev_t)((1u << 8) | 3u)) != 0 && errno != EEXIST) {
     dprintf(2, "mknod /dev/null failed: errno=%d\n", errno);
   }
@@ -132,6 +135,39 @@ static uint32_t resolve_port(void) {
   unsigned long value = strtoul(p, NULL, 10);
   if (value == 0 || value > 65535) return 10700;
   return (uint32_t)value;
+}
+
+static int cmdline_has_flag(const char *flag) {
+  char buf[1024];
+  int fd = open("/proc/cmdline", O_RDONLY);
+  if (fd < 0) return 0;
+  ssize_t n = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  if (n <= 0) return 0;
+  buf[n] = '\0';
+  return strstr(buf, flag) != NULL;
+}
+
+static int wait_for_path(const char *path, int attempts, int sleep_us) {
+  for (int i = 0; i < attempts; i++) {
+    if (access(path, R_OK) == 0) return 0;
+    usleep((useconds_t)sleep_us);
+  }
+  return -1;
+}
+
+static int setup_rootfs(char *error, size_t cap) {
+  mkdir("/mnt", 0755);
+  mkdir("/mnt/rootfs", 0755);
+  if (wait_for_path("/dev/vda", 100, 50000) != 0) {
+    snprintf(error, cap, "rootfs block device not found");
+    return -1;
+  }
+  if (mount("/dev/vda", "/mnt/rootfs", "ext4", MS_RDONLY, "noload") != 0) {
+    snprintf(error, cap, "rootfs mount failed: errno=%d", errno);
+    return -1;
+  }
+  return 0;
 }
 
 static int listen_vsock(uint32_t port) {
@@ -284,6 +320,8 @@ static void send_exit(int fd, int exit_code, const char *error, const struct out
   if (error != NULL) {
     if (strcmp(error, "bad request") == 0) {
       error_json = "\"bad request\"";
+    } else if (strcmp(error, "rootfs unavailable") == 0) {
+      error_json = "\"rootfs unavailable\"";
     } else {
       error_json = "\"run failed\"";
     }
@@ -394,7 +432,7 @@ static int parse_argv(const char *req, char storage[MAX_ARGC][MAX_ARG_LEN], char
   }
 }
 
-static int run_argv(char *const argv[], struct output_capture *capture) {
+static int run_argv(char *const argv[], struct output_capture *capture, int use_rootfs) {
   t_command_start = now_ms();
   int stdout_pipe[2];
   int stderr_pipe[2];
@@ -425,6 +463,10 @@ static int run_argv(char *const argv[], struct output_capture *capture) {
     if (dup2(stderr_pipe[1], STDERR_FILENO) < 0) _exit(127);
     close(stdout_pipe[1]);
     close(stderr_pipe[1]);
+    if (use_rootfs) {
+      if (chroot("/mnt/rootfs") != 0) _exit(126);
+      if (chdir("/") != 0) _exit(126);
+    }
     char *const empty_env[] = { NULL };
     execve(argv[0], argv, empty_env);
     _exit(127);
@@ -514,6 +556,14 @@ int main(void) {
   t_init_start = now_ms();
   mount_proc();
   prepare_dev();
+  int use_rootfs = cmdline_has_flag("spore_rootfs=1");
+  int rootfs_ready = 1;
+  char rootfs_error[128];
+  rootfs_error[0] = '\0';
+  if (use_rootfs && setup_rootfs(rootfs_error, sizeof(rootfs_error)) != 0) {
+    rootfs_ready = 0;
+    dprintf(2, "%s\n", rootfs_error);
+  }
 
   int listener = listen_vsock(resolve_port());
   if (listener < 0) {
@@ -547,10 +597,17 @@ int main(void) {
       close(conn);
       continue;
     }
+    if (use_rootfs && !rootfs_ready) {
+      t_command_start = now_ms();
+      t_command_exit = t_command_start;
+      send_exit(conn, 126, "rootfs unavailable", NULL);
+      close(conn);
+      continue;
+    }
 
     struct output_capture capture;
     memset(&capture, 0, sizeof(capture));
-    int code = run_argv(argv, &capture);
+    int code = run_argv(argv, &capture, use_rootfs);
     send_exit(conn, code, NULL, &capture);
     close(conn);
   }
