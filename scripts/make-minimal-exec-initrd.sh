@@ -277,7 +277,8 @@ static int run_argv(char *const argv[]) {
   t_command_start = now_ms();
   pid_t pid = fork();
   if (pid == 0) {
-    execv(argv[0], argv);
+    char *const empty_env[] = { NULL };
+    execve(argv[0], argv, empty_env);
     _exit(127);
   }
   if (pid < 0) {

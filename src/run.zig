@@ -13,6 +13,10 @@ const vsock = @import("virtio/vsock.zig");
 
 const default_command = [_][]const u8{"/bin/true"};
 const max_file_size = 256 * 1024 * 1024;
+const max_guest_argc = 16;
+const max_guest_arg_len = 255;
+const max_guest_request_len = 2047;
+const max_guest_port = 65535;
 
 pub const Backend = enum {
     auto,
@@ -278,12 +282,14 @@ pub fn closeConsoleLog() void {
 }
 
 pub fn execRequest(allocator: std.mem.Allocator, argv: []const []const u8) ![]const u8 {
+    try validateGuestArgv(argv);
     const payload = struct {
         argv: []const []const u8,
         closed_env: bool = true,
     }{ .argv = argv };
     const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(json);
+    if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
     return std.fmt.allocPrint(allocator, "{s}\n", .{json});
 }
 
@@ -330,6 +336,25 @@ fn parsePositive(comptime T: type, name: []const u8, raw: []const u8) !T {
     return parsed;
 }
 
+fn parseGuestPort(name: []const u8, raw: []const u8) !u32 {
+    const parsed = std.fmt.parseInt(u32, raw, 10) catch {
+        std.debug.print("{s} must be an integer from 1 to {d}\n", .{ name, max_guest_port });
+        std.process.exit(2);
+    };
+    if (parsed == 0 or parsed > max_guest_port) {
+        std.debug.print("{s} must be an integer from 1 to {d}\n", .{ name, max_guest_port });
+        std.process.exit(2);
+    }
+    return parsed;
+}
+
+fn validateGuestArgv(argv: []const []const u8) !void {
+    if (argv.len == 0 or argv.len > max_guest_argc) return error.RunArgCountUnsupported;
+    for (argv) |arg| {
+        if (arg.len > max_guest_arg_len) return error.RunArgTooLong;
+    }
+}
+
 fn parseSharedOption(shared: *SharedOptions, args: []const []const u8, i: *usize) !bool {
     const name = args[i.*];
     if (std.mem.eql(u8, name, "--kernel")) {
@@ -341,7 +366,7 @@ fn parseSharedOption(shared: *SharedOptions, args: []const []const u8, i: *usize
     } else if (std.mem.eql(u8, name, "--vcpus")) {
         shared.vcpus = try parsePositive(u32, name, takeValue(args, i, name));
     } else if (std.mem.eql(u8, name, "--guest-port")) {
-        shared.guest_port = try parsePositive(u32, name, takeValue(args, i, name));
+        shared.guest_port = try parseGuestPort(name, takeValue(args, i, name));
     } else if (std.mem.eql(u8, name, "--timeout-ms")) {
         shared.timeout_ms = try parsePositive(u64, name, takeValue(args, i, name));
     } else if (std.mem.eql(u8, name, "--console-log")) {
@@ -426,6 +451,29 @@ test "run request encodes argv" {
     const request = try execRequest(std.testing.allocator, &.{ "/bin/echo", "hello world" });
     defer std.testing.allocator.free(request);
     try std.testing.expectEqualStrings("{\"argv\":[\"/bin/echo\",\"hello world\"],\"closed_env\":true}\n", request);
+}
+
+test "run request rejects guest argv count overflow" {
+    const argv = [_][]const u8{
+        "/bin/true", "1",  "2",  "3",
+        "4",         "5",  "6",  "7",
+        "8",         "9",  "10", "11",
+        "12",        "13", "14", "15",
+        "16",
+    };
+    try std.testing.expectError(error.RunArgCountUnsupported, execRequest(std.testing.allocator, &argv));
+}
+
+test "run request rejects guest argv length overflow" {
+    var arg = [_]u8{'a'} ** (max_guest_arg_len + 1);
+    try std.testing.expectError(error.RunArgTooLong, execRequest(std.testing.allocator, &.{arg[0..]}));
+}
+
+test "run request rejects encoded line overflow" {
+    var arg = [_]u8{'a'} ** 240;
+    var argv: [10][]const u8 = undefined;
+    for (&argv) |*slot| slot.* = arg[0..];
+    try std.testing.expectError(error.RunRequestTooLarge, execRequest(std.testing.allocator, &argv));
 }
 
 test "run cli parser accepts command after separator" {
