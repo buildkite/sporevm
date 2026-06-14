@@ -391,7 +391,10 @@ for the second restore, and reported `total_cache_hits=2`,
 `total_cache_misses=2`, and `origin_multiplier_vs_resume_bundle=0.5` across
 four resumes. That proves host-local cache reuse for repeated same-host
 restores; peer/fleet distribution is still required before the final fan-out
-data plane can claim low origin egress at large scale.
+data plane can claim low origin egress at large scale. The bundle identity used
+for that cache path is now a product-level `bundle_digest` reported by both
+`spore pack` and `spore unpack`, so future daemons and cache layers do not need
+to reinvent script-local tree hashes.
 
 ## Delivery Strategy
 
@@ -492,10 +495,10 @@ fan-out.
 
 ### Slice 6: Identical-host fan-out distribution
 
-Status: in progress. Local chunkpack bundles, the first two-host S3/SSM remote
-restore smoke, and a host-local cache-backed repeat restore smoke have landed;
-peer/fleet fan-out and measured origin-egress efficiency at larger host counts
-remain.
+Status: in progress. Local chunkpack bundles with canonical `bundle_digest`
+output, the first two-host S3/SSM remote restore smoke, and a host-local
+cache-backed repeat restore smoke have landed; peer/fleet fan-out and measured
+origin-egress efficiency at larger host counts remain.
 
 Start with a local bundle/chunkpack format, then add distribution adapters.
 `spore pack` writes a portable bundle containing a manifest with local RAM

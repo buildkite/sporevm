@@ -237,7 +237,7 @@ export XDG_STATE_HOME="\${XDG_STATE_HOME:-\${HOME}/.local/state}"
 mkdir -p "\${XDG_CACHE_HOME}" "\${XDG_DATA_HOME}" "\${XDG_STATE_HOME}"
 command -v git >/dev/null 2>&1 || { echo "git is required" >&2; exit 1; }
 command -v tar >/dev/null 2>&1 || { echo "tar is required" >&2; exit 1; }
-command -v sha256sum >/dev/null 2>&1 || { echo "sha256sum is required" >&2; exit 1; }
+command -v python3 >/dev/null 2>&1 || { echo "python3 is required" >&2; exit 1; }
 
 region=${q_region}
 bucket=${q_bucket}
@@ -268,11 +268,11 @@ scripts/smoke-restore-leg.sh capture \
   --spore-dir "\${workdir}/spore" \
   --mem-mib "\${mem_mib}" \
   --snapshot-after-ms "\${snapshot_after_ms}"
-zig-out/bin/spore pack "\${workdir}/spore" --out "\${workdir}/spore.bundle"
+zig-out/bin/spore pack "\${workdir}/spore" --out "\${workdir}/spore.bundle" | tee "\${workdir}/pack-result.json"
 
 bundle_bytes="\$(du -sb "\${workdir}/spore.bundle" | awk '{print \$1}')"
 unique_chunk_bytes="\$(du -sb "\${workdir}/spore.bundle/chunkpacks/000000.pack" | awk '{print \$1}')"
-bundle_key="\$(cd "\${workdir}/spore.bundle" && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print \$1}')"
+bundle_key="\$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["bundle_digest"])' "\${workdir}/pack-result.json")"
 packed_chunks="\$(find "\${workdir}/spore.bundle/chunkpacks" -type f | wc -l | tr -d ' ')"
 aws s3 cp "\${workdir}/spore.bundle" "s3://\${bucket}/\${run_prefix}/spore.bundle/" --recursive --region "\${region}" --only-show-errors
 printf '%s\n' "\${bundle_key}" >"\${workdir}/bundle-key.txt"
