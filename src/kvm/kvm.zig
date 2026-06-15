@@ -342,6 +342,20 @@ pub fn completePendingExit(vcpu_fd: std.c.fd_t, run: []u8) Error!void {
     }
 }
 
+pub const RunResult = enum { completed, interrupted };
+
+pub fn runVcpu(vcpu_fd: std.c.fd_t) Error!RunResult {
+    const rc = linux.ioctl(vcpu_fd, KVM_RUN, 0);
+    switch (linux.errno(rc)) {
+        .SUCCESS => return .completed,
+        .INTR => return .interrupted,
+        else => |err| {
+            std.log.err("KVM_RUN failed: {s}", .{@tagName(err)});
+            return error.KvmIoctlFailed;
+        },
+    }
+}
+
 pub fn exitReason(run: []u8) u32 {
     return std.mem.readInt(u32, run[RunLayout.exit_reason..][0..4], .native);
 }
