@@ -239,9 +239,8 @@ output/result semantics unchanged.
 
 ### Slice B: Read-Only Rootfs Attach And Exec
 
-Status: implemented. Local validation used a SporeVM run kernel built from the
-matching `cleanroom-kernels` branch; default no-env resolution requires that
-kernel asset to be published on the configured cleanroom-kernels release.
+Status: implemented. Default no-env resolution uses the managed SporeVM run
+kernel published by `cleanroom-kernels`.
 
 Scope:
 
