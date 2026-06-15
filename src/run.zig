@@ -50,6 +50,7 @@ pub const Options = struct {
     kernel_path: []const u8,
     initrd_path: []const u8,
     rootfs_path: ?[]const u8 = null,
+    resume_dir: ?[]const u8 = null,
     command: []const []const u8,
     memory_mib: u64 = 1024,
     vcpus: u32 = 1,
@@ -80,6 +81,16 @@ pub const Result = struct {
     }
 };
 
+pub const MonitorExit = enum {
+    stopped,
+    snapshotted,
+};
+
+pub const MonitorResult = struct {
+    backend: Backend,
+    exit: MonitorExit,
+};
+
 const SharedOptions = struct {
     kernel_path: ?[]const u8 = null,
     initrd_path: ?[]const u8 = null,
@@ -103,6 +114,7 @@ const SharedOptions = struct {
             .kernel_path = kernel_path,
             .initrd_path = initrd_path,
             .rootfs_path = rootfs_path,
+            .resume_dir = null,
             .command = command,
             .memory_mib = self.memory_mib,
             .vcpus = self.vcpus,
@@ -622,7 +634,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     };
 }
 
-pub fn executeMonitor(init: std.process.Init, allocator: std.mem.Allocator, opts: Options, control: vsock.Control) !Backend {
+pub fn executeMonitor(init: std.process.Init, allocator: std.mem.Allocator, opts: Options, control: vsock.Control) !MonitorResult {
     if (opts.vcpus != 1) return error.UnsupportedVcpuCount;
 
     const backend = try resolveBackend(opts.backend);
@@ -645,6 +657,8 @@ pub fn executeMonitor(init: std.process.Init, allocator: std.mem.Allocator, opts
                 .initrd = initrd,
                 .console_sink = consoleSink,
                 .disk_fd = rootfs_fd,
+                .resume_dir = opts.resume_dir,
+                .ram_restore_mode = .eager_chunks,
                 .exec_control = control,
             });
         },
@@ -653,8 +667,11 @@ pub fn executeMonitor(init: std.process.Init, allocator: std.mem.Allocator, opts
             return error.UnsupportedMonitorBackend;
         },
     };
-    if (cause != .monitor_stopped) return error.MonitorDidNotStopCleanly;
-    return backend;
+    return switch (cause) {
+        .monitor_stopped => .{ .backend = backend, .exit = .stopped },
+        .snapshotted => .{ .backend = backend, .exit = .snapshotted },
+        else => error.MonitorDidNotStopCleanly,
+    };
 }
 
 fn openRootfsDisk(allocator: std.mem.Allocator, rootfs_path: ?[]const u8) !?std.c.fd_t {

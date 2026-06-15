@@ -10,6 +10,7 @@ const vsock = @import("virtio/vsock.zig");
 
 const max_control_request = 4096;
 const max_control_response = 128 * 1024;
+const max_suspend_path = 4096;
 const default_backend = "auto";
 
 const monitor_usage =
@@ -22,6 +23,7 @@ const monitor_usage =
     \\  --initrd root.cpio      Initrd path
     \\  --rootfs rootfs.ext4    Resolved rootfs image path
     \\  --image REF             Original OCI image ref for metadata
+    \\  --resume DIR            Resume from a diskless spore directory
     \\  --memory-mib N          Guest memory in MiB (default: 1024)
     \\  --guest-port N          Guest vsock listen port (default: 10700)
     \\  --timeout-ms N          Exec timeout in milliseconds (default: 30000)
@@ -37,6 +39,7 @@ const MonitorOptions = struct {
     initrd_path: ?[]const u8 = null,
     rootfs_path: ?[]const u8 = null,
     image_ref: ?[]const u8 = null,
+    resume_dir: ?[]const u8 = null,
     memory_mib: u64 = 1024,
     vcpus: u32 = 1,
     guest_port: u32 = 10700,
@@ -48,6 +51,8 @@ const RequestState = enum {
     idle,
     pending_exec,
     active_exec,
+    pending_suspend,
+    active_suspend,
     done,
     stop_requested,
 };
@@ -72,6 +77,10 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         std.debug.print("spore monitor: --image is metadata only; pass a resolved --rootfs path\n", .{});
         std.process.exit(2);
     }
+    if (opts.resume_dir != null and opts.rootfs_path != null) {
+        std.debug.print("spore monitor: disk-backed resume is not supported yet\n", .{});
+        std.process.exit(2);
+    }
     const paths = try lifecycle.pathsFor(allocator, init.environ_map, opts.name);
     const kernel_path = opts.kernel_path orelse try run.resolveDefaultKernelPath(init, allocator);
     const initrd_path = opts.initrd_path orelse try run.resolveDefaultInitrdPath(init, allocator);
@@ -83,6 +92,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         .initrd_path = initrd_path,
         .rootfs_path = opts.rootfs_path,
         .image_ref = opts.image_ref,
+        .resume_dir = opts.resume_dir,
         .memory_mib = opts.memory_mib,
         .vcpus = opts.vcpus,
         .guest_port = opts.guest_port,
@@ -108,6 +118,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         .kernel_path = kernel_path,
         .initrd_path = initrd_path,
         .rootfs_path = opts.rootfs_path,
+        .resume_dir = opts.resume_dir,
         .command = &.{"/bin/true"},
         .memory_mib = opts.memory_mib,
         .vcpus = opts.vcpus,
@@ -115,7 +126,11 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         .timeout_ms = opts.timeout_ms,
         .console_log_path = opts.console_log_path,
     }, server.control());
-    if (result) |_| {
+    if (result) |monitor_result| {
+        switch (monitor_result.exit) {
+            .stopped => {},
+            .snapshotted => try server.completeSuspend(),
+        }
         server.deinit();
         thread.join();
     } else |err| {
@@ -140,6 +155,8 @@ const ExecServer = struct {
     request_len: usize = 0,
     response: [max_control_response]u8 = undefined,
     response_len: usize = 0,
+    suspend_dir: [max_suspend_path]u8 = undefined,
+    suspend_dir_len: usize = 0,
     active_stream: vsock.HostStream = undefined,
     active_stream_valid: bool = false,
     next_host_port: u32 = 49152,
@@ -193,6 +210,11 @@ const ExecServer = struct {
         switch (self.state) {
             .idle, .done => return .keep_running,
             .stop_requested => return .stop,
+            .pending_suspend => {
+                self.state = .active_suspend;
+                return .{ .snapshot = self.suspend_dir[0..self.suspend_dir_len] };
+            },
+            .active_suspend => return .keep_running,
             .pending_exec => {
                 self.active_stream = try vsock.HostStream.init(self.guest_port, self.request[0..self.request_len]);
                 self.active_stream.host_port = self.next_host_port;
@@ -248,6 +270,36 @@ const ExecServer = struct {
         return self.response[0..self.response_len];
     }
 
+    fn submitSuspend(self: *ExecServer, out_dir: []const u8) ![]const u8 {
+        if (out_dir.len == 0 or out_dir.len > self.suspend_dir.len) return error.InvalidSuspendDir;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.state != .idle) return error.ControlBusy;
+        @memcpy(self.suspend_dir[0..out_dir.len], out_dir);
+        self.suspend_dir_len = out_dir.len;
+        self.response_len = 0;
+        self.state = .pending_suspend;
+        if (self.wake) |wake| wake.wake();
+        self.cond.broadcast(self.io);
+        while (self.state != .done) {
+            self.cond.waitUncancelable(self.io, &self.mutex);
+        }
+        return self.response[0..self.response_len];
+    }
+
+    fn completeSuspend(self: *ExecServer) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        switch (self.state) {
+            .pending_suspend, .active_suspend => {
+                try self.storeSuspendResultLocked(self.suspend_dir[0..self.suspend_dir_len]);
+                self.state = .done;
+                self.cond.broadcast(self.io);
+            },
+            else => {},
+        }
+    }
+
     fn requestStop(self: *ExecServer) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -260,7 +312,7 @@ const ExecServer = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         switch (self.state) {
-            .pending_exec, .active_exec => {
+            .pending_exec, .active_exec, .pending_suspend, .active_suspend => {
                 self.storeErrorLocked(message) catch {
                     self.response_len = 0;
                 };
@@ -276,6 +328,14 @@ const ExecServer = struct {
             type: []const u8 = "exec_result",
             exit_frame: []const u8,
         }{ .exit_frame = exit_frame };
+        try self.storeJsonLocked(payload);
+    }
+
+    fn storeSuspendResultLocked(self: *ExecServer, out_dir: []const u8) !void {
+        const payload = struct {
+            type: []const u8 = "suspended",
+            out_dir: []const u8,
+        }{ .out_dir = out_dir };
         try self.storeJsonLocked(payload);
     }
 
@@ -337,6 +397,18 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
         try writeControlOk(server.io, stream);
         return true;
     }
+    if (std.mem.eql(u8, parsed.value.type, "suspend")) {
+        const out_dir = parsed.value.out_dir orelse {
+            try writeControlError(server.io, stream, "suspend request missing out_dir");
+            return false;
+        };
+        const response = server.submitSuspend(out_dir) catch {
+            try writeControlError(server.io, stream, "monitor busy");
+            return false;
+        };
+        try writeAll(server.io, stream, response);
+        return true;
+    }
     if (!std.mem.eql(u8, parsed.value.type, "exec")) {
         try writeControlError(server.io, stream, "unknown control request");
         return false;
@@ -361,6 +433,7 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
 const ControlRequest = struct {
     type: []const u8,
     argv: ?[]const []const u8 = null,
+    out_dir: ?[]const u8 = null,
 };
 
 fn writeControlOk(io: Io, stream: net.Stream) !void {
@@ -406,6 +479,8 @@ fn parseMonitorArgs(args: []const []const u8) !MonitorOptions {
             opts.rootfs_path = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--image")) {
             opts.image_ref = takeValue(args, &i, args[i]);
+        } else if (std.mem.eql(u8, args[i], "--resume")) {
+            opts.resume_dir = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--memory-mib")) {
             opts.memory_mib = try parsePositive(u64, args[i], takeValue(args, &i, args[i]));
         } else if (std.mem.eql(u8, args[i], "--vcpus")) {

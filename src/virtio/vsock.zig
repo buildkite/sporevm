@@ -254,7 +254,11 @@ pub const HostStream = struct {
     }
 };
 
-pub const ControlAction = enum { keep_running, stop };
+pub const ControlAction = union(enum) {
+    keep_running,
+    stop,
+    snapshot: []const u8,
+};
 
 pub const Wake = struct {
     context: *anyopaque,

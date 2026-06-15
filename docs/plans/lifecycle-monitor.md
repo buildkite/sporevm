@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: active
 last_reviewed: 2026-06-15
 spec_refs:
   - docs/plans/foundation.md
@@ -246,8 +246,11 @@ than redesigning the guest protocol.
 - KVM still treats the exec stream as a one-shot probe for lifecycle purposes.
   Monitor mode fails explicitly on KVM until that backend has a real wake path
   for host-attached streams.
-- Runtime rootfs cache work exists below `spore run`, but lifecycle
-  `--rootfs`/`--image` create remains a later slice.
+- `spore create --rootfs PATH` and `spore create --image REF` reuse the same
+  read-only rootfs materialization path as `spore run`.
+- `spore suspend NAME --out DIR` and `spore resume DIR --name NAME` work for
+  diskless lifecycle VMs on local HVF. Disk-backed lifecycle suspend/resume
+  fails closed until disk identity and disk manifests are explicit.
 
 ## Delivery Strategy
 
@@ -432,7 +435,8 @@ writes JSONL but exits non-zero when any iteration fails.
 
 ### Slice E: Suspend/Resume Integration
 
-Status: deferred.
+Status: complete for diskless local HVF; disk-backed and KVM lifecycle resume
+remain follow-ups.
 
 Scope:
 
@@ -444,6 +448,25 @@ Scope:
 
 This slice belongs after create/exec/rm is stable because suspend/resume needs
 the same monitor lifetime and runtime registry.
+
+Validated locally:
+
+```console
+SPOREVM_RUNTIME_DIR=/tmp/sporevm-slice-e spore create snap-1 --timeout-ms 30000
+SPOREVM_RUNTIME_DIR=/tmp/sporevm-slice-e spore exec snap-1 -- /bin/writeout
+SPOREVM_RUNTIME_DIR=/tmp/sporevm-slice-e spore suspend snap-1 --out /tmp/sporevm-slice-e-spore
+SPOREVM_RUNTIME_DIR=/tmp/sporevm-slice-e spore ls
+spore inspect /tmp/sporevm-slice-e-spore
+SPOREVM_RUNTIME_DIR=/tmp/sporevm-slice-e spore resume /tmp/sporevm-slice-e-spore --name snap-2
+SPOREVM_RUNTIME_DIR=/tmp/sporevm-slice-e spore exec snap-2 -- /bin/writeout
+SPOREVM_RUNTIME_DIR=/tmp/sporevm-slice-e spore rm snap-2
+```
+
+The resulting spore has four devices, a RAM backing file, and a
+`sporevm-lifecycle.json` sidecar that preserves lifecycle monitor settings such
+as guest port and timeout. A rootfs-backed VM smoke confirms
+`spore suspend` rejects disk-backed lifecycle checkpoints before creating an
+output directory.
 
 ## Verification
 
@@ -460,7 +483,8 @@ the same monitor lifetime and runtime registry.
 - Real-host smokes:
   - HVF create/exec/exec/rm with the minimal initrd;
   - HVF create/exec/rm with `--image docker.io/library/alpine:3.20`;
-  - KVM equivalents on an aarch64 KVM host.
+  - HVF diskless suspend/resume/exec/rm;
+  - KVM equivalents on an aarch64 KVM host after monitor wake support lands.
 - Benchmark smoke:
   - warm-cache `spore create --image node:22-alpine`;
   - two `spore exec` calls against the same VM;
@@ -470,6 +494,7 @@ the same monitor lifetime and runtime registry.
   - monitor crash after ready;
   - `rm` of a dead monitor;
   - duplicate `create` name;
+  - disk-backed `suspend` fails before writing a spore;
   - unsupported backend.
 
 ## Resolved Decisions

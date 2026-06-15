@@ -20,6 +20,10 @@ const usage =
     \\  exec NAME -- <argv...>
     \\                      Execute a command in a named VM
     \\  rm NAME             Remove a named VM
+    \\  suspend NAME --out DIR
+    \\                      Checkpoint a diskless named VM into a spore
+    \\  resume DIR --name NAME
+    \\                      Resume a diskless spore as a named VM
     \\  ls                  List named VMs in the local runtime registry
     \\  version             Print the sporevm version
     \\  host-info           Print this host's platform facts as JSON
@@ -61,6 +65,10 @@ pub fn main(init: std.process.Init) !void {
         try sporevm.lifecycle.execCli(init, args[2..], stdout);
     } else if (std.mem.eql(u8, command, "rm")) {
         try sporevm.lifecycle.rmCli(init, args[2..], stdout);
+    } else if (std.mem.eql(u8, command, "suspend")) {
+        try sporevm.lifecycle.suspendCli(init, args[2..], stdout);
+    } else if (std.mem.eql(u8, command, "resume")) {
+        try sporevm.lifecycle.resumeCli(init, args[2..], stdout);
     } else if (std.mem.eql(u8, command, "ls")) {
         try sporevm.lifecycle.lsCli(init, args[2..], stdout);
     } else if (std.mem.eql(u8, command, "monitor")) {
@@ -237,6 +245,8 @@ test "usage names every command" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "create") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "exec") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "rm") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "suspend") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "resume") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "ls") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "version") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "host-info") != null);

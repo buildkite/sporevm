@@ -360,6 +360,14 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             switch (try control.poll(&vsock_dev)) {
                 .keep_running => {},
                 .stop => return .monitor_stopped,
+                .snapshot => |dir| {
+                    try takeSnapshot(allocator, dir, vcpu, transports, &gen_dev, ram_bytes, .{
+                        .dist_base = dist_base,
+                        .redist_base = vcpu_redist_base,
+                        .ram_size = config.ram_size,
+                    }, if (dirty_tracker) |*tracker| tracker else null);
+                    return .snapshotted;
+                },
             }
             if (vsock_dev.flushPendingRx(&transports_buf[vsock_transport_index].queues, ram)) {
                 transports_buf[vsock_transport_index].interrupt_status |= 1;
