@@ -479,9 +479,9 @@ fn openVerifiedRootfsFromCache(io: Io, allocator: std.mem.Allocator, cache_root:
     const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c_uint, 0));
     if (fd < 0) return error.RootFSDigestCacheMiss;
     errdefer _ = std.c.close(fd);
-    if (!fdIsRegularFile(fd)) return error.RootFSDigestCacheMiss;
+    if (!try fdIsRegularFile(io, fd)) return error.RootFSDigestCacheMiss;
 
-    const actual = try hashFd(allocator, fd);
+    const actual = try hashFd(io, allocator, fd);
     if (actual.size != rootfs.artifact.size) return error.RootFSDigestMismatch;
     if (!std.mem.eql(u8, actual.digest, rootfs.artifact.digest)) return error.RootFSDigestMismatch;
     if (std.c.lseek(fd, 0, std.c.SEEK.SET) < 0) return error.RootFSOpenFailed;
@@ -503,7 +503,7 @@ fn cacheRootfsByDigestPath(
     cache_root: []const u8,
     rootfs_path: []const u8,
 ) !spore.RootfsArtifactRef {
-    const source = try hashPath(allocator, rootfs_path);
+    const source = try hashPath(io, allocator, rootfs_path);
     const digest_path = try digestRootfsPath(allocator, cache_root, source.digest);
     const digest_dir = std.fs.path.dirname(digest_path) orelse return error.RootFSOpenFailed;
     try ensureDirPath(io, digest_dir);
@@ -513,7 +513,7 @@ fn cacheRootfsByDigestPath(
     } else {
         try copyRootfsIntoDigestCache(io, allocator, rootfs_path, digest_path);
     }
-    const cached = try hashPath(allocator, digest_path);
+    const cached = try hashPath(io, allocator, digest_path);
     if (cached.size != source.size or !std.mem.eql(u8, cached.digest, source.digest)) return error.RootFSDigestMismatch;
 
     return .{
@@ -543,16 +543,16 @@ const RootfsHash = struct {
     size: u64,
 };
 
-fn hashPath(allocator: std.mem.Allocator, path: []const u8) !RootfsHash {
+fn hashPath(io: Io, allocator: std.mem.Allocator, path: []const u8) !RootfsHash {
     const pathz = try allocator.dupeZ(u8, path);
     const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c_uint, 0));
     if (fd < 0) return error.RootFSOpenFailed;
     defer _ = std.c.close(fd);
-    return hashFd(allocator, fd);
+    return hashFd(io, allocator, fd);
 }
 
-fn hashFd(allocator: std.mem.Allocator, fd: std.c.fd_t) !RootfsHash {
-    if (!fdIsRegularFile(fd)) return error.RootFSOpenFailed;
+fn hashFd(io: Io, allocator: std.mem.Allocator, fd: std.c.fd_t) !RootfsHash {
+    if (!try fdIsRegularFile(io, fd)) return error.RootFSOpenFailed;
     if (std.c.lseek(fd, 0, std.c.SEEK.SET) < 0) return error.RootFSOpenFailed;
     var h = Blake3.init(.{});
     var size: u64 = 0;
@@ -572,14 +572,13 @@ fn hashFd(allocator: std.mem.Allocator, fd: std.c.fd_t) !RootfsHash {
     return .{ .digest = digest_text, .size = size };
 }
 
-fn fdIsRegularFile(fd: std.c.fd_t) bool {
-    if (std.posix.Stat == void) return false;
-    var stat = std.mem.zeroes(std.posix.Stat);
-    const fstat_sym = if (std.posix.lfs64_abi) std.posix.system.fstat64 else std.posix.system.fstat;
-    switch (std.posix.errno(fstat_sym(fd, &stat))) {
-        .SUCCESS => return std.posix.S.ISREG(stat.mode),
-        else => return false,
-    }
+fn fdIsRegularFile(io: Io, fd: std.c.fd_t) !bool {
+    const file = Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
+    const stat = file.stat(io) catch |err| switch (err) {
+        error.AccessDenied, error.PermissionDenied, error.Streaming => return false,
+        else => |e| return e,
+    };
+    return stat.kind == .file;
 }
 
 fn digestRootfsPath(allocator: std.mem.Allocator, cache_root: []const u8, digest: []const u8) ![]const u8 {
@@ -1351,8 +1350,8 @@ test "rootfs hashing rejects non-file descriptors" {
     const fd = std.c.open(tmp_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c_uint, 0));
     if (fd < 0) return error.SkipZigTest;
     defer _ = std.c.close(fd);
-    try std.testing.expect(!fdIsRegularFile(fd));
-    try std.testing.expectError(error.RootFSOpenFailed, hashFd(allocator, fd));
+    try std.testing.expect(!try fdIsRegularFile(io, fd));
+    try std.testing.expectError(error.RootFSOpenFailed, hashFd(io, allocator, fd));
 }
 
 test "run image cache creates absolute cache directories" {
