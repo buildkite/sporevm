@@ -244,12 +244,26 @@ fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parse
 }
 
 fn resolveImageRootfs(init: std.process.Init, allocator: std.mem.Allocator, image_ref: []const u8) ![]const u8 {
-    const resolved = rootfs_mod.resolveImageRef(init, allocator, image_ref, direct_image_platform) catch |err| {
-        failRunSetup("spore run: image resolve failed for {s}: {s}", .{ image_ref, @errorName(err) });
-    };
     const cache_root = try rootfsCacheRootPath(init, allocator);
     try ensureDirPath(init.io, cache_root);
 
+    if (try rootfs_mod.digestPinnedImageIdentity(allocator, image_ref, direct_image_platform)) |digest_pinned| {
+        if (try cachedImageRootfsPath(init, allocator, cache_root, digest_pinned)) |path| return path;
+    }
+
+    const resolved = rootfs_mod.resolveImageRef(init, allocator, image_ref, direct_image_platform) catch |err| {
+        failRunSetup("spore run: image resolve failed for {s}: {s}", .{ image_ref, @errorName(err) });
+    };
+    if (try cachedImageRootfsPath(init, allocator, cache_root, resolved)) |path| return path;
+    return buildCachedImageRootfs(init, allocator, cache_root, resolved);
+}
+
+fn cachedImageRootfsPath(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    resolved: rootfs_mod.ResolvedImage,
+) !?[]const u8 {
     const cache_key = try rootfsCacheKeyAlloc(allocator, resolved);
     const rootfs_path = try std.fmt.allocPrint(allocator, "{s}/{s}.ext4", .{ cache_root, cache_key });
     const metadata_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ cache_root, cache_key });
@@ -261,7 +275,20 @@ fn resolveImageRootfs(init: std.process.Init, allocator: std.mem.Allocator, imag
         try writeSetupStderr(init, message);
         return rootfs_path;
     }
+    return null;
+}
 
+fn buildCachedImageRootfs(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    resolved: rootfs_mod.ResolvedImage,
+) ![]const u8 {
+    const cache_key = try rootfsCacheKeyAlloc(allocator, resolved);
+    const rootfs_path = try std.fmt.allocPrint(allocator, "{s}/{s}.ext4", .{ cache_root, cache_key });
+    const metadata_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ cache_root, cache_key });
+    const temp_dir_root = try std.fmt.allocPrint(allocator, "{s}/tmp", .{cache_root});
+    try ensureDirPath(init.io, temp_dir_root);
     const temp_id = Io.Clock.real.now(init.io).nanoseconds;
     var temp_nonce_bytes: [8]u8 = undefined;
     init.io.random(&temp_nonce_bytes);
@@ -279,8 +306,9 @@ fn resolveImageRootfs(init: std.process.Init, allocator: std.mem.Allocator, imag
         .metadata = temp_metadata_path,
         .platform = direct_image_platform,
         .metadata_rootfs_path = rootfs_path,
+        .temp_dir_root = temp_dir_root,
     }) catch |err| {
-        failRunSetup("spore run: image rootfs build failed for {s}: {s}", .{ image_ref, @errorName(err) });
+        failRunSetup("spore run: image rootfs build failed for {s}: {s}", .{ resolved.ref, @errorName(err) });
     };
     try Io.Dir.renameAbsolute(temp_rootfs_path, rootfs_path, init.io);
     try Io.Dir.renameAbsolute(temp_metadata_path, metadata_path, init.io);
@@ -347,6 +375,7 @@ fn rootfsCacheKeyAlloc(allocator: std.mem.Allocator, resolved: rootfs_mod.Resolv
 fn cachedRootfsMetadataMatches(io: Io, allocator: std.mem.Allocator, metadata_path: []const u8, resolved: rootfs_mod.ResolvedImage) !bool {
     const metadata = Io.Dir.cwd().readFileAlloc(io, metadata_path, allocator, .limited(max_rootfs_metadata_bytes)) catch |err| switch (err) {
         error.FileNotFound => return false,
+        error.StreamTooLong => return false,
         else => |e| return e,
     };
     defer allocator.free(metadata);
@@ -957,6 +986,26 @@ test "run image cache key is deterministic and scoped to resolved image identity
     try std.testing.expect(!std.mem.eql(u8, same, changed_platform));
 }
 
+test "run image cache can identify digest-pinned refs without network" {
+    const allocator = std.testing.allocator;
+    const resolved = (try rootfs_mod.digestPinnedImageIdentity(
+        allocator,
+        "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .{},
+    )).?;
+    defer allocator.free(resolved.ref);
+
+    try std.testing.expectEqualStrings(
+        "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        resolved.ref,
+    );
+    try std.testing.expectEqualStrings(
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        resolved.manifest_digest,
+    );
+    try std.testing.expect((try rootfs_mod.digestPinnedImageIdentity(allocator, "docker.io/library/alpine:3.20", .{})) == null);
+}
+
 test "run image cache metadata matches resolved image identity" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -992,6 +1041,26 @@ test "run image cache metadata matches resolved image identity" {
 
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = "not json" });
     try std.testing.expect(!try cachedRootfsMetadataMatches(io, allocator, metadata_path, resolved));
+}
+
+test "run image cache treats oversized metadata as a miss" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-run-image-cache-oversized-metadata";
+    const metadata_path = tmp ++ "/metadata.json";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+
+    const oversized = try allocator.alloc(u8, max_rootfs_metadata_bytes);
+    defer allocator.free(oversized);
+    @memset(oversized, ' ');
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = oversized });
+
+    try std.testing.expect(!try cachedRootfsMetadataMatches(io, allocator, metadata_path, .{
+        .ref = "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .manifest_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .platform = .{},
+    }));
 }
 
 test "run image cache creates absolute cache directories" {

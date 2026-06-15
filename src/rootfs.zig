@@ -73,6 +73,7 @@ pub const BuildRequest = struct {
     mkfs: ?[]const u8 = null,
     debugfs: ?[]const u8 = null,
     metadata_rootfs_path: ?[]const u8 = null,
+    temp_dir_root: ?[]const u8 = null,
 };
 
 const BuildOptions = struct {
@@ -83,6 +84,7 @@ const BuildOptions = struct {
     mkfs: []const u8,
     debugfs: []const u8,
     metadata_rootfs_path: ?[]const u8 = null,
+    temp_dir_root: ?[]const u8 = null,
 };
 
 pub const ResolvedImage = struct {
@@ -418,6 +420,18 @@ pub fn resolveImageRef(init: std.process.Init, allocator: std.mem.Allocator, raw
     };
 }
 
+pub fn digestPinnedImageIdentity(allocator: std.mem.Allocator, raw_ref: []const u8, platform: Platform) !?ResolvedImage {
+    const image_ref = ImageRef.parse(raw_ref) catch |err| switch (err) {
+        error.ImageRefMustBeDigestPinned => return null,
+        else => |e| return e,
+    };
+    return .{
+        .ref = try digestImageRef(allocator, image_ref, image_ref.digest),
+        .manifest_digest = image_ref.digest,
+        .platform = platform,
+    };
+}
+
 fn manifestContentDigest(allocator: std.mem.Allocator, manifest_bytes: []const u8, content_digest: ?[]const u8) ![]const u8 {
     if (content_digest) |digest| {
         if (!oci.isSha256Digest(digest)) return error.UnsupportedDigest;
@@ -505,6 +519,7 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, request: Buil
         .mkfs = try resolveExt4Tool(allocator, init.io, init.environ_map, request.mkfs, .mkfs),
         .debugfs = try resolveExt4Tool(allocator, init.io, init.environ_map, request.debugfs, .debugfs),
         .metadata_rootfs_path = request.metadata_rootfs_path,
+        .temp_dir_root = request.temp_dir_root,
     };
     return buildRootFS(init, allocator, opts);
 }
@@ -514,8 +529,13 @@ fn buildRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts: Build
     defer client.deinit();
     var bearer_token: ?[]const u8 = null;
 
+    const temp_dir_root = opts.temp_dir_root orelse ".zig-cache";
+    try Io.Dir.cwd().createDirPath(init.io, temp_dir_root);
     const temp_id = Io.Clock.real.now(init.io).nanoseconds;
-    const temp_dir = try std.fmt.allocPrint(allocator, ".zig-cache/spore-rootfs-{d}", .{temp_id});
+    var temp_nonce_bytes: [8]u8 = undefined;
+    init.io.random(&temp_nonce_bytes);
+    const temp_nonce = std.mem.readInt(u64, &temp_nonce_bytes, .little);
+    const temp_dir = try std.fmt.allocPrint(allocator, "{s}/spore-rootfs-{d}-{x}", .{ temp_dir_root, temp_id, temp_nonce });
     defer Io.Dir.cwd().deleteTree(init.io, temp_dir) catch {};
     try Io.Dir.cwd().createDirPath(init.io, temp_dir);
 
