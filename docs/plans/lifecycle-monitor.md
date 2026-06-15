@@ -24,14 +24,14 @@ agent, and remove the VM without requiring a central always-on daemon.
 `spore run` remains the one-shot convenience command:
 
 ```console
-spore run --image docker.io/library/node:22 -- /bin/sh -lc 'node -v'
+spore run --image docker.io/library/node:22-alpine -- /bin/sh -lc 'node -v'
 ```
 
 The lifecycle surface uses top-level commands and treats the target as a named
 running VM:
 
 ```console
-spore create bench-1 --image docker.io/library/node:22
+spore create bench-1 --image docker.io/library/node:22-alpine
 spore exec bench-1 -- /bin/sh -lc 'node -v'
 spore rm bench-1
 ```
@@ -365,7 +365,7 @@ SPOREVM_RUNTIME_DIR=/tmp/sporevm-slice-c spore rm bench-warm
 
 ### Slice D: Local Lifecycle Timing Script
 
-Status: proposed.
+Status: complete for local HVF.
 
 Scope:
 
@@ -374,7 +374,7 @@ Scope:
 
   ```console
   start timer
-  spore create NAME --image docker.io/library/node:22
+  spore create NAME --image docker.io/library/node:22-alpine
   spore exec NAME -- /bin/sh -lc '<identity probe>'
   spore exec NAME -- /bin/sh -lc 'node -v'
   stop timer
@@ -382,7 +382,10 @@ Scope:
   ```
 
 - Keep cleanup outside the timed section.
-- Use a digest-pinned `linux/arm64` Node image.
+- Prefer a digest-pinned `linux/arm64` Node image for stable comparisons. The
+  local smoke uses the tag-resolved `docker.io/library/node:22-alpine` image
+  because plain `node:22` currently hits the rootfs builder's
+  `CaseCollisionPath` guard.
 - Support an isolated warm-cache run first. Add cold-cache and concurrent modes
   only after the single-VM lifecycle is stable.
 - Write JSONL with per-iteration `create_to_node_ms`, command exit status, and
@@ -394,13 +397,38 @@ Done when:
 
 ```console
 scripts/benchmark-sporevm-lifecycle.sh \
-  --image docker.io/library/node:22 \
+  --image docker.io/library/node:22-alpine \
   --iterations 30 \
   --output-dir /tmp/sporevm-lifecycle
 ```
 
 produces JSONL and summary statistics for a warm-cache local run, with each
 iteration proving two commands executed inside the same VM before cleanup.
+
+Validated locally:
+
+```console
+scripts/benchmark-sporevm-lifecycle.sh \
+  --image docker.io/library/alpine:3.20 \
+  --iterations 1 \
+  --output-dir /tmp/sporevm-lifecycle-smoke \
+  --rootfs-cache-dir /tmp/sporevm-slice-c-cache \
+  --workload-command '/bin/echo script-ok' \
+  --no-build
+
+scripts/benchmark-sporevm-lifecycle.sh \
+  --image docker.io/library/node:22-alpine \
+  --iterations 1 \
+  --output-dir /tmp/sporevm-lifecycle-node-alpine-smoke \
+  --rootfs-cache-dir /tmp/sporevm-node-alpine-cache \
+  --no-build
+```
+
+The Node-Alpine run built a cold rootfs, ran a boot-id identity probe and
+`node -v` in one VM, returned `v22.22.3`, and wrote one JSONL row with
+`create_to_node_ms=26418`, `create_ms=26343`, `identity_exec_ms=32`, and
+`workload_exec_ms=43`. A deliberate `exit 7` workload smoke confirms the script
+writes JSONL but exits non-zero when any iteration fails.
 
 ### Slice E: Suspend/Resume Integration
 
@@ -434,7 +462,7 @@ the same monitor lifetime and runtime registry.
   - HVF create/exec/rm with `--image docker.io/library/alpine:3.20`;
   - KVM equivalents on an aarch64 KVM host.
 - Benchmark smoke:
-  - warm-cache `spore create --image node:22`;
+  - warm-cache `spore create --image node:22-alpine`;
   - two `spore exec` calls against the same VM;
   - local lifecycle timing script with low iteration count.
 - Failure smokes:
