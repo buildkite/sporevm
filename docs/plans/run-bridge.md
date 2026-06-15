@@ -202,7 +202,8 @@ Direct image mode remains explicit through `--image`; the first positional
 argument is not overloaded as an image reference.
 
 The cache root is `SPOREVM_ROOTFS_CACHE_DIR` when set, otherwise the platform
-cache directory under `sporevm/rootfs`. Setup and cache messages go to stderr.
+cache directory under `sporevm/rootfs`. Setup and cache messages stay hidden by
+default and are shown with `spore --debug ...`.
 
 ### Host-Signalled Capture And Resume
 
@@ -636,9 +637,9 @@ interleaved counters from the same captured process state.
   agent mirrors workload output to the guest console for the first product
   guarantee. Separated stdout/stderr after resuming a captured `spore run`
   requires a later explicit reconnect or host-stream state design.
-- The immediate fan-out proof is diskless. Ruby/rootfs fan-out now has an
-  immutable rootfs resume contract, but the end-to-end Ruby demo smoke and
-  remote preload/bundle path remain in `docs/plans/immutable-rootfs-resume.md`.
+- The immediate bridge proof is diskless. Ruby/rootfs fan-out now has an
+  immutable rootfs resume contract and an opt-in local smoke; the remote
+  preload/bundle path remains in `docs/plans/immutable-rootfs-resume.md`.
 
 ## Open Questions And Recommended Defaults
 
@@ -705,5 +706,6 @@ development-only or install/generate assets in a way that survives normal
 The Slice F risk was bundling several different problems into one PR: product
 resume, streaming run output, host-triggered snapshot, and resume-time output
 visibility. Splitting those slices kept each behavior testable. The final proof
-stays diskless because Ruby/rootfs fan-out needs its own demo, preload, and
-remote distribution work even after immutable rootfs resume support exists.
+stayed diskless while immutable-rootfs resume took its own plan and PR. Local
+Ruby/rootfs fan-out is now covered by that plan; remote distribution still needs
+preload or bundle work.
