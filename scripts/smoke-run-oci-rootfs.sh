@@ -45,7 +45,10 @@ shell_join() {
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ -f "${repo_root}/mise.toml" ]]; then
-  export MISE_TRUSTED_CONFIG_PATHS="${MISE_TRUSTED_CONFIG_PATHS:-${repo_root}/mise.toml}"
+  case ":${MISE_TRUSTED_CONFIG_PATHS:-}:" in
+    *":${repo_root}/mise.toml:"*) ;;
+    *) export MISE_TRUSTED_CONFIG_PATHS="${repo_root}/mise.toml${MISE_TRUSTED_CONFIG_PATHS:+:${MISE_TRUSTED_CONFIG_PATHS}}" ;;
+  esac
 fi
 
 image_ref="docker.io/library/alpine:3.20"
