@@ -829,11 +829,23 @@ int main(void) {
 }
 EOF
 
+cat >"${workdir}/sleeper.c" <<'EOF'
+#include <stdio.h>
+#include <unistd.h>
+
+int main(void) {
+  puts("spore run ready");
+  fflush(stdout);
+  for (;;) sleep(60);
+}
+EOF
+
 "${cc_cmd[@]}" -static -Os -s "${workdir}/agent.c" -o "${workdir}/root/init"
 "${cc_cmd[@]}" -static -Os -s "${workdir}/true.c" -o "${workdir}/root/bin/true"
 "${cc_cmd[@]}" -static -Os -s "${workdir}/false.c" -o "${workdir}/root/bin/false"
 "${cc_cmd[@]}" -static -Os -s "${workdir}/writeout.c" -o "${workdir}/root/bin/writeout"
-chmod 0755 "${workdir}/root/init" "${workdir}/root/bin/true" "${workdir}/root/bin/false" "${workdir}/root/bin/writeout"
+"${cc_cmd[@]}" -static -Os -s "${workdir}/sleeper.c" -o "${workdir}/root/bin/sleeper"
+chmod 0755 "${workdir}/root/init" "${workdir}/root/bin/true" "${workdir}/root/bin/false" "${workdir}/root/bin/writeout" "${workdir}/root/bin/sleeper"
 chmod 1777 "${workdir}/root/tmp"
 
 mkdir -p "$(dirname "${out}")"

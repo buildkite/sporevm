@@ -490,7 +490,7 @@ status still matches the guest command.
 
 #### Slice F3: Host-Requested Snapshot Trigger
 
-Status: next.
+Status: implemented.
 
 Scope:
 
@@ -506,6 +506,19 @@ Scope:
 - Snapshot only after pending MMIO/device completion has been settled. Preserve
   the existing fail-closed behavior when vsock has unsnapshot-safe pending
   packets.
+
+Implementation notes:
+
+- `spore run --capture-on-abort DIR` installs a host signal handler for the
+  configured signal, defaulting to `INT`. The first signal requests capture; a
+  second signal exits 130.
+- `--capture-signal NAME` accepts `INT`, `TERM`, `HUP`, `USR1`, and `USR2`, with
+  or without the `SIG` prefix. It is only valid with `--capture-on-abort`.
+- Capture exits zero after writing the spore and prints the capture directory to
+  stderr. Normal completed runs still exit with the guest command status.
+- `mise run smoke:run-capture` starts a long-running guest command, sends
+  `USR1`, checks `manifest.json`, then resumes the captured spore through the
+  product `spore resume` command.
 
 Done when a non-interactive smoke can send the configured host signal to
 `spore run --capture-on-abort out.spore -- /bin/long-running-command`, observe

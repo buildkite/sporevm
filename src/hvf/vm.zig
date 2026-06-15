@@ -7,6 +7,7 @@
 //! Multi-vCPU and the rest of the device set land in later slices.
 
 const std = @import("std");
+const capture = @import("../capture.zig");
 const chunk = @import("../chunk.zig");
 const hvf = @import("hvf.zig");
 const gic = @import("gic.zig");
@@ -53,6 +54,9 @@ pub const Config = struct {
     /// stop. Requires snapshot_dir.
     snapshot_after_ms: ?u64 = null,
     snapshot_dir: ?[]const u8 = null,
+    /// Optional host request that asks the run loop to snapshot at the next
+    /// settled boundary. A second request aborts the run.
+    capture_request: ?*capture.Request = null,
     /// Opt-in HVF write-protect dirty tracking for Slice 7 measurement. When
     /// enabled, guest write faults identify dirty chunks and snapshots only
     /// need a final dirty-tail flush instead of a full RAM scan.
@@ -221,6 +225,10 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     var exit: *hvf.VcpuExit = undefined;
     try hvf.check(hvf.hv_vcpu_create(&vcpu, &exit, null), "hv_vcpu_create");
     defer _ = hvf.hv_vcpu_destroy(vcpu);
+    if (config.capture_request) |request_capture| {
+        request_capture.setWake(wakeCaptureVcpu, &vcpu);
+    }
+    defer if (config.capture_request) |request_capture| request_capture.clearWake();
 
     try hvf.check(hvf.hv_vcpu_set_sys_reg(vcpu, .mpidr_el1, 0x8000_0000), "set mpidr"); // aff 0, RES1
     var vcpu_redist_base: hvf.Ipa = 0;
@@ -347,6 +355,18 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             if (probe.state == .complete) return .probe_complete;
             if (probe.elapsedMs() > config.exec_probe_timeout_ms) return error.VsockProbeTimedOut;
         }
+        if (config.capture_request) |request_capture| {
+            if (request_capture.isAbortRequested()) return error.CaptureAborted;
+            if (request_capture.isRequested()) {
+                const dir = config.snapshot_dir orelse return error.HvCallFailed;
+                try takeSnapshot(allocator, dir, vcpu, transports, &gen_dev, ram_bytes, .{
+                    .dist_base = dist_base,
+                    .redist_base = vcpu_redist_base,
+                    .ram_size = config.ram_size,
+                }, if (dirty_tracker) |*tracker| tracker else null);
+                return .snapshotted;
+            }
+        }
         if (config.snapshot_after_ms) |after_ms| {
             const elapsed_ms = (snapshot.hostCounter() - counter_start) * 1000 / counter_freq;
             if (elapsed_ms >= after_ms) {
@@ -447,7 +467,13 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     try drainStdin(&con, &transports[0], ram);
                 }
             },
-            .canceled => return error.VcpuCanceled,
+            .canceled => {
+                if (config.capture_request) |request_capture| {
+                    if (request_capture.isAbortRequested()) return error.CaptureAborted;
+                    if (request_capture.isRequested()) continue;
+                }
+                return error.VcpuCanceled;
+            },
             else => {
                 std.log.err("unhandled exit reason {}", .{exit.reason});
                 return error.UnhandledExit;
@@ -468,6 +494,12 @@ fn sleepMs(ms: u64) void {
         .nsec = @intCast((ms % std.time.ms_per_s) * std.time.ns_per_ms),
     };
     _ = std.c.nanosleep(&ts, null);
+}
+
+fn wakeCaptureVcpu(context: ?*anyopaque) callconv(.c) void {
+    const vcpu_ptr: *hvf.VcpuHandle = @ptrCast(@alignCast(context orelse return));
+    var vcpus = [_]hvf.VcpuHandle{vcpu_ptr.*};
+    _ = hvf.hv_vcpus_exit(&vcpus, vcpus.len);
 }
 
 fn shouldMapRamAtStart(config: Config, ram_mapping: RamMapping) bool {

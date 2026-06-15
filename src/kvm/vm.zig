@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const linux = std.os.linux;
+const capture = @import("../capture.zig");
 const chunk = @import("../chunk.zig");
 const kvm = @import("kvm.zig");
 const lazy_ram = @import("lazy_ram.zig");
@@ -48,6 +49,9 @@ pub const Config = struct {
     /// stop. Requires snapshot_dir.
     snapshot_after_ms: ?u64 = null,
     snapshot_dir: ?[]const u8 = null,
+    /// Optional host request that asks the run loop to snapshot at the next
+    /// settled boundary. A second request aborts the run.
+    capture_request: ?*capture.Request = null,
     /// Opt-in KVM dirty-log capture path for Slice 7 measurement. When
     /// enabled, guest writes are collected in epochs and snapshot only needs a
     /// final dirty-log tail flush instead of a full RAM scan.
@@ -133,7 +137,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_ONE_REG, "KVM_CAP_ONE_REG");
     try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_ARM_PSCI_0_2, "KVM_CAP_ARM_PSCI_0_2");
     try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_DEVICE_CTRL, "KVM_CAP_DEVICE_CTRL");
-    if (config.resume_dir != null or config.snapshot_after_ms != null) {
+    if (config.resume_dir != null or config.snapshot_after_ms != null or config.capture_request != null) {
         try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_COUNTER_OFFSET, "KVM_CAP_COUNTER_OFFSET");
     }
 
@@ -282,6 +286,11 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         0,
     );
     defer std.posix.munmap(run_bytes);
+    var capture_wake = KvmCaptureWake{ .run = run_bytes };
+    if (config.capture_request) |request_capture| {
+        request_capture.setWake(wakeKvmRun, &capture_wake);
+    }
+    defer if (config.capture_request) |request_capture| request_capture.clearWake();
 
     const start_ms = try monotonicMs();
     if (restore_stats) |*stats| {
@@ -318,6 +327,18 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             }
             if (probe.elapsedMs() > config.exec_probe_timeout_ms) return error.VsockProbeTimedOut;
         }
+        if (config.capture_request) |request_capture| {
+            if (request_capture.isAbortRequested()) return error.CaptureAborted;
+            if (request_capture.isRequested()) {
+                if (pending_kvm_completion) {
+                    try kvm.completePendingExit(vcpu_fd, run_bytes);
+                    pending_kvm_completion = false;
+                }
+                const dir = config.snapshot_dir orelse return error.KvmIoctlFailed;
+                try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, if (dirty_tracker) |*tracker| tracker else null);
+                return .snapshotted;
+            }
+        }
         if (config.snapshot_after_ms) |after_ms| {
             const elapsed_ms = (try monotonicMs()) - start_ms;
             if (elapsed_ms >= after_ms) {
@@ -331,8 +352,20 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             }
         }
 
-        _ = try kvm.ioctl(vcpu_fd, kvm.KVM_RUN, 0, "KVM_RUN");
-        pending_kvm_completion = false;
+        switch (try kvm.runVcpu(vcpu_fd)) {
+            .completed => {
+                if (consumeCaptureWake(config.capture_request, run_bytes)) continue;
+                pending_kvm_completion = false;
+            },
+            .interrupted => {
+                _ = consumeCaptureWake(config.capture_request, run_bytes);
+                if (config.capture_request) |request_capture| {
+                    if (request_capture.isRequested() or request_capture.isAbortRequested()) continue;
+                }
+                std.log.err("KVM_RUN interrupted without a pending capture request", .{});
+                return error.KvmIoctlFailed;
+            },
+        }
         switch (kvm.exitReason(run_bytes)) {
             kvm.KVM_EXIT_MMIO => {
                 try handleMmio(vm_fd, run_bytes, transports, &gen_dev, ram);
@@ -351,6 +384,24 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             },
         }
     }
+}
+
+const KvmCaptureWake = struct {
+    run: []u8,
+};
+
+fn wakeKvmRun(context: ?*anyopaque) callconv(.c) void {
+    const wake: *KvmCaptureWake = @ptrCast(@alignCast(context orelse return));
+    wake.run[kvm.RunLayout.immediate_exit] = 1;
+}
+
+fn consumeCaptureWake(capture_request: ?*capture.Request, run_bytes: []u8) bool {
+    if (run_bytes[kvm.RunLayout.immediate_exit] == 0) return false;
+    run_bytes[kvm.RunLayout.immediate_exit] = 0;
+    if (capture_request) |request_capture| {
+        return request_capture.isRequested() or request_capture.isAbortRequested();
+    }
+    return false;
 }
 
 fn monotonicMs() !u64 {

@@ -5,6 +5,7 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
+const capture = @import("capture.zig");
 const hvf = @import("hvf/hvf.zig");
 const kvm = if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)
     @import("kvm/kvm.zig")
@@ -57,6 +58,8 @@ pub const Options = struct {
     timeout_ms: u64 = 30_000,
     console_log_path: ?[]const u8 = null,
     stream_output: bool = true,
+    capture_on_abort_path: ?[]const u8 = null,
+    capture_signal: capture.Signal = .INT,
 };
 
 pub const Result = struct {
@@ -68,8 +71,11 @@ pub const Result = struct {
     exit_code: i32,
     vcpus: u32,
     memory_mib: u64,
+    captured: bool = false,
+    capture_path: ?[]const u8 = null,
 
     pub fn processExitCode(self: Result) u8 {
+        if (self.captured) return 0;
         std.debug.assert(self.exit_code >= 0 and self.exit_code <= 255);
         return @intCast(self.exit_code);
     }
@@ -118,6 +124,8 @@ pub const CliOptions = struct {
     shared: SharedOptions = .{},
     rootfs_path: ?[]const u8 = null,
     image_ref: ?[]const u8 = null,
+    capture_on_abort_path: ?[]const u8 = null,
+    capture_signal: capture.Signal = .INT,
     command: []const []const u8,
 };
 
@@ -131,6 +139,8 @@ const cli_usage =
     \\  --initrd root.cpio      Initrd path (default: installed minimal exec initrd)
     \\  --rootfs rootfs.ext4    Attach rootfs image read-only as virtio-blk
     \\  --image REF             Build or reuse cached OCI rootfs, then run from it
+    \\  --capture-on-abort DIR  Snapshot to DIR when the capture signal is received
+    \\  --capture-signal NAME   Signal for capture-on-abort (default: INT)
     \\  --memory-mib N          Guest memory in MiB (default: 1024)
     \\  --vcpus N               Guest vCPU count; must be 1 today
     \\  --guest-port N          Guest vsock listen port (default: 10700)
@@ -152,7 +162,17 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     try openConsoleLog(opts.console_log_path);
     defer closeConsoleLog();
 
-    const result = try execute(init, arena, opts);
+    const result = execute(init, arena, opts) catch |err| {
+        if (isCaptureAborted(err)) std.process.exit(130);
+        return err;
+    };
+    if (result.captured) {
+        if (result.capture_path) |path| {
+            const message = try std.fmt.allocPrint(arena, "spore run: captured snapshot at {s}\n", .{path});
+            try writeSetupStderr(init, message);
+        }
+        return;
+    }
     const code = result.processExitCode();
     if (code != 0) std.process.exit(code);
 }
@@ -162,6 +182,9 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     var shared = SharedOptions{};
     var rootfs_path: ?[]const u8 = null;
     var image_ref: ?[]const u8 = null;
+    var capture_on_abort_path: ?[]const u8 = null;
+    var capture_signal: capture.Signal = .INT;
+    var capture_signal_set = false;
     var command: ?[]const []const u8 = null;
 
     var i: usize = 0;
@@ -179,6 +202,15 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
             rootfs_path = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--image")) {
             image_ref = takeValue(args, &i, args[i]);
+        } else if (std.mem.eql(u8, args[i], "--capture-on-abort")) {
+            capture_on_abort_path = takeValue(args, &i, args[i]);
+        } else if (std.mem.eql(u8, args[i], "--capture-signal")) {
+            const signal_raw = takeValue(args, &i, args[i]);
+            capture_signal = capture.parseSignal(signal_raw) orelse {
+                std.debug.print("--capture-signal must be INT, TERM, HUP, USR1, or USR2\n", .{});
+                std.process.exit(2);
+            };
+            capture_signal_set = true;
         } else if (try parseSharedOption(&shared, args, &i)) {
             continue;
         } else if (std.mem.startsWith(u8, args[i], "--")) {
@@ -199,12 +231,18 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         std.debug.print("spore run: --rootfs and --image are mutually exclusive\n", .{});
         std.process.exit(2);
     }
+    if (capture_signal_set and capture_on_abort_path == null) {
+        std.debug.print("spore run: --capture-signal requires --capture-on-abort\n", .{});
+        std.process.exit(2);
+    }
 
     return .{
         .backend = backend,
         .shared = shared,
         .rootfs_path = rootfs_path,
         .image_ref = image_ref,
+        .capture_on_abort_path = capture_on_abort_path,
+        .capture_signal = capture_signal,
         .command = argv,
     };
 }
@@ -221,7 +259,10 @@ fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parse
     }
     const kernel_path = parsed.shared.kernel_path orelse try resolveDefaultKernelPath(init, allocator);
     const initrd_path = parsed.shared.initrd_path orelse try resolveDefaultInitrdPath(init, allocator);
-    return parsed.shared.completeWithAssets(parsed.backend, kernel_path, initrd_path, rootfs_path, parsed.command, true);
+    var opts = parsed.shared.completeWithAssets(parsed.backend, kernel_path, initrd_path, rootfs_path, parsed.command, true);
+    opts.capture_on_abort_path = parsed.capture_on_abort_path;
+    opts.capture_signal = parsed.capture_signal;
+    return opts;
 }
 
 fn resolveImageRootfs(init: std.process.Init, allocator: std.mem.Allocator, image_ref: []const u8) ![]const u8 {
@@ -547,6 +588,13 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     const request = try execRequest(allocator, opts.command);
     var stream = try vsock.HostStream.init(opts.guest_port, request);
     if (opts.stream_output) stream.setOutputSink(null, runOutputSink);
+    var capture_request = capture.Request{};
+    var signal_registration: ?capture.SignalRegistration = null;
+    defer if (signal_registration) |*registration| registration.deinit();
+    const capture_request_ptr: ?*capture.Request = if (opts.capture_on_abort_path != null) &capture_request else null;
+    if (capture_request_ptr) |request_capture| {
+        signal_registration = capture.SignalRegistration.install(opts.capture_signal, request_capture);
+    }
 
     const cause = switch (backend) {
         .auto => unreachable,
@@ -561,6 +609,8 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .disk_fd = rootfs_fd,
                 .exec_probe = &stream,
                 .exec_probe_timeout_ms = opts.timeout_ms,
+                .snapshot_dir = opts.capture_on_abort_path,
+                .capture_request = capture_request_ptr,
             });
         },
         .kvm => blk: {
@@ -574,12 +624,16 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .disk_fd = rootfs_fd,
                 .exec_probe = &stream,
                 .exec_probe_timeout_ms = opts.timeout_ms,
+                .snapshot_dir = opts.capture_on_abort_path,
+                .capture_request = capture_request_ptr,
             });
         },
     };
-    if (cause != .probe_complete) return error.ProbeDidNotComplete;
-
-    return resultFromStream(backend, opts, &stream);
+    return switch (cause) {
+        .probe_complete => resultFromStream(backend, opts, &stream),
+        .snapshotted => resultFromCapture(backend, opts, &stream),
+        else => error.ProbeDidNotComplete,
+    };
 }
 
 fn openRootfsDisk(allocator: std.mem.Allocator, rootfs_path: ?[]const u8) !?std.c.fd_t {
@@ -689,6 +743,28 @@ fn resultFromStream(backend: Backend, opts: Options, stream: *const vsock.HostSt
         .vcpus = opts.vcpus,
         .memory_mib = opts.memory_mib,
     };
+}
+
+fn resultFromCapture(backend: Backend, opts: Options, stream: *const vsock.HostStream) Result {
+    const start_ms = stream.start_ms orelse 0;
+    const connect_ms = stream.connect_ms orelse stream.elapsedMs();
+    const response_ms = stream.response_ms orelse stream.elapsedMs();
+    return .{
+        .backend = backend,
+        .start_ms = start_ms,
+        .vsock_connect_ms = connect_ms,
+        .exec_response_ms = response_ms,
+        .probe_duration_ms = if (response_ms >= connect_ms) response_ms - connect_ms else 0,
+        .exit_code = 0,
+        .vcpus = opts.vcpus,
+        .memory_mib = opts.memory_mib,
+        .captured = true,
+        .capture_path = opts.capture_on_abort_path,
+    };
+}
+
+fn isCaptureAborted(err: anyerror) bool {
+    return std.mem.eql(u8, @errorName(err), "CaptureAborted");
 }
 
 fn parsePositive(comptime T: type, name: []const u8, raw: []const u8) !T {
@@ -831,6 +907,30 @@ test "run cli parser accepts image ref" {
     try std.testing.expectEqual(@as(usize, 2), opts.command.len);
     try std.testing.expectEqualStrings("/bin/echo", opts.command[0]);
     try std.testing.expectEqualStrings("hi", opts.command[1]);
+}
+
+test "run cli parser accepts capture-on-abort flags" {
+    const opts = try parseCliArgs(&.{ "--capture-on-abort", "out.spore", "--capture-signal", "USR1", "--", "/bin/sleeper" });
+    try std.testing.expectEqualStrings("out.spore", opts.capture_on_abort_path.?);
+    try std.testing.expectEqual(capture.Signal.USR1, opts.capture_signal);
+    try std.testing.expectEqual(@as(usize, 1), opts.command.len);
+    try std.testing.expectEqualStrings("/bin/sleeper", opts.command[0]);
+}
+
+test "captured run result exits zero" {
+    const result = Result{
+        .backend = .hvf,
+        .start_ms = 1,
+        .vsock_connect_ms = 2,
+        .exec_response_ms = 3,
+        .probe_duration_ms = 1,
+        .exit_code = 0,
+        .vcpus = 1,
+        .memory_mib = 1024,
+        .captured = true,
+        .capture_path = "out.spore",
+    };
+    try std.testing.expectEqual(@as(u8, 0), result.processExitCode());
 }
 
 test "run image cache key is deterministic and scoped to resolved image identity" {
