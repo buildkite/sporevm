@@ -199,6 +199,8 @@ backend debugging and hardware proof work:
 - `zig build hvf-gic-probe`: probe Hypervisor.framework GIC state support.
 - `scripts/smoke-restore-leg.sh`: split capture/resume legs for backend
   debugging.
+- `scripts/smoke-counter-fanout.sh`: exercise diskless capture, fork, and
+  parallel resume fan-out.
 - `scripts/smoke-fork-fanout.sh`: exercise fork generation fixups.
 - `scripts/smoke-remote-bundle.sh`: run SSM/S3 cross-host bundle validation.
 
