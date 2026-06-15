@@ -58,8 +58,15 @@ Tooling is pinned with [mise](https://mise.jdx.dev):
 
 ```bash
 mise install
-mise run build    # zig build
-mise run test     # zig build test
+mise run check       # unit tests, product build, diff hygiene
+mise run smoke       # product run + resume smokes
+mise run smoke:run   # product run streaming and exit-status smoke
+mise run smoke:resume  # product resume smoke
+```
+
+Lower-level backend harnesses remain available for targeted debugging:
+
+```bash
 mise exec -- zig build hvf-boot   # build/sign the HVF kernel boot harness
 mise exec -- zig build hvf-gic-probe # probe HVF GICv3 portable-state support
 mise exec -- zig build kvm-boot   # build the KVM kernel boot harness on Linux/aarch64
