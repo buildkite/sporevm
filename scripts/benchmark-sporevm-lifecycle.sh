@@ -9,7 +9,10 @@ Usage:
   scripts/benchmark-sporevm-lifecycle.sh --image REF [options]
 
 Options:
-  --image REF              OCI image to use for spore create. Prefer a digest-pinned linux/arm64 image.
+  --image REF              OCI image to use for spore create.
+                           Mutable tags are pinned once before timing by default.
+  --pin-image-once         Resolve mutable image tags before the timed loop (default).
+  --measure-tag-resolution Do not pre-resolve image tags; include tag lookup in create time.
   -n, --iterations N       Number of lifecycle runs (default: 10).
   --output-dir DIR         Directory for JSONL output and logs (default: /tmp/sporevm-lifecycle).
   --runtime-dir DIR        Runtime directory to reuse (default: <output-dir>/runtime).
@@ -127,6 +130,13 @@ json_number_delta() {
   fi
 }
 
+json_bool() {
+  case "$1" in
+    true|false) printf '%s' "$1" ;;
+    *) die "internal error: invalid JSON boolean: $1" ;;
+  esac
+}
+
 positive_int() {
   local opt="$1"
   local value="$2"
@@ -154,6 +164,7 @@ timeout_ms=60000
 identity_command='cat /proc/sys/kernel/random/boot_id'
 workload_command='node -v'
 build=1
+pin_image_once=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -161,6 +172,14 @@ while [[ $# -gt 0 ]]; do
       need_value "$1" "${2-}"
       image="$2"
       shift 2
+      ;;
+    --pin-image-once)
+      pin_image_once=1
+      shift
+      ;;
+    --measure-tag-resolution)
+      pin_image_once=0
+      shift
       ;;
     -n|--iterations)
       need_value "$1" "${2-}"
@@ -280,6 +299,31 @@ if [[ -n "${rootfs_cache_dir}" ]]; then
   spore_env+=(SPOREVM_ROOTFS_CACHE_DIR="${rootfs_cache_dir}")
 fi
 
+requested_image="${image}"
+effective_image="${requested_image}"
+image_resolution_ms="0"
+image_resolution_timed="false"
+if [[ "${pin_image_once}" == "1" && "${requested_image}" != *@sha256:* ]]; then
+  image_resolve_stdout="${log_dir}/image-resolve.out"
+  image_resolve_stderr="${log_dir}/image-resolve.err"
+  image_resolve_start_ms="$(now_ms)"
+  if run_capture "${image_resolve_stdout}" "${image_resolve_stderr}" \
+    env "${spore_env[@]}" "${spore_bin}" rootfs resolve "${requested_image}"; then
+    image_resolution_ms="$(( $(now_ms) - image_resolve_start_ms ))"
+  else
+    status=$?
+    echo "image tag resolution failed for ${requested_image}; stderr follows:" >&2
+    trim_file "${image_resolve_stderr}" >&2 || true
+    exit "${status}"
+  fi
+  effective_image="$(trim_file "${image_resolve_stdout}")"
+  [[ "${effective_image}" == *@sha256:* ]] || die "image resolver did not return a digest-pinned ref: ${effective_image}"
+  echo "lifecycle benchmark image: requested=${requested_image} pinned=${effective_image} resolution_ms=${image_resolution_ms}" >&2
+elif [[ "${pin_image_once}" == "0" ]]; then
+  image_resolution_ms="null"
+  image_resolution_timed="true"
+fi
+
 create_base=("${spore_bin}" create)
 if [[ -n "${backend}" ]]; then
   create_base+=(--backend "${backend}")
@@ -290,7 +334,7 @@ fi
 if [[ -n "${initrd_path}" ]]; then
   create_base+=(--initrd "${initrd_path}")
 fi
-create_base+=(--image "${image}" --memory-mib "${memory_mib}" --timeout-ms "${timeout_ms}")
+create_base+=(--image "${effective_image}" --memory-mib "${memory_mib}" --timeout-ms "${timeout_ms}")
 
 for i in $(seq 1 "${iterations}"); do
   vm_name="spore-life-${timestamp}-${i}"
@@ -381,7 +425,10 @@ for i in $(seq 1 "${iterations}"); do
     printf '{'
     printf '"iteration":%d,' "${i}"
     printf '"vm_name":%s,' "$(json_string "${vm_name}")"
-    printf '"image":%s,' "$(json_string "${image}")"
+    printf '"requested_image":%s,' "$(json_string "${requested_image}")"
+    printf '"image":%s,' "$(json_string "${effective_image}")"
+    printf '"image_resolution_ms":%s,' "${image_resolution_ms}"
+    printf '"image_resolution_timed":%s,' "$(json_bool "${image_resolution_timed}")"
     printf '"backend":%s,' "$(json_string "${backend}")"
     printf '"memory_mib":%d,' "${memory_mib}"
     printf '"timeout_ms":%d,' "${timeout_ms}"

@@ -478,19 +478,26 @@ These samples were three-iteration local checks, not official benchmark runs,
 but they identify the first optimization target: repeated OCI tag resolution on
 the `spore create --image <tag>` path.
 
+The lifecycle benchmark now treats that as benchmark setup by default. When the
+user passes a mutable tag, the script runs `spore rootfs resolve` once before
+the timed loop, records the original tag as `requested_image`, uses the
+digest-pinned ref as `image`, and stores `image_resolution_ms` with
+`image_resolution_timed=false`. Passing `--measure-tag-resolution` keeps the
+old behavior and records `image_resolution_timed=true`, making the slower
+tag-in-the-loop measurement explicit.
+
 ### Slice D.1: Speed Experiments
 
-Status: proposed.
+Status: active; benchmark-side digest pinning is implemented.
 
 Run the experiments in this order, keeping each one measurable with the
 lifecycle benchmark JSONL fields before moving to the next:
 
-1. **Digest-pinned benchmark mode.** Teach the benchmark docs and examples to
-   prefer digest-pinned image refs once the rootfs cache is warm. This tests the
-   VM lifecycle and guest command path without measuring registry tag lookup.
-   Done when a 30-iteration digest-pinned Node run reports stable
-   `create_rootfs_resolve_ms` near zero and a ComputeSDK-style score estimate
-   from `create_to_node_ms`.
+1. **Digest-pinned benchmark mode.** Complete for the local script. The
+   benchmark resolves mutable tags once before timing by default and records
+   both the requested tag and effective digest. A longer 30-iteration
+   digest-pinned Node run is still useful for the ComputeSDK-style score
+   estimate from `create_to_node_ms`.
 
 2. **Tag-to-digest resolution cache.** Cache the result of resolving mutable
    tags with an explicit TTL and metadata that records the resolved digest,
