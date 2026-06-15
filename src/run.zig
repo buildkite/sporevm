@@ -510,6 +510,7 @@ fn cacheRootfsByDigestPath(
 
     if (try pathExistsNoSymlink(io, digest_path)) {
         if (!try regularFileNoSymlink(io, digest_path)) return error.RootFSDigestMismatch;
+        try chmodRootfsReadOnly(allocator, digest_path);
     } else {
         try copyRootfsIntoDigestCache(io, allocator, rootfs_path, digest_path);
     }
@@ -587,10 +588,18 @@ fn digestRootfsPath(allocator: std.mem.Allocator, cache_root: []const u8, digest
     return std.fs.path.join(allocator, &.{ cache_root, "by-digest", "blake3", try std.fmt.allocPrint(allocator, "{s}.ext4", .{hex}) });
 }
 
+fn chmodRootfsReadOnly(allocator: std.mem.Allocator, path: []const u8) !void {
+    const pathz = try allocator.dupeZ(u8, path);
+    if (std.c.chmod(pathz, 0o444) != 0) return error.RootFSOpenFailed;
+}
+
 fn copyRootfsIntoDigestCache(io: Io, allocator: std.mem.Allocator, source_path: []const u8, digest_path: []const u8) !void {
     const source_z = try allocator.dupeZ(u8, source_path);
     const dest_z = try allocator.dupeZ(u8, digest_path);
-    if (std.c.link(source_z, dest_z) == 0) return;
+    if (std.c.link(source_z, dest_z) == 0) {
+        if (std.c.chmod(dest_z, 0o444) != 0) return error.RootFSOpenFailed;
+        return;
+    }
 
     var temp_nonce_bytes: [8]u8 = undefined;
     io.random(&temp_nonce_bytes);
@@ -1309,6 +1318,13 @@ test "rootfs digest cache verifies exact bytes" {
     _ = std.c.close(fd);
 
     const digest_path = try digestRootfsPath(arena, cache_root, artifact.digest);
+    const digest_z = try arena.dupeZ(u8, digest_path);
+    const write_fd = std.c.open(digest_z, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, @as(c_uint, 0));
+    if (write_fd >= 0) {
+        _ = std.c.close(write_fd);
+        return error.TestExpectedError;
+    }
+
     try Io.Dir.cwd().deleteFile(io, digest_path);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = digest_path, .data = "tampered" });
     try std.testing.expectError(error.RootFSDigestMismatch, openVerifiedRootfsFromCache(io, arena, cache_root, rootfs));
