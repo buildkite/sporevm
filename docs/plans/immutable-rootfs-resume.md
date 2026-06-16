@@ -5,6 +5,7 @@ spec_refs:
   - docs/plans/foundation.md
   - docs/plans/run-bridge.md
   - docs/rootfs.md
+  - src/fanout.zig
   - src/run.zig
   - src/rootfs.zig
   - src/resume.zig
@@ -34,8 +35,7 @@ SporeVM into a container runtime:
 ```console
 spore run --image ruby-demo@sha256:... --capture-on-abort ruby-counter.spore -- ruby /demo/counter.rb
 spore fork ruby-counter.spore --count 10 --out ruby-counter.children/
-for child in ruby-counter.children/*; do spore resume "$child" & done
-wait
+spore fanout ruby-counter.children/ --parallel --for 20s
 ```
 
 ## Problem

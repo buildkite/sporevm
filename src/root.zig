@@ -19,6 +19,7 @@ pub const fdpass = if (builtin.os.tag == .linux)
     @import("fdpass.zig")
 else
     struct {};
+pub const fanout = @import("fanout.zig");
 pub const guestmem = @import("guestmem.zig");
 pub const lifecycle = @import("lifecycle.zig");
 pub const local_paths = @import("local_paths.zig");
@@ -52,6 +53,7 @@ test {
     testing.refAllDecls(bundle);
     testing.refAllDecls(capture);
     testing.refAllDecls(fdpass);
+    testing.refAllDecls(fanout);
     testing.refAllDecls(generation);
     testing.refAllDecls(gicv3);
     testing.refAllDecls(lifecycle);

@@ -38,7 +38,6 @@ esac
 workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-counter-fanout.XXXXXX")"
 run_pid=""
 watchdog_pid=""
-resume_pids=()
 cleanup() {
   if [[ -n "${run_pid}" ]]; then
     kill -TERM "${run_pid}" >/dev/null 2>&1 || true
@@ -48,14 +47,6 @@ cleanup() {
     kill "${watchdog_pid}" >/dev/null 2>&1 || true
     wait "${watchdog_pid}" >/dev/null 2>&1 || true
   fi
-  for pid in "${resume_pids[@]}"; do
-    kill -TERM "${pid}" >/dev/null 2>&1 || true
-  done
-  sleep 0.2
-  for pid in "${resume_pids[@]}"; do
-    kill -KILL "${pid}" >/dev/null 2>&1 || true
-    wait "${pid}" >/dev/null 2>&1 || true
-  done
   rm -rf "${workdir}"
 }
 trap cleanup EXIT
@@ -64,6 +55,8 @@ capture_dir="${workdir}/counter.spore"
 fork_dir="${workdir}/children"
 run_stdout="${workdir}/run.stdout"
 run_stderr="${workdir}/run.stderr"
+fanout_stdout="${workdir}/fanout.stdout"
+fanout_stderr="${workdir}/fanout.stderr"
 
 "${spore_bin}" run \
   --backend "${backend}" \
@@ -119,38 +112,24 @@ while IFS= read -r child; do
 done < <(find "${fork_dir}" -mindepth 1 -maxdepth 1 -type d | sort)
 [[ "${#children[@]}" == "${count}" ]] || die "expected ${count} child spores, found ${#children[@]}"
 
-resume_logs=()
-seen=()
-for i in "${!children[@]}"; do
-  log="${workdir}/resume-${i}.log"
-  resume_logs+=("${log}")
-  seen+=("0")
-  "${spore_bin}" resume --backend "${backend}" "${children[$i]}" >"${log}" 2>&1 &
-  resume_pids+=("$!")
-done
+set +e
+"${spore_bin}" fanout --backend "${backend}" "${fork_dir}" --parallel --for "${SPORE_SMOKE_FANOUT_DURATION:-20s}" \
+  >"${fanout_stdout}" 2>"${fanout_stderr}"
+fanout_rc="$?"
+set -e
 
-for _ in $(seq 1 "${SPORE_SMOKE_RESUME_POLLS:-120}"); do
-  all_seen=1
-  for i in "${!resume_logs[@]}"; do
-    if [[ "${seen[$i]}" == "1" ]]; then
-      continue
-    fi
-    if grep -Eaq 'spore counter [0-9]+' "${resume_logs[$i]}"; then
-      seen[$i]=1
-    else
-      all_seen=0
-    fi
-  done
-  if [[ "${all_seen}" == "1" ]]; then
-    break
-  fi
-  sleep "${SPORE_SMOKE_RESUME_POLL_INTERVAL:-0.1}"
-done
+if [[ "${fanout_rc}" != "0" ]]; then
+  cat "${fanout_stdout}" >&2 || true
+  cat "${fanout_stderr}" >&2 || true
+  die "spore fanout exited ${fanout_rc}, expected 0"
+fi
 
-for i in "${!resume_logs[@]}"; do
-  if [[ "${seen[$i]}" != "1" ]]; then
-    tail -80 "${resume_logs[$i]}" >&2 || true
-    die "child ${i} did not stream a resumed counter line"
+for child in "${children[@]}"; do
+  child_name="$(basename "${child}")"
+  if ! grep -Eaq "^\[${child_name}\] .*spore counter [0-9]+" "${fanout_stdout}"; then
+    tail -120 "${fanout_stdout}" >&2 || true
+    cat "${fanout_stderr}" >&2 || true
+    die "child ${child_name} did not stream a prefixed resumed counter line"
   fi
 done
 

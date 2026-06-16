@@ -5,6 +5,7 @@ spec_refs:
   - docs/plans/foundation.md
   - docs/rootfs.md
   - README.md
+  - src/fanout.zig
   - src/local_paths.zig
   - src/run.zig
   - src/rootfs.zig
@@ -30,7 +31,9 @@ assets, read-only rootfs execution, direct OCI image cache convenience, product
 resume, streaming run output, host-signalled capture, and immutable-rootfs
 resume. The completed bridge proof is diskless fan-out through product
 commands: run a long-lived process, capture it on a host signal, fork it, and
-resume child spores with visible post-resume output.
+resume child spores with visible post-resume output. Local fan-out now has
+`spore fanout DIR --for DURATION` as screen-share orchestration sugar over
+repeated `spore resume`; `spore resume` itself remains one-spore-only.
 
 The first OCI-capable milestone is intentionally two-step:
 
@@ -437,6 +440,9 @@ Scope:
 - Keep fan-out as `spore fork --count N --out DIR` plus repeated
   `spore resume DIR/<child>` calls; `spore resume` must not grow a `--count`
   flag in this slice.
+- A later local `spore fanout DIR --for DURATION` helper may orchestrate those
+  repeated resume calls for demos and smokes, but it must not change the
+  one-spore `resume` contract.
 
 #### Slice F1: Product `spore resume`
 
@@ -625,7 +631,8 @@ interleaved counters from the same captured process state.
 - Capture belongs on `spore run --capture-on-abort`; do not add a standalone
   `spore capture` command for the first product surface.
 - `spore resume SPORE` resumes exactly one spore; fan-out remains explicit via
-  `spore fork` plus repeated `spore resume` calls.
+  `spore fork` plus repeated `spore resume` calls. `spore fanout DIR --for
+  DURATION` is local orchestration sugar for that loop, not a new resume mode.
 - Product `spore resume` now promotes proven backend resume paths and defaults
   RAM size from the spore manifest instead of the harness default.
 - The product `--json` final-frame behavior has been removed before 1.0. The

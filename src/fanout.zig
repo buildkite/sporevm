@@ -1,0 +1,411 @@
+//! Local fan-out orchestration for forked spores.
+
+const std = @import("std");
+const Io = std.Io;
+
+const run_mod = @import("run.zig");
+
+pub const Backend = run_mod.Backend;
+const max_pending_line_bytes = 64 * 1024;
+
+pub const Options = struct {
+    backend: Backend = .auto,
+    children_dir: []const u8,
+    duration_ms: ?u64 = null,
+};
+
+const cli_usage =
+    \\Usage:
+    \\  spore fanout [--backend auto|hvf|kvm] [--parallel] [--for DURATION] <children-dir>
+    \\
+    \\Options:
+    \\  --backend auto|hvf|kvm  Backend to run (default: auto)
+    \\  --parallel              Resume all child spores concurrently (default)
+    \\  --for DURATION          Stop resumed children after DURATION, e.g. 10s, 500ms, 1m
+    \\  -h, --help              Show this help
+    \\
+;
+
+const ChildSpec = struct {
+    name: []const u8,
+    path: []const u8,
+};
+
+const RunningChild = struct {
+    name: []const u8,
+    child: std.process.Child,
+    stdout_thread: std.Thread,
+    stderr_thread: std.Thread,
+};
+
+const OutputLock = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+
+    fn lock(self: *OutputLock) void {
+        while (!self.mutex.tryLock()) {
+            std.Thread.yield() catch {};
+        }
+    }
+
+    fn unlock(self: *OutputLock) void {
+        self.mutex.unlock();
+    }
+};
+
+pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
+    if (args.len == 0 or std.mem.eql(u8, args[0], "help") or std.mem.eql(u8, args[0], "-h") or std.mem.eql(u8, args[0], "--help")) {
+        try stdout.writeAll(cli_usage);
+        return;
+    }
+
+    const opts = try parseCliArgs(args);
+    try execute(init, init.arena.allocator(), opts);
+}
+
+pub fn parseCliArgs(args: []const []const u8) !Options {
+    var backend: Backend = .auto;
+    var children_dir: ?[]const u8 = null;
+    var duration_ms: ?u64 = null;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--backend") and i + 1 < args.len) {
+            i += 1;
+            backend = Backend.parse(args[i]) orelse {
+                failCli("--backend must be auto, hvf, or kvm", .{});
+            };
+        } else if (std.mem.eql(u8, args[i], "--parallel")) {
+            // Fan-out is parallel by definition today. Accepting the flag keeps
+            // the demo command self-describing without adding a second mode.
+        } else if (std.mem.eql(u8, args[i], "--for") and i + 1 < args.len) {
+            i += 1;
+            duration_ms = parseDurationMs(args[i]) catch {
+                failCli("--for expects a duration like 10s, 500ms, or 1m", .{});
+            };
+        } else if (std.mem.startsWith(u8, args[i], "--")) {
+            failCli("unknown fanout argument: {s}\n\n{s}", .{ args[i], cli_usage });
+        } else if (children_dir == null) {
+            children_dir = args[i];
+        } else {
+            failCli("unexpected fanout argument: {s}\n\n{s}", .{ args[i], cli_usage });
+        }
+    }
+
+    return .{
+        .backend = backend,
+        .children_dir = children_dir orelse {
+            failCli("{s}", .{cli_usage});
+        },
+        .duration_ms = duration_ms,
+    };
+}
+
+pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Options) !void {
+    const children = try listChildren(allocator, init.io, opts.children_dir);
+    if (children.len == 0) {
+        failCli("spore fanout: no child spore directories found in {s}", .{opts.children_dir});
+    }
+
+    const argv0 = blk: {
+        const full_args = try init.minimal.args.toSlice(allocator);
+        break :blk full_args[0];
+    };
+
+    var output_lock = OutputLock{};
+    var running = std.array_list.Managed(RunningChild).init(allocator);
+    errdefer cleanupRunning(init.io, running.items);
+
+    for (children) |child| {
+        const run = try startRunningChild(init, allocator, argv0, opts.backend, child, &output_lock);
+        running.append(run) catch |err| {
+            var single = [_]RunningChild{run};
+            cleanupRunning(init.io, single[0..]);
+            return err;
+        };
+    }
+
+    var done = std.atomic.Value(bool).init(false);
+    const terminator_thread: ?std.Thread = if (opts.duration_ms) |ms|
+        try std.Thread.spawn(.{}, terminateAfter, .{ running.items, ms, &done })
+    else
+        null;
+
+    for (running.items) |run| {
+        run.stdout_thread.join();
+        run.stderr_thread.join();
+    }
+    done.store(true, .release);
+    if (terminator_thread) |thread| thread.join();
+
+    var failed = false;
+    for (running.items) |*run| {
+        const term = run.child.wait(init.io) catch |err| {
+            writeStderr("spore fanout: child {s} wait failed: {s}\n", .{ run.name, @errorName(err) });
+            failed = true;
+            continue;
+        };
+        if (!termOk(term, opts.duration_ms != null)) {
+            writeStderr("spore fanout: child {s} exited {s}\n", .{ run.name, termName(term) });
+            failed = true;
+        }
+    }
+
+    if (failed) std.process.exit(1);
+}
+
+fn spawnResume(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    argv0: []const u8,
+    backend: Backend,
+    spore_dir: []const u8,
+) !std.process.Child {
+    const backend_arg = @tagName(backend);
+    const argv = try allocator.dupe([]const u8, &.{ argv0, "resume", "--backend", backend_arg, spore_dir });
+    return std.process.spawn(init.io, .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+}
+
+fn startRunningChild(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    argv0: []const u8,
+    backend: Backend,
+    child: ChildSpec,
+    output_lock: *OutputLock,
+) !RunningChild {
+    var proc = try spawnResume(init, allocator, argv0, backend, child.path);
+    const stdout_fd = proc.stdout.?.handle;
+    const stderr_fd = proc.stderr.?.handle;
+    proc.stdout = null;
+    proc.stderr = null;
+
+    const stdout_thread = std.Thread.spawn(.{}, streamThread, .{ stdout_fd, child.name, output_lock }) catch |err| {
+        proc.kill(init.io);
+        _ = std.c.close(stdout_fd);
+        _ = std.c.close(stderr_fd);
+        return err;
+    };
+
+    const stderr_thread = std.Thread.spawn(.{}, streamThread, .{ stderr_fd, child.name, output_lock }) catch |err| {
+        proc.kill(init.io);
+        stdout_thread.join();
+        _ = std.c.close(stderr_fd);
+        return err;
+    };
+
+    return .{
+        .name = child.name,
+        .child = proc,
+        .stdout_thread = stdout_thread,
+        .stderr_thread = stderr_thread,
+    };
+}
+
+fn cleanupRunning(io: Io, children: []RunningChild) void {
+    terminateChildren(children, .TERM);
+    sleepMs(500);
+    terminateChildren(children, .KILL);
+    for (children) |run| {
+        run.stdout_thread.join();
+        run.stderr_thread.join();
+    }
+    for (children) |*run| {
+        if (run.child.id != null) run.child.kill(io);
+    }
+}
+
+fn listChildren(allocator: std.mem.Allocator, io: Io, children_dir: []const u8) ![]ChildSpec {
+    var dir = Io.Dir.cwd().openDir(io, children_dir, .{ .iterate = true }) catch |err| {
+        writeStderr("spore fanout: cannot open {s}: {s}\n", .{ children_dir, @errorName(err) });
+        std.process.exit(2);
+    };
+    defer dir.close(io);
+
+    var children = std.array_list.Managed(ChildSpec).init(allocator);
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .directory) continue;
+        const manifest_path = try std.fmt.allocPrint(allocator, "{s}/manifest.json", .{entry.name});
+        dir.access(io, manifest_path, .{}) catch continue;
+        try children.append(.{
+            .name = try allocator.dupe(u8, entry.name),
+            .path = try std.fs.path.join(allocator, &.{ children_dir, entry.name }),
+        });
+    }
+
+    const out = try children.toOwnedSlice();
+    std.mem.sort(ChildSpec, out, {}, lessChildSpec);
+    return out;
+}
+
+fn lessChildSpec(_: void, a: ChildSpec, b: ChildSpec) bool {
+    return std.mem.lessThan(u8, a.name, b.name);
+}
+
+fn streamThread(fd: std.posix.fd_t, name: []const u8, output_lock: *OutputLock) void {
+    defer _ = std.c.close(fd);
+
+    var buf: [4096]u8 = undefined;
+    var pending = std.array_list.Managed(u8).init(std.heap.page_allocator);
+    defer pending.deinit();
+    while (true) {
+        const n = std.c.read(fd, &buf, buf.len);
+        if (n <= 0) break;
+        writePrefixed(output_lock, name, &pending, buf[0..@intCast(n)]) catch break;
+    }
+    if (pending.items.len > 0) {
+        writePrefixedLine(output_lock, name, pending.items, false);
+    }
+}
+
+fn writePrefixed(output_lock: *OutputLock, name: []const u8, pending: *std.array_list.Managed(u8), bytes: []const u8) !void {
+    var start: usize = 0;
+    while (start < bytes.len) {
+        var end = start;
+        while (end < bytes.len and bytes[end] != '\n') : (end += 1) {}
+
+        if (end < bytes.len and bytes[end] == '\n') {
+            if (pending.items.len == 0) {
+                writePrefixedLine(output_lock, name, bytes[start..end], true);
+            } else {
+                try pending.appendSlice(bytes[start..end]);
+                writePrefixedLine(output_lock, name, pending.items, true);
+                pending.clearRetainingCapacity();
+            }
+            start = end + 1;
+        } else {
+            try pending.appendSlice(bytes[start..end]);
+            flushLongPendingLine(output_lock, name, pending);
+            start = end;
+        }
+    }
+}
+
+fn flushLongPendingLine(output_lock: *OutputLock, name: []const u8, pending: *std.array_list.Managed(u8)) void {
+    if (pending.items.len < max_pending_line_bytes) return;
+    writePrefixedLine(output_lock, name, pending.items, true);
+    pending.clearRetainingCapacity();
+}
+
+fn writePrefixedLine(output_lock: *OutputLock, name: []const u8, line: []const u8, newline: bool) void {
+    output_lock.lock();
+    writeAllFd(1, "[");
+    writeAllFd(1, name);
+    writeAllFd(1, "] ");
+    writeAllFd(1, line);
+    if (newline) writeAllFd(1, "\n");
+    output_lock.unlock();
+}
+
+fn terminateChildren(children: []RunningChild, signal: std.posix.SIG) void {
+    for (children) |child| {
+        const pid = child.child.id orelse continue;
+        std.posix.kill(-pid, signal) catch {
+            std.posix.kill(pid, signal) catch {};
+        };
+    }
+}
+
+fn terminateAfter(children: []RunningChild, duration_ms: u64, done: *std.atomic.Value(bool)) void {
+    if (sleepUntilDone(duration_ms, done)) return;
+    terminateChildren(children, .TERM);
+    if (sleepUntilDone(2 * std.time.ms_per_s, done)) return;
+    terminateChildren(children, .KILL);
+}
+
+fn sleepUntilDone(duration_ms: u64, done: *std.atomic.Value(bool)) bool {
+    var remaining = duration_ms;
+    while (remaining > 0) {
+        if (done.load(.acquire)) return true;
+        const step = @min(remaining, 100);
+        sleepMs(step);
+        remaining -= step;
+    }
+    return done.load(.acquire);
+}
+
+fn termOk(term: std.process.Child.Term, duration_limited: bool) bool {
+    return switch (term) {
+        .exited => |code| code == 0,
+        .signal => |signal| duration_limited and (signal == .TERM or signal == .KILL),
+        .stopped, .unknown => false,
+    };
+}
+
+fn termName(term: std.process.Child.Term) []const u8 {
+    return switch (term) {
+        .exited => "non-zero",
+        .signal => "by signal",
+        .stopped => "stopped",
+        .unknown => "unknown",
+    };
+}
+
+fn parseDurationMs(raw: []const u8) !u64 {
+    if (raw.len == 0) return error.InvalidDuration;
+    if (std.mem.endsWith(u8, raw, "ms")) {
+        return parsePositiveDuration(raw[0 .. raw.len - 2], 1);
+    }
+    if (std.mem.endsWith(u8, raw, "s")) {
+        return parsePositiveDuration(raw[0 .. raw.len - 1], std.time.ms_per_s);
+    }
+    if (std.mem.endsWith(u8, raw, "m")) {
+        return parsePositiveDuration(raw[0 .. raw.len - 1], std.time.ms_per_min);
+    }
+    return parsePositiveDuration(raw, std.time.ms_per_s);
+}
+
+fn parsePositiveDuration(number: []const u8, multiplier: u64) !u64 {
+    if (number.len == 0) return error.InvalidDuration;
+    const value = try std.fmt.parseInt(u64, number, 10);
+    if (value == 0) return error.InvalidDuration;
+    return try std.math.mul(u64, value, multiplier);
+}
+
+fn sleepMs(ms: u64) void {
+    var ts = std.c.timespec{
+        .sec = @intCast(ms / std.time.ms_per_s),
+        .nsec = @intCast((ms % std.time.ms_per_s) * std.time.ns_per_ms),
+    };
+    _ = std.c.nanosleep(&ts, null);
+}
+
+fn writeStderr(comptime fmt: []const u8, args: anytype) void {
+    var buf: [512]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    writeAllFd(2, msg);
+}
+
+fn writeAllFd(fd: std.c.fd_t, bytes: []const u8) void {
+    var remaining = bytes;
+    while (remaining.len > 0) {
+        const n = std.c.write(fd, remaining.ptr, remaining.len);
+        if (n <= 0) return;
+        remaining = remaining[@intCast(n)..];
+    }
+}
+
+fn failCli(comptime fmt: []const u8, args: anytype) noreturn {
+    writeStderr(fmt ++ "\n", args);
+    std.process.exit(2);
+}
+
+test "fanout cli parser accepts requested demo shape" {
+    const opts = try parseCliArgs(&.{ "children", "--parallel", "--for", "10s", "--backend", "hvf" });
+    try std.testing.expectEqual(Backend.hvf, opts.backend);
+    try std.testing.expectEqualStrings("children", opts.children_dir);
+    try std.testing.expectEqual(@as(?u64, 10_000), opts.duration_ms);
+}
+
+test "fanout duration parser accepts common suffixes" {
+    try std.testing.expectEqual(@as(u64, 500), try parseDurationMs("500ms"));
+    try std.testing.expectEqual(@as(u64, 10_000), try parseDurationMs("10s"));
+    try std.testing.expectEqual(@as(u64, 60_000), try parseDurationMs("1m"));
+    try std.testing.expectEqual(@as(u64, 5_000), try parseDurationMs("5"));
+    try std.testing.expectError(error.InvalidDuration, parseDurationMs("0s"));
+}

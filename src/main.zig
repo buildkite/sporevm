@@ -39,6 +39,8 @@ const usage =
     \\  inspect <spore-dir> Print a spore manifest summary as JSON
     \\  fork <spore-dir> --count N --out DIR
     \\                      Mint child spores that share parent chunks
+    \\  fanout <children-dir> [--for DURATION]
+    \\                      Resume forked children concurrently with prefixed output
     \\  pack <spore-dir> --out DIR
     \\                      Pack portable spore chunks into a local bundle
     \\  unpack <bundle-dir> --out DIR
@@ -104,6 +106,8 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, command, "fork")) {
         const result = try forkCommand(arena, command_args);
         try printJson(arena, stdout, result);
+    } else if (std.mem.eql(u8, command, "fanout")) {
+        try sporevm.fanout.cli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "pack")) {
         const result = try packCommand(arena, command_args);
         try printJson(arena, stdout, result);
@@ -311,6 +315,7 @@ test "usage names every command" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "host-info") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "inspect") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "fork") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "fanout") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "pack") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "unpack") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "help") != null);

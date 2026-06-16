@@ -182,6 +182,12 @@ zig-out/bin/spore fork /tmp/run.spore --count 100 --out /tmp/forks
 Children are named `000000`, `000001`, and so on, and share the parent's chunk
 store.
 
+Resume forked children concurrently with prefixed output:
+
+```bash
+zig-out/bin/spore fanout /tmp/forks --parallel --for 20s
+```
+
 Resume one captured or forked spore:
 
 ```bash
