@@ -81,7 +81,7 @@ uses the platform cache directory. Cache setup messages are shown only with
 `spore --debug ...`, so command stdout and stderr stay workload-focused by
 default.
 
-When `spore run --image ... --capture-on-abort SPORE` captures a VM, the spore
+When `spore run --image ... --capture SPORE` captures a VM, the spore
 manifest records an immutable rootfs artifact: the ext4 content BLAKE3 digest,
 size, virtio-blk binding, resolved OCI image identity, platform, and builder
 version. The rootfs is also stored under a digest-addressed cache path. Product
@@ -90,7 +90,7 @@ digest and size, then attaches it as virtio-blk. If the digest cache entry is
 missing or tampered with, resume refuses to boot.
 
 Plain `spore run --rootfs PATH` remains a local run escape hatch. Combining
-`--rootfs PATH` with `--capture-on-abort` is rejected until an import/preload
+`--rootfs PATH` with `--capture` is rejected until an import/preload
 command can record portable rootfs identity for arbitrary local images.
 
 Validate OCI rootfs capture, fork, and parallel product resume with the opt-in

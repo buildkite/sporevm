@@ -189,8 +189,8 @@ stream_pids+=("$!")
 "${spore_bin}" run \
   --backend "${backend}" \
   --image "${resolved_image_ref}" \
-  --capture-on-abort "${capture_dir}" \
-  --capture-signal USR1 \
+  --capture "${capture_dir}" \
+  --capture-on USR1 \
   -- /usr/local/bin/ruby -e 'STDOUT.sync = true; puts "spore run ready"; i = 0; loop { puts "ruby counter #{i}"; i += 1; sleep 1 }' \
   >"${run_stdout}" 2>"${run_stderr}" &
 run_pid="$!"

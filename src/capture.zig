@@ -5,11 +5,23 @@ const posix = std.posix;
 
 pub const Signal = posix.SIG;
 
+pub const Trigger = union(enum) {
+    exit,
+    signal: Signal,
+
+    pub fn parse(raw: []const u8) ?Trigger {
+        if (std.ascii.eqlIgnoreCase(raw, "EXIT")) return .exit;
+        if (parseSignal(raw)) |signal| return .{ .signal = signal };
+        return null;
+    }
+};
+
 pub const Error = error{CaptureAborted};
 pub const WakeFn = *const fn (context: ?*anyopaque) callconv(.c) void;
 
 pub const Request = struct {
     signal_count: std.atomic.Value(u32) = .init(0),
+    completed: std.atomic.Value(bool) = .init(false),
     wake_fn_addr: std.atomic.Value(usize) = .init(0),
     wake_context_addr: std.atomic.Value(usize) = .init(0),
 
@@ -28,6 +40,14 @@ pub const Request = struct {
 
     pub fn isAbortRequested(self: *const Request) bool {
         return self.signal_count.load(.acquire) >= 2;
+    }
+
+    pub fn markCompleted(self: *Request) void {
+        self.completed.store(true, .release);
+    }
+
+    pub fn isCompleted(self: *const Request) bool {
+        return self.completed.load(.acquire);
     }
 
     pub fn setWake(self: *Request, wake_fn: WakeFn, context: ?*anyopaque) void {
@@ -105,10 +125,14 @@ test "capture request records first signal as capture and second as abort" {
     request_value.notifySignal();
     try std.testing.expect(request_value.isRequested());
     try std.testing.expect(!request_value.isAbortRequested());
+    try std.testing.expect(!request_value.isCompleted());
 
     request_value.notifySignal();
     try std.testing.expect(request_value.isRequested());
     try std.testing.expect(request_value.isAbortRequested());
+
+    request_value.markCompleted();
+    try std.testing.expect(request_value.isCompleted());
 }
 
 test "capture signal parser accepts common names" {
@@ -118,6 +142,18 @@ test "capture signal parser accepts common names" {
     try std.testing.expectEqual(Signal.USR1, parseSignal("USR1").?);
     try std.testing.expectEqual(Signal.USR2, parseSignal("sigusr2").?);
     try std.testing.expect(parseSignal("KILL") == null);
+}
+
+test "capture trigger parser accepts exit and signals" {
+    switch (Trigger.parse("EXIT").?) {
+        .exit => {},
+        .signal => return error.ExpectedExitTrigger,
+    }
+    switch (Trigger.parse("SIGUSR1").?) {
+        .exit => return error.ExpectedSignalTrigger,
+        .signal => |signal| try std.testing.expectEqual(Signal.USR1, signal),
+    }
+    try std.testing.expect(Trigger.parse("KILL") == null);
 }
 
 var test_wake_count: u32 = 0;

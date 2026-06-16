@@ -70,7 +70,7 @@ Target-state `spore` is one binary with CLI subcommands and a local monitor
 protocol:
 
 ```console
-spore run --image ruby-demo --capture-on-abort ruby.spore -- ruby /demo/counter.rb
+spore run --image ruby-demo --capture ruby.spore --capture-on USR1 -- ruby /demo/counter.rb
 spore fork ruby.spore --count 10000 --out forks/
 spore fanout forks/ --parallel --for 20s
 
@@ -246,7 +246,7 @@ inputs.
 - Distribution starts with SporeVM chunkpack bundles.
 - `spore run` is one-shot; named lifecycle uses `create`/`exec`/`rm`/`ls` plus
   monitor-backed suspend/resume.
-- Product capture is `spore run --capture-on-abort`, not a separate capture verb.
+- Product capture is `spore run --capture`, not a separate capture verb.
 - Same-host fan-out uses explicit RAM-backing transfer and private mappings
   before claiming high-concurrency memory efficiency.
 - KVM dirty tracking stays on `KVM_GET_DIRTY_LOG` until evidence shows bitmap

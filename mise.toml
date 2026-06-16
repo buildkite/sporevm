@@ -27,7 +27,7 @@ description = "Smoke product spore resume"
 
 [tasks."smoke:run-capture"]
 run = "mise run build && scripts/smoke-run-capture.sh"
-description = "Smoke product spore run capture-on-abort"
+description = "Smoke product spore run signal capture"
 
 [tasks."smoke:counter-fanout"]
 run = "mise run build && scripts/smoke-counter-fanout.sh"

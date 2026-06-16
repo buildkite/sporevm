@@ -68,8 +68,9 @@ pub const Options = struct {
     timeout_ms: u64 = 30_000,
     console_log_path: ?[]const u8 = null,
     stream_output: bool = true,
-    capture_on_abort_path: ?[]const u8 = null,
-    capture_signal: capture.Signal = .INT,
+    capture_path: ?[]const u8 = null,
+    capture_trigger: capture.Trigger = .exit,
+    continue_after_capture: bool = false,
 };
 
 pub const Result = struct {
@@ -85,7 +86,6 @@ pub const Result = struct {
     capture_path: ?[]const u8 = null,
 
     pub fn processExitCode(self: Result) u8 {
-        if (self.captured) return 0;
         std.debug.assert(self.exit_code >= 0 and self.exit_code <= 255);
         return @intCast(self.exit_code);
     }
@@ -143,8 +143,9 @@ pub const CliOptions = struct {
     shared: SharedOptions = .{},
     rootfs_path: ?[]const u8 = null,
     image_ref: ?[]const u8 = null,
-    capture_on_abort_path: ?[]const u8 = null,
-    capture_signal: capture.Signal = .INT,
+    capture_path: ?[]const u8 = null,
+    capture_trigger: capture.Trigger = .exit,
+    continue_after_capture: bool = false,
     command: []const []const u8,
 };
 
@@ -158,8 +159,10 @@ const cli_usage =
     \\  --initrd root.cpio      Initrd path (default: installed minimal exec initrd)
     \\  --rootfs rootfs.ext4    Attach rootfs image read-only as virtio-blk
     \\  --image REF             Build or reuse cached OCI rootfs, then run from it
-    \\  --capture-on-abort DIR  Snapshot to DIR when the capture signal is received
-    \\  --capture-signal NAME   Signal for capture-on-abort (default: INT)
+    \\  --capture DIR           Snapshot to DIR; defaults to --capture-on EXIT
+    \\  --capture-on WHEN       Capture trigger: EXIT, INT, TERM, HUP, USR1, or USR2
+    \\  --continue-after-capture
+    \\                          Keep running after a signal-triggered capture
     \\  --memory-mib N          Guest memory in MiB (default: 1024)
     \\  --vcpus N               Guest vCPU count; must be 1 today
     \\  --guest-port N          Guest vsock listen port (default: 10700)
@@ -190,7 +193,6 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
             const message = try std.fmt.allocPrint(arena, "spore run: captured snapshot at {s}\n", .{path});
             try writeSetupStderr(init, message);
         }
-        return;
     }
     const code = result.processExitCode();
     if (code != 0) std.process.exit(code);
@@ -201,9 +203,10 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     var shared = SharedOptions{};
     var rootfs_path: ?[]const u8 = null;
     var image_ref: ?[]const u8 = null;
-    var capture_on_abort_path: ?[]const u8 = null;
-    var capture_signal: capture.Signal = .INT;
-    var capture_signal_set = false;
+    var capture_path: ?[]const u8 = null;
+    var capture_trigger: capture.Trigger = .exit;
+    var capture_trigger_set = false;
+    var continue_after_capture = false;
     var command: ?[]const []const u8 = null;
 
     var i: usize = 0;
@@ -221,15 +224,17 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
             rootfs_path = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--image")) {
             image_ref = takeValue(args, &i, args[i]);
-        } else if (std.mem.eql(u8, args[i], "--capture-on-abort")) {
-            capture_on_abort_path = takeValue(args, &i, args[i]);
-        } else if (std.mem.eql(u8, args[i], "--capture-signal")) {
-            const signal_raw = takeValue(args, &i, args[i]);
-            capture_signal = capture.parseSignal(signal_raw) orelse {
-                std.debug.print("--capture-signal must be INT, TERM, HUP, USR1, or USR2\n", .{});
+        } else if (std.mem.eql(u8, args[i], "--capture")) {
+            capture_path = takeValue(args, &i, args[i]);
+        } else if (std.mem.eql(u8, args[i], "--capture-on")) {
+            const trigger_raw = takeValue(args, &i, args[i]);
+            capture_trigger = capture.Trigger.parse(trigger_raw) orelse {
+                std.debug.print("--capture-on must be EXIT, INT, TERM, HUP, USR1, or USR2\n", .{});
                 std.process.exit(2);
             };
-            capture_signal_set = true;
+            capture_trigger_set = true;
+        } else if (std.mem.eql(u8, args[i], "--continue-after-capture")) {
+            continue_after_capture = true;
         } else if (try parseSharedOption(&shared, args, &i)) {
             continue;
         } else if (std.mem.startsWith(u8, args[i], "--")) {
@@ -250,8 +255,16 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         std.debug.print("spore run: --rootfs and --image are mutually exclusive\n", .{});
         std.process.exit(2);
     }
-    if (capture_signal_set and capture_on_abort_path == null) {
-        std.debug.print("spore run: --capture-signal requires --capture-on-abort\n", .{});
+    if (capture_trigger_set and capture_path == null) {
+        std.debug.print("spore run: --capture-on requires --capture\n", .{});
+        std.process.exit(2);
+    }
+    if (continue_after_capture and capture_path == null) {
+        std.debug.print("spore run: --continue-after-capture requires --capture\n", .{});
+        std.process.exit(2);
+    }
+    if (continue_after_capture and captureTriggerIsExit(capture_trigger)) {
+        std.debug.print("spore run: --continue-after-capture requires a signal capture trigger\n", .{});
         std.process.exit(2);
     }
 
@@ -260,27 +273,29 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         .shared = shared,
         .rootfs_path = rootfs_path,
         .image_ref = image_ref,
-        .capture_on_abort_path = capture_on_abort_path,
-        .capture_signal = capture_signal,
+        .capture_path = capture_path,
+        .capture_trigger = capture_trigger,
+        .continue_after_capture = continue_after_capture,
         .command = argv,
     };
 }
 
 fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parsed: CliOptions) !Options {
-    if (parsed.capture_on_abort_path != null and parsed.rootfs_path != null and parsed.image_ref == null) {
-        failRunSetup("spore run: --rootfs with --capture-on-abort is not portable yet; use --image so capture can record immutable rootfs identity", .{});
+    if (parsed.capture_path != null and parsed.rootfs_path != null and parsed.image_ref == null) {
+        failRunSetup("spore run: --rootfs with --capture is not portable yet; use --image so capture can record immutable rootfs identity", .{});
     }
     const rootfs = try resolveRootfsInputDetailed(init, allocator, .{
         .rootfs_path = parsed.rootfs_path,
         .image_ref = parsed.image_ref,
         .command_name = "run",
-        .record_artifact = parsed.capture_on_abort_path != null,
+        .record_artifact = parsed.capture_path != null,
     });
     const kernel_path = parsed.shared.kernel_path orelse try resolveDefaultKernelPath(init, allocator);
     const initrd_path = parsed.shared.initrd_path orelse try resolveDefaultInitrdPath(init, allocator);
     var opts = parsed.shared.completeWithAssets(parsed.backend, kernel_path, initrd_path, rootfs.path, rootfs.rootfs, parsed.command, true);
-    opts.capture_on_abort_path = parsed.capture_on_abort_path;
-    opts.capture_signal = parsed.capture_signal;
+    opts.capture_path = parsed.capture_path;
+    opts.capture_trigger = parsed.capture_trigger;
+    opts.continue_after_capture = parsed.continue_after_capture;
     return opts;
 }
 
@@ -1153,16 +1168,18 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     var capture_request = capture.Request{};
     var signal_registration: ?capture.SignalRegistration = null;
     defer if (signal_registration) |*registration| registration.deinit();
-    const capture_request_ptr: ?*capture.Request = if (opts.capture_on_abort_path != null) &capture_request else null;
+    const signal_capture = opts.capture_path != null and captureTriggerSignal(opts.capture_trigger) != null;
+    const exit_capture = opts.capture_path != null and captureTriggerIsExit(opts.capture_trigger);
+    const capture_request_ptr: ?*capture.Request = if (signal_capture) &capture_request else null;
     if (capture_request_ptr) |request_capture| {
-        signal_registration = capture.SignalRegistration.install(opts.capture_signal, request_capture);
+        signal_registration = capture.SignalRegistration.install(captureTriggerSignal(opts.capture_trigger).?, request_capture);
     }
 
-    const cause = switch (backend) {
+    const cause = (switch (backend) {
         .auto => unreachable,
         .hvf => blk: {
             if (comptime !(builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)) return error.UnsupportedBackend;
-            break :blk try hvf.vm.run(allocator, .{
+            break :blk hvf.vm.run(allocator, .{
                 .kernel = kernel,
                 .ram_size = opts.memory_mib * 1024 * 1024,
                 .cmdline = boot_args,
@@ -1172,13 +1189,15 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .rootfs = opts.rootfs,
                 .exec_probe = &stream,
                 .exec_probe_timeout_ms = opts.timeout_ms,
-                .snapshot_dir = opts.capture_on_abort_path,
+                .snapshot_dir = opts.capture_path,
+                .snapshot_on_probe_complete = exit_capture,
                 .capture_request = capture_request_ptr,
+                .continue_after_capture = opts.continue_after_capture,
             });
         },
         .kvm => blk: {
             if (comptime !(builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)) return error.UnsupportedBackend;
-            break :blk try kvm.vm.run(allocator, .{
+            break :blk kvm.vm.run(allocator, .{
                 .kernel = kernel,
                 .ram_size = opts.memory_mib * 1024 * 1024,
                 .cmdline = boot_args,
@@ -1188,14 +1207,25 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .rootfs = opts.rootfs,
                 .exec_probe = &stream,
                 .exec_probe_timeout_ms = opts.timeout_ms,
-                .snapshot_dir = opts.capture_on_abort_path,
+                .snapshot_dir = opts.capture_path,
+                .snapshot_on_probe_complete = exit_capture,
                 .capture_request = capture_request_ptr,
+                .continue_after_capture = opts.continue_after_capture,
             });
         },
+    }) catch |err| {
+        if (signal_capture and capture_request.isCompleted() and isCaptureAborted(err)) {
+            return resultFromAbortedSignalCapture(backend, opts, &stream);
+        }
+        return err;
     };
+    const signal_capture_observed = signal_capture and capture_request.isCompleted();
     return switch (cause) {
-        .probe_complete => resultFromStream(backend, opts, &stream),
-        .snapshotted => resultFromCapture(backend, opts, &stream),
+        .probe_complete => resultFromStream(backend, opts, &stream, signal_capture_observed),
+        .snapshotted => if (exit_capture)
+            resultFromExitCapture(backend, opts, &stream)
+        else
+            resultFromSignalCapture(backend, opts, &stream),
         else => error.ProbeDidNotComplete,
     };
 }
@@ -1339,7 +1369,7 @@ fn resolveBackend(backend: Backend) !Backend {
     return error.UnsupportedBackend;
 }
 
-fn resultFromStream(backend: Backend, opts: Options, stream: *const vsock.HostStream) !Result {
+fn resultFromStream(backend: Backend, opts: Options, stream: *const vsock.HostStream, captured: bool) !Result {
     const start_ms = stream.start_ms orelse 0;
     const connect_ms = stream.connect_ms orelse stream.elapsedMs();
     const response_ms = stream.response_ms orelse stream.elapsedMs();
@@ -1352,10 +1382,20 @@ fn resultFromStream(backend: Backend, opts: Options, stream: *const vsock.HostSt
         .exit_code = stream.exit_code orelse return error.BadRunExitFrame,
         .vcpus = opts.vcpus,
         .memory_mib = opts.memory_mib,
+        .captured = captured,
+        .capture_path = if (captured) opts.capture_path else null,
     };
 }
 
-fn resultFromCapture(backend: Backend, opts: Options, stream: *const vsock.HostStream) Result {
+fn resultFromSignalCapture(backend: Backend, opts: Options, stream: *const vsock.HostStream) Result {
+    return resultFromSignalCaptureExitCode(backend, opts, stream, 0);
+}
+
+fn resultFromAbortedSignalCapture(backend: Backend, opts: Options, stream: *const vsock.HostStream) Result {
+    return resultFromSignalCaptureExitCode(backend, opts, stream, 130);
+}
+
+fn resultFromSignalCaptureExitCode(backend: Backend, opts: Options, stream: *const vsock.HostStream, exit_code: u8) Result {
     const start_ms = stream.start_ms orelse 0;
     const connect_ms = stream.connect_ms orelse stream.elapsedMs();
     const response_ms = stream.response_ms orelse stream.elapsedMs();
@@ -1365,11 +1405,43 @@ fn resultFromCapture(backend: Backend, opts: Options, stream: *const vsock.HostS
         .vsock_connect_ms = connect_ms,
         .exec_response_ms = response_ms,
         .probe_duration_ms = if (response_ms >= connect_ms) response_ms - connect_ms else 0,
-        .exit_code = 0,
+        .exit_code = exit_code,
         .vcpus = opts.vcpus,
         .memory_mib = opts.memory_mib,
         .captured = true,
-        .capture_path = opts.capture_on_abort_path,
+        .capture_path = opts.capture_path,
+    };
+}
+
+fn resultFromExitCapture(backend: Backend, opts: Options, stream: *const vsock.HostStream) !Result {
+    const start_ms = stream.start_ms orelse 0;
+    const connect_ms = stream.connect_ms orelse stream.elapsedMs();
+    const response_ms = stream.response_ms orelse stream.elapsedMs();
+    return .{
+        .backend = backend,
+        .start_ms = start_ms,
+        .vsock_connect_ms = connect_ms,
+        .exec_response_ms = response_ms,
+        .probe_duration_ms = if (response_ms >= connect_ms) response_ms - connect_ms else 0,
+        .exit_code = stream.exit_code orelse return error.BadRunExitFrame,
+        .vcpus = opts.vcpus,
+        .memory_mib = opts.memory_mib,
+        .captured = true,
+        .capture_path = opts.capture_path,
+    };
+}
+
+fn captureTriggerSignal(trigger: capture.Trigger) ?capture.Signal {
+    return switch (trigger) {
+        .exit => null,
+        .signal => |signal| signal,
+    };
+}
+
+fn captureTriggerIsExit(trigger: capture.Trigger) bool {
+    return switch (trigger) {
+        .exit => true,
+        .signal => false,
     };
 }
 
@@ -1515,12 +1587,20 @@ test "run cli parser accepts image ref" {
     try std.testing.expectEqualStrings("hi", opts.command[1]);
 }
 
-test "run cli parser accepts capture-on-abort flags" {
-    const opts = try parseCliArgs(&.{ "--capture-on-abort", "out.spore", "--capture-signal", "USR1", "--", "/bin/sleeper" });
-    try std.testing.expectEqualStrings("out.spore", opts.capture_on_abort_path.?);
-    try std.testing.expectEqual(capture.Signal.USR1, opts.capture_signal);
+test "run cli parser accepts capture flags" {
+    const opts = try parseCliArgs(&.{ "--capture", "out.spore", "--capture-on", "USR1", "--continue-after-capture", "--", "/bin/sleeper" });
+    try std.testing.expectEqualStrings("out.spore", opts.capture_path.?);
+    try std.testing.expectEqual(capture.Signal.USR1, captureTriggerSignal(opts.capture_trigger).?);
+    try std.testing.expect(opts.continue_after_capture);
     try std.testing.expectEqual(@as(usize, 1), opts.command.len);
     try std.testing.expectEqualStrings("/bin/sleeper", opts.command[0]);
+}
+
+test "run cli parser defaults capture trigger to exit" {
+    const opts = try parseCliArgs(&.{ "--capture", "out.spore", "--", "/bin/true" });
+    try std.testing.expectEqualStrings("out.spore", opts.capture_path.?);
+    try std.testing.expect(captureTriggerIsExit(opts.capture_trigger));
+    try std.testing.expect(!opts.continue_after_capture);
 }
 
 test "captured run result exits zero" {
@@ -1537,6 +1617,22 @@ test "captured run result exits zero" {
         .capture_path = "out.spore",
     };
     try std.testing.expectEqual(@as(u8, 0), result.processExitCode());
+}
+
+test "captured run result preserves stored exit code" {
+    const result = Result{
+        .backend = .hvf,
+        .start_ms = 1,
+        .vsock_connect_ms = 2,
+        .exec_response_ms = 3,
+        .probe_duration_ms = 1,
+        .exit_code = 7,
+        .vcpus = 1,
+        .memory_mib = 1024,
+        .captured = true,
+        .capture_path = "out.spore",
+    };
+    try std.testing.expectEqual(@as(u8, 7), result.processExitCode());
 }
 
 test "run image cache key is deterministic and scoped to resolved image identity" {

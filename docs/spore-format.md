@@ -21,7 +21,7 @@ A spore is a directory:
 └── ram.backing             # optional local same-host RAM acceleration file
 ```
 
-Spores captured from `spore run --image ... --capture-on-abort` may also require
+Spores captured from `spore run --image ... --capture` may also require
 an immutable rootfs artifact from the local rootfs digest cache. The artifact is
 not stored inside the spore directory today; the manifest records its digest,
 size, device binding, and provenance so `spore resume` can reopen and verify the

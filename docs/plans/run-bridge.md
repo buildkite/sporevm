@@ -29,9 +29,9 @@ stdout/stderr, return the guest command status, and fail closed when boot assets
 or workload inputs are unsupported.
 
 The landed bridge covers default run assets, read-only rootfs execution, cached
-OCI rootfs convenience, streaming output, host-signalled capture, product
-`spore resume`, explicit fork/fan-out, and immutable-rootfs resume for captured
-`--image` workloads.
+OCI rootfs convenience, streaming output, exit and host-signalled capture,
+product `spore resume`, explicit fork/fan-out, and immutable-rootfs resume for
+captured `--image` workloads.
 
 ## Landed Product Contract
 
@@ -71,14 +71,19 @@ spore run --image docker.io/library/alpine:3.20 -- /bin/echo hi
 an image shorthand, and SporeVM does not apply OCI Entrypoint, Cmd, User, Env, or
 Workdir semantics in this bridge.
 
-Capture a running workload on a host signal:
+Capture a running workload on exit or on a host signal:
 
 ```console
-spore run --capture-on-abort counter.spore -- /bin/counter
+spore run --capture counter.spore --capture-on INT -- /bin/counter
 # press Ctrl-C to capture
 spore fork counter.spore --count 10 --out counter.children/
 spore fanout counter.children --parallel --for 20s
 ```
+
+Plain `--capture DIR` captures after the guest command exits and preserves the
+guest command status. `--capture-on INT|TERM|HUP|USR1|USR2` captures on the
+first matching host signal and exits zero unless `--continue-after-capture` is
+set; a second matching signal exits 130.
 
 `spore resume SPORE` resumes exactly one spore. Fan-out is intentionally explicit:
 mint child spores with `spore fork`, then resume them individually or through
@@ -88,7 +93,7 @@ mint child spores with `spore fork`, then resume them individually or through
 
 - `src/run.zig` implements one-shot run argument parsing, default asset
   resolution, read-only rootfs attachment, direct image cache lookup/build,
-  streaming output, and host-signalled capture.
+  streaming output, and exit or host-signalled capture.
 - `src/resume.zig` implements product `spore resume` for one diskless or verified
   immutable-rootfs spore at a time.
 - `src/fanout.zig` implements product fan-out over an existing child-spore
@@ -111,7 +116,7 @@ mint child spores with `spore fork`, then resume them individually or through
 - Cached OCI rootfs images are never mounted writable by default.
 - Rootfs execution uses the existing virtio-blk device and does not widen the
   frozen device model.
-- `--rootfs PATH --capture-on-abort` is rejected until an import/preload command
+- `--rootfs PATH --capture` is rejected until an import/preload command
   can record portable rootfs identity for arbitrary local images.
 - Resumed captured workloads are visible through restored guest console output.
   Separated stdout/stderr after resume requires a later reconnect or persisted
