@@ -71,6 +71,7 @@ protocol:
 
 ```console
 spore run --image ruby-demo --capture ruby.spore --capture-on USR1 -- ruby /demo/counter.rb
+spore run --from ruby.spore -- ruby /demo/counter.rb
 spore fork ruby.spore --count 10000 --out forks/
 spore fanout forks/ --parallel --for 20s
 
