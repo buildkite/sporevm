@@ -19,6 +19,7 @@ const vsock = @import("virtio/vsock.zig");
 
 const max_file_size = 256 * 1024 * 1024;
 const max_kernel_asset_size = 256 * 1024 * 1024;
+const managed_kernel_download_attempts = 3;
 const max_guest_argc = 16;
 const max_guest_arg_len = 255;
 const max_guest_request_len = 2047;
@@ -870,7 +871,16 @@ fn fetchManagedKernelAsset(
     try validateManagedKernelVersion(release);
     try validateManagedKernelAsset(asset);
     const url = try std.fmt.allocPrint(allocator, "https://github.com/{s}/releases/download/{s}/{s}", .{ repository, release, asset });
-    try httpGetToFile(io, client, url, output_path, max_kernel_asset_size);
+    var attempt: u8 = 0;
+    while (attempt < managed_kernel_download_attempts) : (attempt += 1) {
+        Io.Dir.cwd().deleteFile(io, output_path) catch {};
+        httpGetToFile(io, client, url, output_path, max_kernel_asset_size) catch |err| {
+            if (attempt + 1 == managed_kernel_download_attempts) return err;
+            continue;
+        };
+        return;
+    }
+    unreachable;
 }
 
 fn validateManagedKernelAsset(asset: []const u8) !void {

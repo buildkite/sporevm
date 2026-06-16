@@ -36,17 +36,23 @@ pub fn cacheRootPath(
     environ: *const std.process.Environ.Map,
     kind: CacheKind,
 ) ![]const u8 {
-    if (environ.get(kind.overrideEnvName())) |path| {
+    if (nonEmptyEnv(environ, kind.overrideEnvName())) |path| {
         return std.fs.path.resolve(allocator, &.{path});
     }
-    if (environ.get(xdg_cache_home_env)) |path| {
+    if (nonEmptyEnv(environ, xdg_cache_home_env)) |path| {
         return std.fs.path.resolve(allocator, &.{ path, app_dir, kind.leafName() });
     }
-    const home = environ.get("HOME") orelse return error.MissingHome;
+    const home = nonEmptyEnv(environ, "HOME") orelse return error.MissingHome;
     if (comptime builtin.os.tag == .macos) {
         return std.fs.path.resolve(allocator, &.{ home, "Library", "Caches", app_dir, kind.leafName() });
     }
     return std.fs.path.resolve(allocator, &.{ home, ".cache", app_dir, kind.leafName() });
+}
+
+fn nonEmptyEnv(environ: *const std.process.Environ.Map, name: []const u8) ?[]const u8 {
+    const value = environ.get(name) orelse return null;
+    if (value.len == 0) return null;
+    return value;
 }
 
 pub fn kernelCacheRootPath(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {
@@ -103,6 +109,31 @@ test "cache roots prefer explicit and xdg paths" {
     const rootfs = try rootfsCacheRootPath(allocator, &env);
     defer allocator.free(rootfs);
     try std.testing.expectEqualStrings("/tmp/xdg-cache/sporevm/rootfs", rootfs);
+}
+
+test "cache roots ignore empty optional environment values" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+
+    try env.put(kernel_cache_env, "");
+    try env.put(xdg_cache_home_env, "/tmp/xdg-cache");
+    const kernels = try kernelCacheRootPath(allocator, &env);
+    defer allocator.free(kernels);
+    try std.testing.expectEqualStrings("/tmp/xdg-cache/sporevm/kernels", kernels);
+
+    _ = env.swapRemove(xdg_cache_home_env);
+    try env.put("HOME", "/home/spore");
+    const home_fallback = try kernelCacheRootPath(allocator, &env);
+    defer allocator.free(home_fallback);
+    const expected = if (comptime builtin.os.tag == .macos)
+        "/home/spore/Library/Caches/sporevm/kernels"
+    else
+        "/home/spore/.cache/sporevm/kernels";
+    try std.testing.expectEqualStrings(expected, home_fallback);
+
+    try env.put("HOME", "");
+    try std.testing.expectError(error.MissingHome, kernelCacheRootPath(allocator, &env));
 }
 
 test "cache roots use platform home fallback" {
