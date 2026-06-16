@@ -19,7 +19,7 @@ related_plans:
 ## Summary
 
 Local immutable rootfs resume has landed. A spore captured from
-`spore run --image ... --capture-on-abort` records the exact read-only ext4
+`spore run --image ... --capture` records the exact read-only ext4
 rootfs artifact it needs: BLAKE3 digest, size, virtio-blk binding, and OCI
 provenance. `spore resume` resolves that artifact from the local digest cache,
 verifies the same read-only fd it will attach, and fails before VM creation when
@@ -33,7 +33,8 @@ preserving the invariant that the ext4 digest is restore authority.
 
 ```console
 spore run --image docker.io/library/ruby:3.3-alpine \
-  --capture-on-abort ruby-counter.spore \
+  --capture ruby-counter.spore \
+  --capture-on USR1 \
   -- ruby -e 'STDOUT.sync = true; i = 0; loop { puts "ruby counter #{i}"; i += 1; sleep 1 }'
 
 spore fork ruby-counter.spore --count 10 --out ruby-counter.children/
@@ -167,7 +168,7 @@ child.
 - v0 `spore resume` does not implicitly rebuild missing rootfs artifacts.
 - `--image` is the first portable capture path because it already has resolved
   OCI metadata.
-- `spore run --rootfs PATH --capture-on-abort` is rejected until import/preload
+- `spore run --rootfs PATH --capture` is rejected until import/preload
   records content identity and provenance. Plain `spore run --rootfs PATH` keeps
   working.
 - Fork copies rootfs references, not rootfs bytes.

@@ -57,9 +57,13 @@ pub const Config = struct {
     /// stop. Requires snapshot_dir.
     snapshot_after_ms: ?u64 = null,
     snapshot_dir: ?[]const u8 = null,
+    /// Snapshot and stop when the exec probe has observed command completion.
+    snapshot_on_probe_complete: bool = false,
     /// Optional host request that asks the run loop to snapshot at the next
     /// settled boundary. A second request aborts the run.
     capture_request: ?*capture.Request = null,
+    /// Continue running after a host-requested capture instead of stopping.
+    continue_after_capture: bool = false,
     /// Opt-in HVF write-protect dirty tracking for Slice 7 measurement. When
     /// enabled, guest write faults identify dirty chunks and snapshots only
     /// need a final dirty-tail flush instead of a full RAM scan.
@@ -361,6 +365,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     var exec_probe_done = false;
 
     // Run loop.
+    var did_capture_request = false;
     while (true) {
         if (config.exec_control) |control| {
             switch (try control.poll(&vsock_dev)) {
@@ -380,6 +385,24 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                 try hvf.check(hvf.hv_gic_set_spi(board.virtioDeviceIntid(@intCast(vsock_transport_index)), true), "raise vsock spi");
             }
         }
+        if (config.capture_request) |request_capture| {
+            if (request_capture.isAbortRequested()) return error.CaptureAborted;
+            if (request_capture.isRequested() and !did_capture_request) {
+                const dir = config.snapshot_dir orelse return error.HvCallFailed;
+                try takeSnapshot(allocator, dir, vcpu, transports, &gen_dev, ram_bytes, .{
+                    .dist_base = dist_base,
+                    .redist_base = vcpu_redist_base,
+                    .ram_size = config.ram_size,
+                }, config.rootfs, if (dirty_tracker) |*tracker| tracker else null);
+                request_capture.markCompleted();
+                if (request_capture.isAbortRequested()) return error.CaptureAborted;
+                if (config.continue_after_capture) {
+                    did_capture_request = true;
+                    continue;
+                }
+                return .snapshotted;
+            }
+        }
         if (config.exec_probe) |probe| {
             if (!exec_probe_done) {
                 if (probe.state == .failed) {
@@ -388,7 +411,18 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     exec_probe_done = true;
                 }
                 if (probe.state == .complete) {
-                    if (config.exec_probe_completes_run) return .probe_complete;
+                    if (config.exec_probe_completes_run) {
+                        if (config.snapshot_on_probe_complete) {
+                            const dir = config.snapshot_dir orelse return error.HvCallFailed;
+                            try takeSnapshot(allocator, dir, vcpu, transports, &gen_dev, ram_bytes, .{
+                                .dist_base = dist_base,
+                                .redist_base = vcpu_redist_base,
+                                .ram_size = config.ram_size,
+                            }, config.rootfs, if (dirty_tracker) |*tracker| tracker else null);
+                            return .snapshotted;
+                        }
+                        return .probe_complete;
+                    }
                     vsock_dev.host_stream = null;
                     exec_probe_done = true;
                 }
@@ -397,18 +431,6 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     vsock_dev.host_stream = null;
                     exec_probe_done = true;
                 }
-            }
-        }
-        if (config.capture_request) |request_capture| {
-            if (request_capture.isAbortRequested()) return error.CaptureAborted;
-            if (request_capture.isRequested()) {
-                const dir = config.snapshot_dir orelse return error.HvCallFailed;
-                try takeSnapshot(allocator, dir, vcpu, transports, &gen_dev, ram_bytes, .{
-                    .dist_base = dist_base,
-                    .redist_base = vcpu_redist_base,
-                    .ram_size = config.ram_size,
-                }, config.rootfs, if (dirty_tracker) |*tracker| tracker else null);
-                return .snapshotted;
             }
         }
         if (config.snapshot_after_ms) |after_ms| {

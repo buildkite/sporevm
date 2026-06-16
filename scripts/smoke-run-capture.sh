@@ -39,8 +39,9 @@ resume_log="${workdir}/resume.log"
 
 "${spore_bin}" run \
   --backend "${backend}" \
-  --capture-on-abort "${capture_dir}" \
-  --capture-signal USR1 \
+  --memory-mib "${SPORE_SMOKE_MEMORY_MIB:-256}" \
+  --capture "${capture_dir}" \
+  --capture-on USR1 \
   -- /bin/sleeper \
   >"${run_stdout}" 2>"${run_stderr}" &
 run_pid="$!"

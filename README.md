@@ -55,8 +55,7 @@ Current `main` can:
 - summarize a spore manifest with `spore inspect <spore-dir>`;
 - run one explicit argv request in a throwaway VM with `spore run`;
 - stream fresh run stdout/stderr and exit with the guest command status;
-- capture a long-running `spore run` on a host signal with
-  `--capture-on-abort`;
+- capture a `spore run` on command exit or on a host signal with `--capture`;
 - mint metadata-only child spores with `spore fork`;
 - resume forked child directories with prefixed output using `spore fanout`;
 - resume one diskless or verified immutable-rootfs spore with `spore resume`;
@@ -160,12 +159,12 @@ SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo zig-out/bin/spore exec snap-2 -- /bin/writ
 SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo zig-out/bin/spore rm snap-2
 ```
 
-Capture a long-running run on a host signal:
+Capture a run on command exit or on a host signal:
 
 ```bash
 zig-out/bin/spore run \
-  --capture-on-abort /tmp/run.spore \
-  --capture-signal USR1 \
+  --capture /tmp/run.spore \
+  --capture-on USR1 \
   -- /bin/sleeper &
 run_pid=$!
 
@@ -174,9 +173,11 @@ wait "$run_pid"
 zig-out/bin/spore resume /tmp/run.spore
 ```
 
-With `--capture-on-abort`, the first matching host signal writes a spore and
-exits zero; a second Ctrl-C exits 130. If the guest command finishes first,
-`spore run` still exits with the guest status.
+With plain `--capture DIR`, `spore run` captures after the guest command exits
+and returns the guest status. With `--capture-on USR1` or another host signal,
+the first matching signal writes a spore and exits zero; a second matching
+signal exits 130. Add `--continue-after-capture` to keep the original run alive
+after a signal-triggered snapshot.
 
 Fork an existing spore:
 
@@ -246,11 +247,11 @@ with `spore rootfs import-oci ... --ref local/name:tag`, then run with
 Entrypoint, Cmd, User, Env, or Workdir yet. Set `SPOREVM_ROOTFS_CACHE_DIR` to
 override the cache directory.
 
-When combined with `--capture-on-abort`, `--image` records immutable rootfs
+When combined with `--capture`, `--image` records immutable rootfs
 identity in the spore manifest. `spore resume` later verifies the cached rootfs
 bytes by digest before attaching the fd read-only. `--rootfs PATH` still works
-for ordinary runs, but `--rootfs PATH --capture-on-abort` is rejected until
-there is an import/preload command for arbitrary local rootfs identity.
+for ordinary runs, but `--rootfs PATH --capture` is rejected until there is an
+import/preload command that can record portable rootfs identity.
 
 Exercise the rootfs capture/fork/resume path with:
 

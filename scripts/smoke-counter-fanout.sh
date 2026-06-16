@@ -60,8 +60,8 @@ fanout_stderr="${workdir}/fanout.stderr"
 
 "${spore_bin}" run \
   --backend "${backend}" \
-  --capture-on-abort "${capture_dir}" \
-  --capture-signal USR1 \
+  --capture "${capture_dir}" \
+  --capture-on USR1 \
   -- /bin/counter \
   >"${run_stdout}" 2>"${run_stderr}" &
 run_pid="$!"

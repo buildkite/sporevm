@@ -52,9 +52,13 @@ pub const Config = struct {
     /// stop. Requires snapshot_dir.
     snapshot_after_ms: ?u64 = null,
     snapshot_dir: ?[]const u8 = null,
+    /// Snapshot and stop when the exec probe has observed command completion.
+    snapshot_on_probe_complete: bool = false,
     /// Optional host request that asks the run loop to snapshot at the next
     /// settled boundary. A second request aborts the run.
     capture_request: ?*capture.Request = null,
+    /// Continue running after a host-requested capture instead of stopping.
+    continue_after_capture: bool = false,
     /// Opt-in KVM dirty-log capture path for Slice 7 measurement. When
     /// enabled, guest writes are collected in epochs and snapshot only needs a
     /// final dirty-log tail flush instead of a full RAM scan.
@@ -142,7 +146,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_ONE_REG, "KVM_CAP_ONE_REG");
     try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_ARM_PSCI_0_2, "KVM_CAP_ARM_PSCI_0_2");
     try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_DEVICE_CTRL, "KVM_CAP_DEVICE_CTRL");
-    if (config.resume_dir != null or config.snapshot_after_ms != null or config.capture_request != null) {
+    if (config.resume_dir != null or config.snapshot_after_ms != null or config.snapshot_on_probe_complete or config.capture_request != null) {
         try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_COUNTER_OFFSET, "KVM_CAP_COUNTER_OFFSET");
     }
 
@@ -321,7 +325,26 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     }
     var exec_probe_done = false;
     var pending_kvm_completion = false;
+    var did_capture_request = false;
     while (true) {
+        if (config.capture_request) |request_capture| {
+            if (request_capture.isAbortRequested()) return error.CaptureAborted;
+            if (request_capture.isRequested() and !did_capture_request) {
+                if (pending_kvm_completion) {
+                    try kvm.completePendingExit(vcpu_fd, run_bytes);
+                    pending_kvm_completion = false;
+                }
+                const dir = config.snapshot_dir orelse return error.KvmIoctlFailed;
+                try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, config.rootfs, if (dirty_tracker) |*tracker| tracker else null);
+                request_capture.markCompleted();
+                if (request_capture.isAbortRequested()) return error.CaptureAborted;
+                if (config.continue_after_capture) {
+                    did_capture_request = true;
+                    continue;
+                }
+                return .snapshotted;
+            }
+        }
         if (config.exec_probe) |probe| {
             if (!exec_probe_done) {
                 if (probe.state == .failed) {
@@ -338,7 +361,14 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                         try kvm.completePendingExit(vcpu_fd, run_bytes);
                         pending_kvm_completion = false;
                     }
-                    if (config.exec_probe_completes_run) return .probe_complete;
+                    if (config.exec_probe_completes_run) {
+                        if (config.snapshot_on_probe_complete) {
+                            const dir = config.snapshot_dir orelse return error.KvmIoctlFailed;
+                            try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, config.rootfs, if (dirty_tracker) |*tracker| tracker else null);
+                            return .snapshotted;
+                        }
+                        return .probe_complete;
+                    }
                     vsock_dev.host_stream = null;
                     exec_probe_done = true;
                 }
@@ -351,18 +381,6 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     vsock_dev.host_stream = null;
                     exec_probe_done = true;
                 }
-            }
-        }
-        if (config.capture_request) |request_capture| {
-            if (request_capture.isAbortRequested()) return error.CaptureAborted;
-            if (request_capture.isRequested()) {
-                if (pending_kvm_completion) {
-                    try kvm.completePendingExit(vcpu_fd, run_bytes);
-                    pending_kvm_completion = false;
-                }
-                const dir = config.snapshot_dir orelse return error.KvmIoctlFailed;
-                try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, config.rootfs, if (dirty_tracker) |*tracker| tracker else null);
-                return .snapshotted;
             }
         }
         if (config.snapshot_after_ms) |after_ms| {
