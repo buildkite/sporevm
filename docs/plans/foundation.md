@@ -180,8 +180,8 @@ elision, content-addressed chunk writes, `ram.backing` lifecycle, dirty-tail
 counts, and backing finalization live behind a backend-neutral sealer. Backends
 remain responsible only for detecting dirty memory: KVM via dirty-log bitmaps
 plus host-initiated write marking, and HVF via write-protect faults plus
-host-initiated write marking. This keeps future tail optimizations focused on
-the shared serial sealing path instead of letting KVM and HVF drift.
+host-initiated write marking. This keeps tail optimizations focused on the
+shared path instead of letting KVM and HVF drift.
 
 Both backend dirty workers now report cadence lag and epoch overrun metrics, so
 benchmark output can distinguish a quiet tail from a worker that is falling
@@ -200,21 +200,23 @@ same-host acceleration; verified chunks remain the portable source of truth.
 
 Current benchmark evidence separates boot/seal backlog from suspend tail. On
 HVF, the dirty workload is bounded in the tested cases: 1GiB repeated snapshots
-pause in 16-18ms, and a concurrent 2x4GiB run pauses in 20-22ms per VM with no
-tail chunks. On KVM, 4GiB and 16GiB dirty-workload snapshots remain around
-87-90ms, and concurrent 2x4GiB remains 87ms per VM with no tail chunks. The KVM
-1GiB dirty workload is still not product-ready: the worker no longer turns
-backlog into a 2.1s join, but the same pressure leaves roughly 115 dirty chunks
-for tail flush, with post-refactor runs observed at 114-117 dirty tail chunks
-and suspend around 2.1-2.2s. The next KVM step is to reduce or parallelize
-dirty-tail sealing, or change the backing strategy so active dirty writers
-cannot accumulate a serial tail that large.
+pause in 16-18ms, local post-sealer sanity runs paused in 14-15ms with no tail
+chunks, and a concurrent 2x4GiB run paused in 20-22ms per VM with no tail
+chunks. On KVM, 4GiB and 16GiB dirty-workload snapshots remain around 87-90ms,
+and a post-parallel concurrent 2x4GiB run remained 87ms per VM with no tail
+chunks. The KVM 1GiB dirty workload proved the active-write tail was CPU-bound:
+before parallel sealing, 116 tail chunks produced a 2.19s tail flush while the
+whole run spent 2.90s zero-scanning, 2.99s hashing, 34ms writing chunk files,
+and 24ms writing `ram.backing`. Parallel tail sealing keeps the same exact
+snapshot contract and reduced the same 115-116 chunk tail to about 301ms using 8
+workers. This fixes the multi-second KVM tail regression, but active-write
+latency remains proportional to the unsealed dirty tail.
 
 Current focus:
 
-1. Reduce KVM dirty-tail backlog under active write pressure; the 1GiB dirty
-   workload currently proves this is real suspend tail, not just worker cadence
-   lag.
+1. Repeat KVM 1GiB active-write runs to measure variance after parallel tail
+   sealing and choose a support boundary for guests that keep many chunks dirty
+   at suspend.
 2. Compare one VM, many VMs, and larger RAM using worker metrics without
    changing APIs again.
 3. Separate steady-state idle snapshots from active boot or workload dirty
