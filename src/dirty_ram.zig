@@ -19,6 +19,12 @@ pub const Stats = struct {
     sealed_chunks_total: u64 = 0,
     seal_ms: u64 = 0,
     seal_cpu_ms: u64 = 0,
+    seal_zero_scan_ns: u64 = 0,
+    seal_hash_ns: u64 = 0,
+    seal_chunk_write_ns: u64 = 0,
+    seal_backing_write_ns: u64 = 0,
+    seal_parallel_flush_count: u64 = 0,
+    seal_parallel_workers_max: u64 = 0,
     tail_flush_ms: u64 = 0,
     finish_fchmod_ms: u64 = 0,
     finish_close_ms: u64 = 0,
@@ -27,6 +33,54 @@ pub const Stats = struct {
     tracking_ms: u64 = 0,
     dirty_chunks_per_sec: u64 = 0,
     sealed_chunks_per_sec: u64 = 0,
+
+    pub fn sealZeroScanMs(self: *const Stats) u64 {
+        return nsToMs(self.seal_zero_scan_ns);
+    }
+
+    pub fn sealHashMs(self: *const Stats) u64 {
+        return nsToMs(self.seal_hash_ns);
+    }
+
+    pub fn sealChunkWriteMs(self: *const Stats) u64 {
+        return nsToMs(self.seal_chunk_write_ns);
+    }
+
+    pub fn sealBackingWriteMs(self: *const Stats) u64 {
+        return nsToMs(self.seal_backing_write_ns);
+    }
+};
+
+const SealWorkStats = struct {
+    sealed_chunks: u64 = 0,
+    zero_scan_ns: u64 = 0,
+    hash_ns: u64 = 0,
+    chunk_write_ns: u64 = 0,
+    backing_write_ns: u64 = 0,
+    cpu_ns: u64 = 0,
+
+    fn add(self: *SealWorkStats, other: SealWorkStats) void {
+        self.sealed_chunks +|= other.sealed_chunks;
+        self.zero_scan_ns +|= other.zero_scan_ns;
+        self.hash_ns +|= other.hash_ns;
+        self.chunk_write_ns +|= other.chunk_write_ns;
+        self.backing_write_ns +|= other.backing_write_ns;
+        self.cpu_ns +|= other.cpu_ns;
+    }
+};
+
+const SpinLock = struct {
+    locked: std.atomic.Value(bool) = .init(false),
+
+    fn lock(self: *SpinLock) void {
+        while (self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+            std.Thread.yield() catch {};
+        }
+    }
+
+    fn unlock(self: *SpinLock) void {
+        self.locked.store(false, .release);
+    }
 };
 
 pub const Options = struct {
@@ -49,6 +103,7 @@ pub const FlushOptions = struct {
 
 pub const Sealer = struct {
     allocator: std.mem.Allocator,
+    alloc_mutex: SpinLock = .{},
     dir: []const u8,
     ram: []const u8,
     refs: []?[]const u8,
@@ -92,7 +147,8 @@ pub const Sealer = struct {
 
         const seed_start = try monotonicMs();
         for (sealer.refs, 0..) |_, i| {
-            const nonzero = try sealer.sealChunk(i, false);
+            var work_stats: SealWorkStats = .{};
+            const nonzero = try sealer.sealChunk(i, false, &work_stats);
             sealer.stats.seed_chunks += 1;
             if (nonzero) sealer.stats.seed_nonzero_chunks += 1;
         }
@@ -147,27 +203,30 @@ pub const Sealer = struct {
     }
 
     pub fn flushMarked(self: *Sealer, options: FlushOptions) !u64 {
-        if (!self.hasDirtyChunks()) return 0;
+        var dirty_indices = try self.collectDirtyIndices(options);
+        defer dirty_indices.deinit(self.allocator);
+        if (dirty_indices.items.len == 0) return 0;
 
-        var dirty_chunks_this_flush: u64 = 0;
+        const dirty_chunks_this_flush: u64 = @intCast(dirty_indices.items.len);
         const seal_start = try monotonicMs();
         const seal_cpu_start = if (options.record_cpu) threadCpuNs() else 0;
-        for (self.dirty_chunks, 0..) |is_dirty, i| {
-            if (!options.tail) {
-                if (options.stop) |stop| {
-                    if (stop.load(.acquire)) break;
-                }
-            }
-            if (!is_dirty) continue;
-            self.dirty_chunks[i] = false;
-            dirty_chunks_this_flush += 1;
-            if (options.before_seal) |before_seal| {
-                try before_seal(options.before_seal_ctx orelse return error.BadManifest, i);
-            }
-            _ = try self.sealChunk(i, true);
+        var work_stats: SealWorkStats = .{};
+
+        if (self.shouldParallelFlush(options, dirty_indices.items.len)) {
+            work_stats = try self.flushIndicesParallel(dirty_indices.items, options.record_cpu);
+        } else {
+            try self.flushIndicesSerial(dirty_indices.items, options, &work_stats);
         }
+
         self.stats.seal_ms += (try monotonicMs()) - seal_start;
-        if (options.record_cpu) self.stats.seal_cpu_ms += elapsedCpuMs(seal_cpu_start);
+        if (options.record_cpu) {
+            if (work_stats.cpu_ns != 0) {
+                self.stats.seal_cpu_ms +|= nsToMs(work_stats.cpu_ns);
+            } else {
+                self.stats.seal_cpu_ms +|= elapsedCpuMs(seal_cpu_start);
+            }
+        }
+        self.recordSealWork(work_stats);
         self.stats.dirty_chunks_total += dirty_chunks_this_flush;
         if (options.tail) self.stats.dirty_chunks_tail += dirty_chunks_this_flush;
         return dirty_chunks_this_flush;
@@ -181,6 +240,12 @@ pub const Sealer = struct {
         self.stats.sealed_chunks_total = 0;
         self.stats.seal_ms = 0;
         self.stats.seal_cpu_ms = 0;
+        self.stats.seal_zero_scan_ns = 0;
+        self.stats.seal_hash_ns = 0;
+        self.stats.seal_chunk_write_ns = 0;
+        self.stats.seal_backing_write_ns = 0;
+        self.stats.seal_parallel_flush_count = 0;
+        self.stats.seal_parallel_workers_max = 0;
         self.stats.tail_flush_ms = 0;
         self.stats.finish_fchmod_ms = 0;
         self.stats.finish_close_ms = 0;
@@ -230,35 +295,171 @@ pub const Sealer = struct {
         };
     }
 
-    fn sealChunk(self: *Sealer, index: usize, count_dirty_seal: bool) !bool {
+    fn collectDirtyIndices(self: *Sealer, options: FlushOptions) !std.ArrayList(usize) {
+        var dirty_indices: std.ArrayList(usize) = .empty;
+        errdefer dirty_indices.deinit(self.allocator);
+
+        for (self.dirty_chunks, 0..) |is_dirty, i| {
+            if (!options.tail) {
+                if (options.stop) |stop| {
+                    if (stop.load(.acquire)) break;
+                }
+            }
+            if (!is_dirty) continue;
+            try dirty_indices.append(self.allocator, i);
+        }
+        return dirty_indices;
+    }
+
+    fn shouldParallelFlush(self: *const Sealer, options: FlushOptions, dirty_count: usize) bool {
+        _ = self;
+        if (!options.tail) return false;
+        if (options.before_seal != null) return false;
+        return dirty_count >= 4 and parallelWorkerCount(dirty_count) > 1;
+    }
+
+    fn flushIndicesSerial(self: *Sealer, indices: []const usize, options: FlushOptions, work_stats: *SealWorkStats) !void {
+        for (indices) |i| {
+            self.dirty_chunks[i] = false;
+            if (options.before_seal) |before_seal| {
+                try before_seal(options.before_seal_ctx orelse return error.BadManifest, i);
+            }
+            _ = try self.sealChunk(i, true, work_stats);
+        }
+    }
+
+    fn flushIndicesParallel(self: *Sealer, indices: []const usize, record_cpu: bool) !SealWorkStats {
+        const worker_count = parallelWorkerCount(indices.len);
+        var threads = try self.allocator.alloc(std.Thread, worker_count);
+        defer self.allocator.free(threads);
+        const worker_stats = try self.allocator.alloc(SealWorkStats, worker_count);
+        defer self.allocator.free(worker_stats);
+        const worker_errors = try self.allocator.alloc(?anyerror, worker_count);
+        defer self.allocator.free(worker_errors);
+        @memset(worker_stats, .{});
+        @memset(worker_errors, null);
+
+        var context = ParallelSealContext{
+            .sealer = self,
+            .indices = indices,
+            .record_cpu = record_cpu,
+            .worker_stats = worker_stats,
+            .worker_errors = worker_errors,
+        };
+
+        var started: usize = 0;
+        while (started < worker_count) : (started += 1) {
+            threads[started] = std.Thread.spawn(.{}, parallelSealWorker, .{ &context, started }) catch |err| {
+                context.failed.store(true, .release);
+                var join_index: usize = 0;
+                while (join_index < started) : (join_index += 1) threads[join_index].join();
+                return err;
+            };
+        }
+        self.stats.seal_parallel_flush_count +|= 1;
+        self.stats.seal_parallel_workers_max = @max(self.stats.seal_parallel_workers_max, worker_count);
+
+        for (threads) |thread| thread.join();
+        for (worker_errors) |maybe_err| {
+            if (maybe_err) |err| return err;
+        }
+
+        var out: SealWorkStats = .{};
+        for (worker_stats) |stats| out.add(stats);
+        return out;
+    }
+
+    fn recordSealWork(self: *Sealer, work_stats: SealWorkStats) void {
+        self.stats.sealed_chunks_total +|= work_stats.sealed_chunks;
+        self.stats.seal_zero_scan_ns +|= work_stats.zero_scan_ns;
+        self.stats.seal_hash_ns +|= work_stats.hash_ns;
+        self.stats.seal_chunk_write_ns +|= work_stats.chunk_write_ns;
+        self.stats.seal_backing_write_ns +|= work_stats.backing_write_ns;
+    }
+
+    fn sealChunk(self: *Sealer, index: usize, count_dirty_seal: bool, work_stats: *SealWorkStats) !bool {
         const range = self.chunkRange(index);
         const data = self.ram[range.start..range.end];
 
-        if (std.mem.allEqual(u8, data, 0)) {
+        const zero_scan_start = try monotonicNs();
+        const is_zero = std.mem.allEqual(u8, data, 0);
+        work_stats.zero_scan_ns +|= try elapsedMonotonicNs(zero_scan_start);
+
+        if (is_zero) {
             if (self.refs[index] != null) {
                 self.refs[index] = null;
+                const backing_write_start = try monotonicNs();
                 try pwriteFileAll(self.backing_fd, range.start, data);
-                if (count_dirty_seal) self.stats.sealed_chunks_total += 1;
+                work_stats.backing_write_ns +|= try elapsedMonotonicNs(backing_write_start);
+                if (count_dirty_seal) work_stats.sealed_chunks += 1;
             }
             return false;
         }
 
+        const hash_start = try monotonicNs();
         const id = chunk.ChunkId.fromContents(data);
+        work_stats.hash_ns +|= try elapsedMonotonicNs(hash_start);
         const hex = id.toHex();
         const existing = self.refs[index];
         if (existing == null or !std.mem.eql(u8, existing.?, &hex)) {
-            const ref = try self.allocator.dupe(u8, &hex);
+            const ref, const chunk_path = try self.allocChunkRefAndPath(&hex);
             self.refs[index] = ref;
-            const chunk_path = try pathZ(self.allocator, "{s}/chunks/{s}", .{ self.dir, ref });
-            if (std.c.access(chunk_path, 0) != 0) {
-                try writeFileAll(chunk_path, data);
-            }
+            const chunk_write_start = try monotonicNs();
+            try writeFileAllIfMissing(chunk_path, data);
+            work_stats.chunk_write_ns +|= try elapsedMonotonicNs(chunk_write_start);
         }
+        const backing_write_start = try monotonicNs();
         try pwriteFileAll(self.backing_fd, range.start, data);
-        if (count_dirty_seal) self.stats.sealed_chunks_total += 1;
+        work_stats.backing_write_ns +|= try elapsedMonotonicNs(backing_write_start);
+        if (count_dirty_seal) work_stats.sealed_chunks += 1;
         return true;
     }
+
+    fn allocChunkRefAndPath(self: *Sealer, hex: *const [chunk.ChunkId.hex_len]u8) !struct { []const u8, [:0]const u8 } {
+        self.alloc_mutex.lock();
+        defer self.alloc_mutex.unlock();
+        const ref = try self.allocator.dupe(u8, hex);
+        const chunk_path = try pathZ(self.allocator, "{s}/chunks/{s}", .{ self.dir, ref });
+        return .{ ref, chunk_path };
+    }
 };
+
+const ParallelSealContext = struct {
+    sealer: *Sealer,
+    indices: []const usize,
+    record_cpu: bool,
+    next_index: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    worker_stats: []SealWorkStats,
+    worker_errors: []?anyerror,
+};
+
+fn parallelSealWorker(context: *ParallelSealContext, worker_index: usize) void {
+    var work_stats: SealWorkStats = .{};
+    const cpu_start = if (context.record_cpu) threadCpuNs() else 0;
+    defer {
+        if (context.record_cpu) work_stats.cpu_ns = elapsedCpuNs(cpu_start);
+        context.worker_stats[worker_index] = work_stats;
+    }
+
+    while (!context.failed.load(.acquire)) {
+        const next = context.next_index.fetchAdd(1, .monotonic);
+        if (next >= context.indices.len) break;
+        const chunk_index = context.indices[next];
+        context.sealer.dirty_chunks[chunk_index] = false;
+        _ = context.sealer.sealChunk(chunk_index, true, &work_stats) catch |err| {
+            context.sealer.dirty_chunks[chunk_index] = true;
+            context.worker_errors[worker_index] = err;
+            context.failed.store(true, .release);
+            break;
+        };
+    }
+}
+
+fn parallelWorkerCount(dirty_count: usize) usize {
+    const cpu_count = std.Thread.getCpuCount() catch 1;
+    return @min(@min(cpu_count, 8), dirty_count);
+}
 
 fn closeBackingFdDeferred(fd: std.c.fd_t) bool {
     const thread = std.Thread.spawn(.{}, closeBackingFdThread, .{fd}) catch return false;
@@ -273,6 +474,21 @@ fn closeBackingFdThread(fd: std.c.fd_t) void {
 fn writeFileAll(path: [:0]const u8, data: []const u8) !void {
     const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c_uint, 0o644));
     if (fd < 0) return error.IoFailed;
+    defer _ = std.c.close(fd);
+    var done: usize = 0;
+    while (done < data.len) {
+        const n = std.c.write(fd, data.ptr + done, data.len - done);
+        if (n <= 0) return error.IoFailed;
+        done += @intCast(n);
+    }
+}
+
+fn writeFileAllIfMissing(path: [:0]const u8, data: []const u8) !void {
+    const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, @as(c_uint, 0o644));
+    if (fd < 0) {
+        if (std.c.errno(fd) == .EXIST) return;
+        return error.IoFailed;
+    }
     defer _ = std.c.close(fd);
     var done: usize = 0;
     while (done < data.len) {
@@ -307,6 +523,18 @@ fn monotonicMs() !u64 {
     return @as(u64, @intCast(ts.sec)) * std.time.ms_per_s + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
 }
 
+fn monotonicNs() !u64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return error.ClockFailed;
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+fn elapsedMonotonicNs(start_ns: u64) !u64 {
+    const end_ns = try monotonicNs();
+    if (end_ns <= start_ns) return 0;
+    return end_ns - start_ns;
+}
+
 fn threadCpuNs() u64 {
     var ts: std.c.timespec = undefined;
     if (std.c.clock_gettime(.THREAD_CPUTIME_ID, &ts) != 0) return 0;
@@ -320,10 +548,14 @@ fn nsToMs(ns: u64) u64 {
 }
 
 fn elapsedCpuMs(start_ns: u64) u64 {
+    return nsToMs(elapsedCpuNs(start_ns));
+}
+
+fn elapsedCpuNs(start_ns: u64) u64 {
     if (start_ns == 0) return 0;
     const end_ns = threadCpuNs();
     if (end_ns <= start_ns) return 0;
-    return nsToMs(end_ns - start_ns);
+    return end_ns - start_ns;
 }
 
 fn ratePerSec(count: u64, elapsed_ms: u64) u64 {
@@ -471,4 +703,42 @@ test "dirty RAM sealer leaves stopped non-tail work for tail flush" {
     try std.testing.expectEqual(@as(u64, 2), sealer.stats.dirty_chunks_total);
     try std.testing.expectEqual(@as(u64, 2), sealer.stats.dirty_chunks_tail);
     try std.testing.expect(!sealer.hasDirtyChunks());
+}
+
+test "dirty RAM sealer can flush a dirty tail in parallel" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = try testDir(arena);
+    const ram = try arena.alloc(u8, 8 * spore.chunk_size);
+    @memset(ram, 0);
+
+    var sealer = try Sealer.start(arena, .{ .dir = dir, .ram = ram });
+    defer sealer.deinit();
+    sealer.resetStatsAfterBaseline();
+
+    for (0..8) |i| {
+        ram[i * spore.chunk_size] = @intCast(0x20 + i);
+        sealer.markCollectedChunkDirty(i);
+    }
+
+    const tail_flushed = try sealer.flushMarked(.{ .tail = true, .record_cpu = true });
+    try std.testing.expectEqual(@as(u64, 8), tail_flushed);
+    try std.testing.expectEqual(@as(u64, 8), sealer.stats.dirty_chunks_total);
+    try std.testing.expectEqual(@as(u64, 8), sealer.stats.dirty_chunks_tail);
+    try std.testing.expectEqual(@as(u64, 8), sealer.stats.sealed_chunks_total);
+    try std.testing.expect(!sealer.hasDirtyChunks());
+
+    const expected_workers = parallelWorkerCount(8);
+    if (expected_workers > 1) {
+        try std.testing.expectEqual(@as(u64, 1), sealer.stats.seal_parallel_flush_count);
+        try std.testing.expectEqual(@as(u64, @intCast(expected_workers)), sealer.stats.seal_parallel_workers_max);
+    }
+
+    _ = try sealer.finishBacking();
+    const backing_path = try pathZ(arena, "{s}/{s}", .{ dir, spore.ram_backing_path });
+    const backing = try readFileAllForTest(arena, backing_path, ram.len);
+    try std.testing.expectEqualSlices(u8, ram, backing);
 }
