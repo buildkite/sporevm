@@ -86,7 +86,7 @@ example/rails/bin/build-image \
 ## Run the Fan-Out Demo
 
 ```bash
-example/rails/bin/fanout-rspec --count 2
+example/rails/bin/fanout-rspec --count 4
 ```
 
 By default `fanout-rspec` builds and imports the local OCI layout first. If the
@@ -96,10 +96,8 @@ image has already been imported, skip that step:
 example/rails/bin/fanout-rspec \
   --image local/sporevm-rails-rspec:dev \
   --no-image-build \
-  --count 2
+  --count 4
 ```
-
-Use a larger `--count` once the host can sustain more concurrent resumes.
 
 The script performs the product lifecycle explicitly:
 
@@ -107,21 +105,21 @@ The script performs the product lifecycle explicitly:
 spore run --image local/sporevm-rails-rspec:dev --capture rails-rspec.spore --capture-on USR1 -- \
   /bin/bash /usr/local/bin/sporevm-rails-coordinator
 
-spore fork rails-rspec.spore --count 2 --out rails-rspec.children
+spore fork rails-rspec.spore --count 4 --out rails-rspec.children
 spore fanout rails-rspec.children --parallel
 ```
 
 Expected output includes the warm marker from the parent:
 
 ```text
-SPOREVM_RAILS_READY pid=... capture_delay=1
+SPOREVM_RAILS_READY pid=... capture_delay=2
 ```
 
 and one successful RSpec completion marker per child:
 
 ```text
-[000000] SPOREVM_RSPEC_DONE parallel_index=0 parallel_count=2 exit=0
-[000001] SPOREVM_RSPEC_DONE parallel_index=1 parallel_count=2 exit=0
+[000000] SPOREVM_RSPEC_DONE parallel_index=0 parallel_count=4 exit=0
+[000001] SPOREVM_RSPEC_DONE parallel_index=1 parallel_count=4 exit=0
 ```
 
 The host script leaves logs and spores in its workdir so the manifest and child
@@ -160,6 +158,7 @@ example/rails/bin/fanout-rspec --backend kvm
 example/rails/bin/fanout-rspec --workdir /tmp/sporevm-rails-demo
 example/rails/bin/fanout-rspec --image ghcr.io/YOUR_ORG/sporevm-rails-rspec:dev --no-image-build
 example/rails/bin/fanout-rspec --kernel /path/to/sporevm-run-arm64-linux-6.1.155-Image
+example/rails/bin/fanout-rspec --capture-delay 5
 ```
 
 Environment equivalents:
@@ -167,7 +166,8 @@ Environment equivalents:
 ```bash
 SPORE_RAILS_IMAGE=local/sporevm-rails-rspec:dev
 SPORE_RAILS_OCI=/tmp/sporevm-rails-rspec.oci
-SPORE_RAILS_FANOUT_COUNT=2
+SPORE_RAILS_FANOUT_COUNT=4
 SPORE_RAILS_MEMORY_MIB=2048
+SPORE_RAILS_CAPTURE_DELAY=2
 SPORE_BIN=/path/to/spore
 ```

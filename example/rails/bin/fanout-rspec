@@ -14,10 +14,10 @@ Options:
   --image REF             OCI image ref to run (default: local/sporevm-rails-rspec:dev)
   --oci PATH              OCI layout tar path for local image builds
   --platform P            OCI platform (default: linux/arm64)
-  --count N               Number of child spores to run (default: 2)
+  --count N               Number of child spores to run (default: 4)
   --backend hvf|kvm       Backend to use (default: infer from host)
   --memory-mib N          Guest RAM in MiB (default: 2048)
-  --capture-delay N       Guest seconds to wait after ready before tests (default: 1)
+  --capture-delay N       Guest seconds to wait after ready before tests (default: 2)
   --fanout-timeout N      Host seconds before fanout is killed (default: 300)
   --workdir DIR           Directory for logs and spores (default: mktemp)
   --spore-bin PATH        Prebuilt spore CLI (default: zig-out/bin/spore)
@@ -72,10 +72,10 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 image_ref="${SPORE_RAILS_IMAGE:-local/sporevm-rails-rspec:dev}"
 oci_output="${SPORE_RAILS_OCI:-${TMPDIR:-/tmp}/sporevm-rails-rspec.oci}"
 platform="${SPORE_RAILS_PLATFORM:-linux/arm64}"
-count="${SPORE_RAILS_FANOUT_COUNT:-2}"
+count="${SPORE_RAILS_FANOUT_COUNT:-4}"
 backend=""
 memory_mib="${SPORE_RAILS_MEMORY_MIB:-2048}"
-capture_delay="${SPORE_RAILS_CAPTURE_DELAY:-1}"
+capture_delay="${SPORE_RAILS_CAPTURE_DELAY:-2}"
 fanout_timeout="${SPORE_RAILS_FANOUT_TIMEOUT:-300}"
 workdir=""
 spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
@@ -186,10 +186,8 @@ else
   mkdir -p "${workdir}"
 fi
 
-kernel_args=()
 if [[ -n "${kernel_image}" ]]; then
   [[ -f "${kernel_image}" ]] || die "kernel image not found: ${kernel_image}"
-  kernel_args=(--kernel "${kernel_image}")
   kernel_label="${kernel_image}"
 else
   kernel_label="managed run kernel"
@@ -283,13 +281,20 @@ phase "warm Rails/Postgres and capture"
 phase_start="${SECONDS}"
 : >"${run_stdout}"
 : >"${run_stderr}"
-"${spore_bin}" run \
-  --backend "${backend}" \
-  --memory-mib "${memory_mib}" \
-  "${kernel_args[@]}" \
-  --image "${resolved_image_ref}" \
-  --capture "${capture_dir}" \
-  --capture-on USR1 \
+run_args=(
+  run
+  --backend "${backend}"
+  --memory-mib "${memory_mib}"
+)
+if [[ -n "${kernel_image}" ]]; then
+  run_args+=(--kernel "${kernel_image}")
+fi
+run_args+=(
+  --image "${resolved_image_ref}"
+  --capture "${capture_dir}"
+  --capture-on USR1
+)
+"${spore_bin}" "${run_args[@]}" \
   -- /bin/bash /usr/local/bin/sporevm-rails-coordinator --capture-delay "${capture_delay}" \
   >"${run_stdout}" 2>"${run_stderr}" &
 run_pid="$!"
@@ -313,6 +318,7 @@ fi
 ready_seconds="$(elapsed_since "${phase_start}")"
 
 tail -40 "${run_stdout}" || true
+sleep "${SPORE_RAILS_CAPTURE_SETTLE_SECONDS:-0.2}"
 printf 'capturing with USR1...\n'
 capture_start="${SECONDS}"
 kill -USR1 "${run_pid}"
