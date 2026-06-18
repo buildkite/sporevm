@@ -1162,7 +1162,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     defer {
         if (rootfs_fd) |fd| _ = std.c.close(fd);
     }
-    const boot_args = if (resuming) "" else try cmdline(allocator, opts.guest_port, opts.rootfs_path != null);
+    const boot_args = if (resuming) "" else try cmdline(allocator, opts.guest_port, opts.rootfs_path != null, opts.network);
     const request = try execRequestForRun(init, allocator, opts);
     var stream = try vsock.HostStream.init(opts.guest_port, request);
     if (opts.stream_output) stream.setOutputSink(null, runOutputSink);
@@ -1246,7 +1246,7 @@ pub fn executeMonitor(init: std.process.Init, allocator: std.mem.Allocator, opts
     defer {
         if (rootfs_fd) |fd| _ = std.c.close(fd);
     }
-    const boot_args = try cmdline(allocator, opts.guest_port, opts.rootfs_path != null);
+    const boot_args = try cmdline(allocator, opts.guest_port, opts.rootfs_path != null, .disabled);
 
     const cause = switch (backend) {
         .auto => unreachable,
@@ -1372,11 +1372,14 @@ pub fn generationRequest(allocator: std.mem.Allocator, params_json: []const u8) 
     return std.fmt.allocPrint(allocator, "{s}\n", .{json});
 }
 
-pub fn cmdline(allocator: std.mem.Allocator, guest_port: u32, rootfs: bool) ![]const u8 {
-    return if (rootfs)
-        std.fmt.allocPrint(allocator, "console=hvc0 rdinit=/init cleanroom_guest_port={d} cleanroom_guest_boot_timing=1 spore_rootfs=1", .{guest_port})
-    else
-        std.fmt.allocPrint(allocator, "console=hvc0 rdinit=/init cleanroom_guest_port={d} cleanroom_guest_boot_timing=1", .{guest_port});
+pub fn cmdline(allocator: std.mem.Allocator, guest_port: u32, rootfs: bool, network: NetworkMode) ![]const u8 {
+    const rootfs_flag = if (rootfs) " spore_rootfs=1" else "";
+    const network_flag = if (network == .spore) " spore_net=1" else "";
+    return std.fmt.allocPrint(
+        allocator,
+        "console=hvc0 rdinit=/init cleanroom_guest_port={d} cleanroom_guest_boot_timing=1{s}{s}",
+        .{ guest_port, rootfs_flag, network_flag },
+    );
 }
 
 fn resolveBackend(backend: Backend) !Backend {
@@ -1995,13 +1998,23 @@ test "run image cache creates absolute cache directories" {
 }
 
 test "run cmdline marks rootfs mode" {
-    const without_rootfs = try cmdline(std.testing.allocator, 10700, false);
+    const without_rootfs = try cmdline(std.testing.allocator, 10700, false, .disabled);
     defer std.testing.allocator.free(without_rootfs);
     try std.testing.expect(std.mem.indexOf(u8, without_rootfs, "spore_rootfs=1") == null);
 
-    const with_rootfs = try cmdline(std.testing.allocator, 10700, true);
+    const with_rootfs = try cmdline(std.testing.allocator, 10700, true, .disabled);
     defer std.testing.allocator.free(with_rootfs);
     try std.testing.expect(std.mem.indexOf(u8, with_rootfs, "spore_rootfs=1") != null);
+}
+
+test "run cmdline marks network mode" {
+    const without_network = try cmdline(std.testing.allocator, 10700, false, .disabled);
+    defer std.testing.allocator.free(without_network);
+    try std.testing.expect(std.mem.indexOf(u8, without_network, "spore_net=1") == null);
+
+    const with_network = try cmdline(std.testing.allocator, 10700, false, .spore);
+    defer std.testing.allocator.free(with_network);
+    try std.testing.expect(std.mem.indexOf(u8, with_network, "spore_net=1") != null);
 }
 
 test "run default asset paths derive from install prefix" {

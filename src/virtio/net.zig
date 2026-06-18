@@ -17,7 +17,9 @@ const tx_queue = 1;
 
 /// VIRTIO_NET_F_MAC: config space contains the device MAC address.
 const feature_mac: u64 = 1 << 5;
-pub const header_len = 10;
+/// Linux uses the mergeable-RX-buffer layout size for virtio-net headers even
+/// when the mergeable feature is not negotiated.
+pub const header_len = 12;
 pub const max_frame_len = 1514;
 
 pub const default_mac: [6]u8 = .{ 0x02, 0x53, 0x50, 0x4f, 0x52, 0x45 }; // locally administered "SPORE"
@@ -33,6 +35,7 @@ pub const Runtime = struct {
     failedFn: *const fn (?*anyopaque) bool = healthy,
     setWakeFn: *const fn (?*anyopaque, Wake) void = ignoreWake,
     clearWakeFn: *const fn (?*anyopaque) void = ignoreClearWake,
+    consumeWakeFn: *const fn (?*anyopaque) bool = noWake,
 
     pub fn failed(self: Runtime) bool {
         return self.failedFn(self.context);
@@ -44,6 +47,10 @@ pub const Runtime = struct {
 
     pub fn clearWake(self: Runtime) void {
         self.clearWakeFn(self.context);
+    }
+
+    pub fn consumeWake(self: Runtime) bool {
+        return self.consumeWakeFn(self.context);
     }
 };
 
@@ -199,6 +206,9 @@ fn healthy(_: ?*anyopaque) bool {
 fn noopWake(_: ?*anyopaque) void {}
 fn ignoreWake(_: ?*anyopaque, _: Wake) void {}
 fn ignoreClearWake(_: ?*anyopaque) void {}
+fn noWake(_: ?*anyopaque) bool {
+    return false;
+}
 
 fn txFrameFromChain(chain: *const queue.Chain, out: *[max_frame_len]u8) ?[]const u8 {
     const total = chain.readableLen();

@@ -581,6 +581,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                 }
                 if (config.exec_probe != null and !exec_probe_done) continue;
                 if (config.network.failed()) continue;
+                if (config.network.consumeWake()) continue;
                 if (config.exec_control != null) continue;
                 return error.VcpuCanceled;
             },

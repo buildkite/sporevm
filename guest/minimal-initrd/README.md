@@ -7,6 +7,8 @@ The `agent.c` binary runs as `/init`, listens for the host's run request over
 vsock, mounts an optional read-only rootfs, executes the requested argv, and
 streams stdout, stderr, and exit status frames back to the host. The other
 programs are fixed helper binaries used by product and lifecycle smokes.
+`netcheck.c` verifies the static `spore run --net` guest link setup without
+requiring distro networking tools in the initrd.
 
 Keep this directory source-only. `scripts/make-minimal-exec-initrd.sh` owns
 compiling these files into static aarch64 binaries and packing the initrd.

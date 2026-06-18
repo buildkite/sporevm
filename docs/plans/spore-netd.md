@@ -184,8 +184,13 @@ avoid address allocation, DHCP, or multiple guests per virtual network.
 - `src/net_gateway.zig` owns helper startup, stderr readiness, deterministic
   shutdown, SIGPIPE-safe helper writes, and the parent-side virtio-net backend
   adapter.
-- The minimal initrd agent listens on vsock and runs commands, but it does not
-  configure `eth0`, routes, or `/etc/resolv.conf`.
+- The minimal initrd agent now reads the `spore_net=1` boot flag, waits for
+  `eth0`, assigns the fixed guest IPv4 address and netmask, brings the link up,
+  installs the default route through the gateway, and writes resolver config
+  pointing at the gateway. The setup uses syscalls and proc/sys files directly;
+  it does not require `ip`, DHCP, or other guest tools. The `/bin/netcheck`
+  helper and `scripts/smoke-run-net-config.sh` inspect the resulting interface,
+  route, resolver, and gateway ARP entry.
 - `SECURITY.md` already treats virtqueue descriptors and device request headers
   as guest-controlled attack surface requiring fuzz targets.
 - The local `lox/zmoltcp` fork exists at `/Users/lachlan/Develop/zmoltcp`. A
@@ -255,6 +260,8 @@ Definition of done:
 - Helper failure during a run tears down the run with a clear error.
 
 ### Slice 4: Static Guest Network Setup
+
+Status: landed in the Slice 4 branch.
 
 Teach the minimal initrd to configure `eth0` from boot args or generation-device
 fields.

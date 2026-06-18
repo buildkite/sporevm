@@ -10,7 +10,6 @@ const spore_netd = @import("spore_netd.zig");
 const virtio_net = @import("virtio/net.zig");
 
 const ready_timeout_ms = 1_000;
-const immediate_rx_timeout_ms = 10;
 
 pub const StartError = error{
     NetdSpawnFailed,
@@ -24,12 +23,15 @@ pub const Process = struct {
     to_child_fd: std.c.fd_t = -1,
     from_child_fd: std.c.fd_t = -1,
     stderr_fd: std.c.fd_t = -1,
+    stdout_thread: ?std.Thread = null,
     stderr_thread: ?std.Thread = null,
     wait_thread: ?std.Thread = null,
     failed: std.atomic.Value(bool) = .init(false),
     shutdown_requested: std.atomic.Value(bool) = .init(false),
+    wake_pending: std.atomic.Value(bool) = .init(false),
     wake_lock: SpinLock = .{},
     wake: virtio_net.Wake = .{},
+    rx_lock: SpinLock = .{},
     link_closed: bool = false,
     rx_pending: bool = false,
     rx_len: usize = 0,
@@ -66,8 +68,16 @@ pub const Process = struct {
             };
         };
 
+        self.stdout_thread = std.Thread.spawn(.{}, readStdout, .{self}) catch {
+            self.child.kill(init.io);
+            closeIfOpen(&self.to_child_fd);
+            closeIfOpen(&self.from_child_fd);
+            closeIfOpen(&self.stderr_fd);
+            return error.NetdThreadFailed;
+        };
         self.stderr_thread = std.Thread.spawn(.{}, drainStderr, .{self}) catch {
             self.child.kill(init.io);
+            if (self.stdout_thread) |thread| thread.join();
             closeIfOpen(&self.to_child_fd);
             closeIfOpen(&self.from_child_fd);
             closeIfOpen(&self.stderr_fd);
@@ -75,6 +85,7 @@ pub const Process = struct {
         };
         self.wait_thread = std.Thread.spawn(.{}, waitChild, .{ self, init.io }) catch {
             self.child.kill(init.io);
+            if (self.stdout_thread) |thread| thread.join();
             if (self.stderr_thread) |thread| thread.join();
             closeIfOpen(&self.to_child_fd);
             closeIfOpen(&self.from_child_fd);
@@ -89,12 +100,16 @@ pub const Process = struct {
             .failedFn = failedRuntime,
             .setWakeFn = setWake,
             .clearWakeFn = clearWake,
+            .consumeWakeFn = consumeWake,
         };
     }
 
     pub fn deinit(self: *Process) void {
         self.shutdown();
-        closeIfOpen(&self.from_child_fd);
+        if (self.stdout_thread) |thread| {
+            thread.join();
+            self.stdout_thread = null;
+        }
         if (self.stderr_thread) |thread| {
             thread.join();
             self.stderr_thread = null;
@@ -139,57 +154,36 @@ pub const Process = struct {
         wake.wake();
     }
 
-    fn drainImmediateRx(self: *Process, timeout_ms: i32) void {
-        if (self.rx_pending or self.from_child_fd < 0 or self.hasFailed()) return;
-        var fds = [_]std.posix.pollfd{.{
-            .fd = self.from_child_fd,
-            .events = std.c.POLL.IN,
-            .revents = 0,
-        }};
-        const ready = std.posix.poll(&fds, timeout_ms) catch {
-            self.markFailed();
-            return;
-        };
-        if (ready == 0) return;
-        if ((fds[0].revents & (std.c.POLL.ERR | std.c.POLL.NVAL)) != 0) {
-            self.markFailed();
-            return;
-        }
-        if ((fds[0].revents & (std.c.POLL.IN | std.c.POLL.HUP)) == 0) return;
-
-        const frame = spore_netd.readFrameFd(self.from_child_fd, &self.rx_buf) catch {
-            self.markFailed();
-            return;
-        };
-        self.rx_len = frame.len;
-        self.rx_pending = true;
-    }
-
     fn transmit(ctx: ?*anyopaque, frame: []const u8) void {
         const self: *Process = @ptrCast(@alignCast(ctx.?));
         if (self.hasFailed() or self.link_closed) return;
+        logTxFrame(frame);
         spore_netd.writeFrameFd(self.to_child_fd, frame) catch {
             self.markFailed();
             return;
         };
-        self.drainImmediateRx(immediate_rx_timeout_ms);
     }
 
     fn peekRx(ctx: ?*anyopaque) ?[]const u8 {
         const self: *Process = @ptrCast(@alignCast(ctx.?));
-        self.drainImmediateRx(0);
+        self.rx_lock.lock();
+        defer self.rx_lock.unlock();
         if (!self.rx_pending) return null;
         return self.rx_buf[0..self.rx_len];
     }
 
     fn consumeRx(ctx: ?*anyopaque) void {
         const self: *Process = @ptrCast(@alignCast(ctx.?));
+        self.rx_lock.lock();
+        defer self.rx_lock.unlock();
         self.rx_pending = false;
         self.rx_len = 0;
     }
 
     fn reset(ctx: ?*anyopaque) void {
         const self: *Process = @ptrCast(@alignCast(ctx.?));
+        self.rx_lock.lock();
+        defer self.rx_lock.unlock();
         self.rx_pending = false;
         self.rx_len = 0;
     }
@@ -202,6 +196,11 @@ pub const Process = struct {
     fn failedRuntime(ctx: ?*anyopaque) bool {
         const self: *Process = @ptrCast(@alignCast(ctx.?));
         return self.hasFailed();
+    }
+
+    fn consumeWake(ctx: ?*anyopaque) bool {
+        const self: *Process = @ptrCast(@alignCast(ctx.?));
+        return self.wake_pending.swap(false, .acq_rel);
     }
 
     fn setWake(ctx: ?*anyopaque, wake: virtio_net.Wake) void {
@@ -258,6 +257,62 @@ fn waitReady(fd: std.c.fd_t) error{ NetdReadyTimedOut, NetdReadyFailed }!void {
         len += 1;
     }
     return error.NetdReadyFailed;
+}
+
+fn logTxFrame(frame: []const u8) void {
+    if (frame.len < 14) {
+        std.log.debug("spore-net gateway tx frame len={d}", .{frame.len});
+        return;
+    }
+    const ether_type = std.mem.readInt(u16, frame[12..14], .big);
+    if (ether_type != 0x0806 or frame.len < 42) {
+        std.log.debug("spore-net gateway tx frame len={d} ether_type=0x{x}", .{ frame.len, ether_type });
+        return;
+    }
+    std.log.debug(
+        "spore-net gateway tx arp len={d} op={d} sender={d}.{d}.{d}.{d} target={d}.{d}.{d}.{d}",
+        .{
+            frame.len,
+            std.mem.readInt(u16, frame[20..22], .big),
+            frame[28],
+            frame[29],
+            frame[30],
+            frame[31],
+            frame[38],
+            frame[39],
+            frame[40],
+            frame[41],
+        },
+    );
+}
+
+fn readStdout(self: *Process) void {
+    var buf: [virtio_net.max_frame_len]u8 = undefined;
+    while (true) {
+        const frame = spore_netd.readFrameFd(self.from_child_fd, &buf) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => {
+                self.markFailed();
+                break;
+            },
+        };
+        std.log.debug("spore-net gateway rx frame len={d}", .{frame.len});
+        var should_wake = false;
+        self.rx_lock.lock();
+        if (!self.rx_pending) {
+            @memcpy(self.rx_buf[0..frame.len], frame);
+            self.rx_len = frame.len;
+            self.rx_pending = true;
+            self.wake_pending.store(true, .release);
+            should_wake = true;
+        } else {
+            std.log.debug("spore-net gateway dropped rx frame len={d}: one-frame queue full", .{frame.len});
+        }
+        self.rx_lock.unlock();
+        if (should_wake) self.wakeGuest();
+    }
+    if (!self.shutdown_requested.load(.acquire)) self.markFailed();
+    closeIfOpen(&self.from_child_fd);
 }
 
 fn drainStderr(self: *Process) void {

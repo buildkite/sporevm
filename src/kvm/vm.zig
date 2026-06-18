@@ -414,6 +414,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             .completed => {
                 if (consumeCaptureWake(config.capture_request, run_bytes)) continue;
                 if (config.network.failed()) continue;
+                if (config.network.consumeWake()) continue;
                 pending_kvm_completion = false;
             },
             .interrupted => {
@@ -422,6 +423,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     if (request_capture.isRequested() or request_capture.isAbortRequested()) continue;
                 }
                 if (config.network.failed()) continue;
+                if (config.network.consumeWake()) continue;
                 std.log.err("KVM_RUN interrupted without a pending capture request", .{});
                 return error.KvmIoctlFailed;
             },
