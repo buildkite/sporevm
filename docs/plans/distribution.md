@@ -212,13 +212,16 @@ an attached rootfs fd.
   rootfs artifact policy.
 - `spore unpack --child ID` can materialize one selected child from an indexed
   local bundle into a normal spore directory.
+- `spore pull file://... --child ID` materializes one selected child from an
+  indexed local bundle through a verified local bundle content source, reusing a
+  node-local BLAKE3 chunk cache where hard links are available.
 - Foundation Slice 6 has S3/SSM remote restore, host-local cache reuse,
   source-peer HTTP seeding, corrupt-bundle rejection, and ten-instance star/tree
   smoke evidence.
 - `spore run --image`, `spore resume`, `spore fork`, and `spore fanout` support
   local immutable-rootfs fan-out.
-- Current distribution still has no `push`, `pull`, metadata-only rootfs CLI
-  mode, remote store adapter, or node-local bundle cache reuse.
+- Current distribution still has no `push`, remote `pull`, metadata-only rootfs
+  CLI mode, remote store adapter, or remote bundle cache reuse metrics.
 
 ## Delivery Strategy
 
@@ -275,6 +278,9 @@ covered. New bundle metadata parsers must be covered by unit tests, fuzz targets
 and a `SECURITY.md` attack-surface update.
 
 ### Slice 3: Local Pull Materialization
+
+Status: implemented for local `file://` indexed bundles with a verified local
+bundle content source and node-local chunk cache.
 
 Add `spore pull` for filesystem bundles before adding remote stores. This should
 verify the bundle, select a child, populate or reuse the node-local content
@@ -363,7 +369,7 @@ rule: peers are byte sources, not trust roots.
 - `SECURITY.md` updates for every slice that widens bundle, rootfs artifact, or
   remote-store parsing.
 - Local smoke: fork one rootfs-backed workload, pack children, pull selected
-  children from `file://`, and resume them.
+  children from `file://`, and resume them with `mise run smoke:local-pull`.
 - Remote smoke: push one bundle to S3, pull separate children on same-class
   Linux/KVM aarch64 hosts, resume them, and record origin bytes.
 - Negative remote smoke: corrupt a bundle index, chunkpack segment, child

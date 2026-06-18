@@ -134,8 +134,10 @@ state and broader disk manifests remain later work.
 - Same-host file-backed RAM sharing and lazy restore have proof paths on KVM and
   HVF. Trusted backing remains a same-host acceleration hint; chunks remain the
   portable verified source of truth.
-- `spore pack` and `spore unpack` provide the first local chunkpack bundle shape
-  with `bundle_digest` for cache identity and per-chunk verification for trust.
+- `spore pack`, `spore unpack`, and local `spore pull file://...` provide the
+  first local distribution bundle shape with rootfs artifact inclusion,
+  multi-child indexes, `bundle_digest` for cache identity, and per-chunk
+  verification for trust.
 - `spore run`, product `spore resume`, and `spore fanout` provide the first
   user-facing run/capture/fork/resume/fan-out path.
 
@@ -157,13 +159,12 @@ includes:
 
 What remains:
 
-1. Convert explicit smoke topology into a pull-based product distribution path.
-2. Make rootfs-backed bundles include exact immutable rootfs bytes by default,
-   with metadata-only prepared-cache workflows deferred until bundle metadata
-   exists.
-3. Measure origin egress as a small multiple of unique chunk bytes across larger
+1. Add the first remote `spore push` and `spore pull` store adapter for the
+   pull-based product distribution path.
+2. Measure origin egress as a small multiple of unique chunk bytes across larger
    identical-host fleets.
-4. Keep corrupt peer/origin data rejected by chunk and rootfs verification.
+3. Keep corrupt peer/origin data rejected by chunk and rootfs verification.
+4. Complete node-local bundle cache reuse and metrics for repeated remote pulls.
 5. Keep immutable rootfs artifacts in the distribution path without blurring
    memory chunks and rootfs bytes.
 
@@ -311,6 +312,9 @@ inputs.
 - Rootfs-backed distribution bundles include exact immutable rootfs bytes by
   default; metadata-only rootfs bundles require an explicit opt-out and bundle
   metadata, so they are not part of the first exact-rootfs bundle slice.
+- Local `spore pull file://...` fully materializes a selected child before
+  product resume; remote and lazy pull sources must keep the same verified
+  content-source boundary.
 - `spore run` is one-shot; named lifecycle uses `create`/`exec`/`rm`/`ls` plus
   monitor-backed suspend/resume.
 - Product capture is `spore run --capture`, not a separate capture verb.
