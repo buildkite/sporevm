@@ -78,6 +78,8 @@ pub const Config = struct {
     exec_probe_initial_rx_delay_ms: u64 = 0,
     exec_probe_completes_run: bool = true,
     exec_probe_failure_fatal: bool = true,
+    /// Optional virtio-net frame backend. The default remains closed.
+    network: net.Runtime = .{},
     /// Optional monitor control hook for attaching host streams after boot.
     exec_control: ?vsock.Control = null,
 };
@@ -215,7 +217,8 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     // The generation device is a separate fixed MMIO window after the reserved virtio range.
     var con = console.Console{ .sink = config.console_sink };
     var blk_dev: blk.Blk = undefined;
-    var net_dev = net.Net.init(.{});
+    var net_dev = net.Net.init(.{ .backend = config.network.backend });
+    defer net_dev.shutdown();
     var rng_dev = rng.Rng{};
     var vsock_dev = vsock.Vsock.init(.{});
     var gen_dev = generation.Device{};
@@ -249,6 +252,8 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     if (config.exec_control) |control| {
         control.setWake(.{ .context = &vcpu, .wakeFn = wakeVcpu });
     }
+    config.network.setWake(.{ .context = &vcpu, .wakeFn = wakeNetworkVcpu });
+    defer config.network.clearWake();
     var exec_probe_wake_stop = std.atomic.Value(bool).init(false);
     var exec_probe_wake_thread: ?std.Thread = null;
     defer {
@@ -402,6 +407,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                 try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, @intCast(vsock_transport_index));
             }
         }
+        if (config.network.failed()) return error.NetworkGatewayFailed;
         if (config.exec_control) |control| {
             switch (try control.poll(&vsock_dev)) {
                 .keep_running => {},
@@ -574,6 +580,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     if (request_capture.isRequested()) continue;
                 }
                 if (config.exec_probe != null and !exec_probe_done) continue;
+                if (config.network.failed()) continue;
                 if (config.exec_control != null) continue;
                 return error.VcpuCanceled;
             },
@@ -1142,6 +1149,11 @@ fn flushVsockRx(vsock_dev: *vsock.Vsock, transport: *mmio.Transport, ram: guestm
         transport.interrupt_status |= 1;
         try hvf.check(hvf.hv_gic_set_spi(board.virtioDeviceIntid(transport_index), true), "raise vsock spi");
     }
+}
+
+fn wakeNetworkVcpu(context: ?*anyopaque) void {
+    const vcpu: *hvf.VcpuHandle = @ptrCast(@alignCast(context orelse return));
+    _ = hvf.hv_vcpus_exit(@ptrCast(vcpu), 1);
 }
 
 /// Drain pending bytes from non-blocking stdin into the console rx queue.

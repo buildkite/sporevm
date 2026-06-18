@@ -94,6 +94,8 @@ pub fn main(init: std.process.Init) !void {
         try sporevm.lifecycle.lsCli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "monitor")) {
         try sporevm.monitor.cli(init, command_args, stdout);
+    } else if (std.mem.eql(u8, command, "netd")) {
+        try sporevm.spore_netd.cli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "version")) {
         try stdout.print("spore {s}\n", .{sporevm.version});
     } else if (std.mem.eql(u8, command, "host-info")) {

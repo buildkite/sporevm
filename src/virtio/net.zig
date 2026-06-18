@@ -27,6 +27,35 @@ pub const Config = struct {
     backend: Backend = .{},
 };
 
+pub const Runtime = struct {
+    backend: Backend = .{},
+    context: ?*anyopaque = null,
+    failedFn: *const fn (?*anyopaque) bool = healthy,
+    setWakeFn: *const fn (?*anyopaque, Wake) void = ignoreWake,
+    clearWakeFn: *const fn (?*anyopaque) void = ignoreClearWake,
+
+    pub fn failed(self: Runtime) bool {
+        return self.failedFn(self.context);
+    }
+
+    pub fn setWake(self: Runtime, wake: Wake) void {
+        self.setWakeFn(self.context, wake);
+    }
+
+    pub fn clearWake(self: Runtime) void {
+        self.clearWakeFn(self.context);
+    }
+};
+
+pub const Wake = struct {
+    context: ?*anyopaque = null,
+    wakeFn: *const fn (?*anyopaque) void = noopWake,
+
+    pub fn wake(self: Wake) void {
+        self.wakeFn(self.context);
+    }
+};
+
 pub const Backend = struct {
     context: ?*anyopaque = null,
     /// Receives one complete Ethernet frame. The frame slice is only valid for
@@ -164,6 +193,12 @@ fn noRx(_: ?*anyopaque) ?[]const u8 {
     return null;
 }
 fn noop(_: ?*anyopaque) void {}
+fn healthy(_: ?*anyopaque) bool {
+    return false;
+}
+fn noopWake(_: ?*anyopaque) void {}
+fn ignoreWake(_: ?*anyopaque, _: Wake) void {}
+fn ignoreClearWake(_: ?*anyopaque) void {}
 
 fn txFrameFromChain(chain: *const queue.Chain, out: *[max_frame_len]u8) ?[]const u8 {
     const total = chain.readableLen();

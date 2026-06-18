@@ -168,12 +168,22 @@ avoid address allocation, DHCP, or multiple guests per virtual network.
   complete Ethernet frames, and backend RX frames can be injected into guest
   writable descriptors. The default backend remains closed, so this still does
   not provide host connectivity.
-- `src/hvf/vm.zig` and `src/kvm/vm.zig` both instantiate the current network
-  device with `net.Net.init(.{})` and no backend configuration.
+- `src/hvf/vm.zig` and `src/kvm/vm.zig` instantiate the network device with a
+  backend-neutral `net.Runtime`. The default runtime remains closed; `spore run
+  --net` supplies the helper-backed runtime.
 - `spore run` now accepts `--net`, records the requested SporeVM-managed
-  network capability in `run.Options`, and fails closed before asset resolution
-  unless the hidden development gate is set. Normal `spore run` invocations
-  still default to closed networking.
+  network capability in `run.Options`, starts the hidden `spore netd --stdio`
+  helper, waits for readiness before VM start, and fails the run if the helper
+  exits while networking is active. Normal `spore run` invocations still
+  default to closed networking.
+- `src/spore_netd.zig` implements the first helper skeleton: a bounded
+  little-endian length-prefixed Ethernet frame stream over inherited stdio fds,
+  debug frame logging, clean EOF shutdown, and ARP replies for the fixed gateway
+  MAC/IP. Frame bounds and ARP handling have unit and fuzz coverage. It does not
+  implement DNS, TCP, policy, or zmoltcp integration yet.
+- `src/net_gateway.zig` owns helper startup, stderr readiness, deterministic
+  shutdown, SIGPIPE-safe helper writes, and the parent-side virtio-net backend
+  adapter.
 - The minimal initrd agent listens on vsock and runs commands, but it does not
   configure `eth0`, routes, or `/etc/resolv.conf`.
 - `SECURITY.md` already treats virtqueue descriptors and device request headers
@@ -198,7 +208,8 @@ avoid address allocation, DHCP, or multiple guests per virtual network.
 
 ### Slice 1: Explicit Closed Networking Contract
 
-Status: landed in the Slice 1 branch.
+Status: landed in the Slice 1 branch; the temporary development gate was
+removed when the Slice 3 helper startup path landed.
 
 Add the `--net` CLI option and plumb it through `run.Options`, but keep it
 failing closed with a clear "not implemented" error unless an internal
@@ -229,6 +240,8 @@ Definition of done:
   net headers, oversized frames, queue exhaustion, and reset/shutdown behavior.
 
 ### Slice 3: `spore-netd` Skeleton
+
+Status: landed in the Slice 3 branch.
 
 Add a small helper binary or internal subcommand that speaks the frame protocol
 over a Unix socket or inherited fd. At this slice it only logs frames, answers

@@ -1,0 +1,297 @@
+//! Parent-side `spore-netd` process adapter.
+//!
+//! The VMM still owns virtio-net queues. This adapter translates the internal
+//! Ethernet frame backend into the helper's length-prefixed stdio frame stream.
+
+const std = @import("std");
+const Io = std.Io;
+
+const spore_netd = @import("spore_netd.zig");
+const virtio_net = @import("virtio/net.zig");
+
+const ready_timeout_ms = 1_000;
+const immediate_rx_timeout_ms = 10;
+
+pub const StartError = error{
+    NetdSpawnFailed,
+    NetdReadyTimedOut,
+    NetdReadyFailed,
+    NetdThreadFailed,
+} || std.mem.Allocator.Error;
+
+pub const Process = struct {
+    child: std.process.Child = undefined,
+    to_child_fd: std.c.fd_t = -1,
+    from_child_fd: std.c.fd_t = -1,
+    stderr_fd: std.c.fd_t = -1,
+    stderr_thread: ?std.Thread = null,
+    wait_thread: ?std.Thread = null,
+    failed: std.atomic.Value(bool) = .init(false),
+    shutdown_requested: std.atomic.Value(bool) = .init(false),
+    wake_lock: SpinLock = .{},
+    wake: virtio_net.Wake = .{},
+    link_closed: bool = false,
+    rx_pending: bool = false,
+    rx_len: usize = 0,
+    rx_buf: [virtio_net.max_frame_len]u8 = undefined,
+
+    pub fn start(self: *Process, init: std.process.Init, allocator: std.mem.Allocator) StartError!void {
+        self.* = .{};
+        ignoreSigpipe();
+        const args = init.minimal.args.toSlice(allocator) catch return error.NetdSpawnFailed;
+        const argv = allocator.dupe([]const u8, &.{ args[0], "netd", "--stdio" }) catch return error.OutOfMemory;
+        const child = std.process.spawn(init.io, .{
+            .argv = argv,
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .pipe,
+        }) catch return error.NetdSpawnFailed;
+
+        self.child = child;
+        self.to_child_fd = child.stdin.?.handle;
+        self.from_child_fd = child.stdout.?.handle;
+        self.stderr_fd = child.stderr.?.handle;
+        self.child.stdin = null;
+        self.child.stdout = null;
+        self.child.stderr = null;
+
+        waitReady(self.stderr_fd) catch |err| {
+            self.child.kill(init.io);
+            closeIfOpen(&self.to_child_fd);
+            closeIfOpen(&self.from_child_fd);
+            closeIfOpen(&self.stderr_fd);
+            return switch (err) {
+                error.NetdReadyTimedOut => error.NetdReadyTimedOut,
+                else => error.NetdReadyFailed,
+            };
+        };
+
+        self.stderr_thread = std.Thread.spawn(.{}, drainStderr, .{self}) catch {
+            self.child.kill(init.io);
+            closeIfOpen(&self.to_child_fd);
+            closeIfOpen(&self.from_child_fd);
+            closeIfOpen(&self.stderr_fd);
+            return error.NetdThreadFailed;
+        };
+        self.wait_thread = std.Thread.spawn(.{}, waitChild, .{ self, init.io }) catch {
+            self.child.kill(init.io);
+            if (self.stderr_thread) |thread| thread.join();
+            closeIfOpen(&self.to_child_fd);
+            closeIfOpen(&self.from_child_fd);
+            return error.NetdThreadFailed;
+        };
+    }
+
+    pub fn runtime(self: *Process) virtio_net.Runtime {
+        return .{
+            .backend = self.backend(),
+            .context = self,
+            .failedFn = failedRuntime,
+            .setWakeFn = setWake,
+            .clearWakeFn = clearWake,
+        };
+    }
+
+    pub fn deinit(self: *Process) void {
+        self.shutdown();
+        closeIfOpen(&self.from_child_fd);
+        if (self.stderr_thread) |thread| {
+            thread.join();
+            self.stderr_thread = null;
+        }
+        if (self.wait_thread) |thread| {
+            thread.join();
+            self.wait_thread = null;
+        }
+    }
+
+    pub fn hasFailed(self: *const Process) bool {
+        return self.failed.load(.acquire);
+    }
+
+    fn backend(self: *Process) virtio_net.Backend {
+        return .{
+            .context = self,
+            .transmitFn = transmit,
+            .peekRxFn = peekRx,
+            .consumeRxFn = consumeRx,
+            .resetFn = reset,
+            .shutdownFn = shutdownBackend,
+        };
+    }
+
+    fn shutdown(self: *Process) void {
+        if (self.link_closed) return;
+        self.shutdown_requested.store(true, .release);
+        closeIfOpen(&self.to_child_fd);
+        self.link_closed = true;
+    }
+
+    fn markFailed(self: *Process) void {
+        self.failed.store(true, .release);
+        self.wakeGuest();
+    }
+
+    fn wakeGuest(self: *Process) void {
+        self.wake_lock.lock();
+        const wake = self.wake;
+        self.wake_lock.unlock();
+        wake.wake();
+    }
+
+    fn drainImmediateRx(self: *Process, timeout_ms: i32) void {
+        if (self.rx_pending or self.from_child_fd < 0 or self.hasFailed()) return;
+        var fds = [_]std.posix.pollfd{.{
+            .fd = self.from_child_fd,
+            .events = std.c.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = std.posix.poll(&fds, timeout_ms) catch {
+            self.markFailed();
+            return;
+        };
+        if (ready == 0) return;
+        if ((fds[0].revents & (std.c.POLL.ERR | std.c.POLL.NVAL)) != 0) {
+            self.markFailed();
+            return;
+        }
+        if ((fds[0].revents & (std.c.POLL.IN | std.c.POLL.HUP)) == 0) return;
+
+        const frame = spore_netd.readFrameFd(self.from_child_fd, &self.rx_buf) catch {
+            self.markFailed();
+            return;
+        };
+        self.rx_len = frame.len;
+        self.rx_pending = true;
+    }
+
+    fn transmit(ctx: ?*anyopaque, frame: []const u8) void {
+        const self: *Process = @ptrCast(@alignCast(ctx.?));
+        if (self.hasFailed() or self.link_closed) return;
+        spore_netd.writeFrameFd(self.to_child_fd, frame) catch {
+            self.markFailed();
+            return;
+        };
+        self.drainImmediateRx(immediate_rx_timeout_ms);
+    }
+
+    fn peekRx(ctx: ?*anyopaque) ?[]const u8 {
+        const self: *Process = @ptrCast(@alignCast(ctx.?));
+        self.drainImmediateRx(0);
+        if (!self.rx_pending) return null;
+        return self.rx_buf[0..self.rx_len];
+    }
+
+    fn consumeRx(ctx: ?*anyopaque) void {
+        const self: *Process = @ptrCast(@alignCast(ctx.?));
+        self.rx_pending = false;
+        self.rx_len = 0;
+    }
+
+    fn reset(ctx: ?*anyopaque) void {
+        const self: *Process = @ptrCast(@alignCast(ctx.?));
+        self.rx_pending = false;
+        self.rx_len = 0;
+    }
+
+    fn shutdownBackend(ctx: ?*anyopaque) void {
+        const self: *Process = @ptrCast(@alignCast(ctx.?));
+        self.shutdown();
+    }
+
+    fn failedRuntime(ctx: ?*anyopaque) bool {
+        const self: *Process = @ptrCast(@alignCast(ctx.?));
+        return self.hasFailed();
+    }
+
+    fn setWake(ctx: ?*anyopaque, wake: virtio_net.Wake) void {
+        const self: *Process = @ptrCast(@alignCast(ctx.?));
+        self.wake_lock.lock();
+        defer self.wake_lock.unlock();
+        self.wake = wake;
+    }
+
+    fn clearWake(ctx: ?*anyopaque) void {
+        const self: *Process = @ptrCast(@alignCast(ctx.?));
+        self.wake_lock.lock();
+        defer self.wake_lock.unlock();
+        self.wake = .{};
+    }
+};
+
+const SpinLock = struct {
+    locked: std.atomic.Value(bool) = .init(false),
+
+    fn lock(self: *SpinLock) void {
+        while (self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+            std.Thread.yield() catch {};
+        }
+    }
+
+    fn unlock(self: *SpinLock) void {
+        self.locked.store(false, .release);
+    }
+};
+
+fn waitReady(fd: std.c.fd_t) error{ NetdReadyTimedOut, NetdReadyFailed }!void {
+    var line: [64]u8 = undefined;
+    var len: usize = 0;
+    while (len < line.len) {
+        var fds = [_]std.posix.pollfd{.{
+            .fd = fd,
+            .events = std.c.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = std.posix.poll(&fds, ready_timeout_ms) catch return error.NetdReadyFailed;
+        if (ready == 0) return error.NetdReadyTimedOut;
+        if ((fds[0].revents & (std.c.POLL.ERR | std.c.POLL.NVAL)) != 0) return error.NetdReadyFailed;
+
+        var byte: [1]u8 = undefined;
+        const n = std.posix.read(fd, &byte) catch return error.NetdReadyFailed;
+        if (n == 0) return error.NetdReadyFailed;
+        if (byte[0] == '\n') {
+            if (std.mem.eql(u8, line[0..len], "ready")) return;
+            len = 0;
+            continue;
+        }
+        line[len] = byte[0];
+        len += 1;
+    }
+    return error.NetdReadyFailed;
+}
+
+fn drainStderr(self: *Process) void {
+    var buf: [256]u8 = undefined;
+    while (true) {
+        const n = std.posix.read(self.stderr_fd, &buf) catch break;
+        if (n == 0) break;
+    }
+    closeIfOpen(&self.stderr_fd);
+}
+
+fn waitChild(self: *Process, io: Io) void {
+    const term = self.child.wait(io) catch {
+        self.markFailed();
+        return;
+    };
+    if (!self.shutdown_requested.load(.acquire)) {
+        std.log.err("spore-netd exited during run: {}", .{term});
+        self.markFailed();
+    }
+}
+
+fn closeIfOpen(fd: *std.c.fd_t) void {
+    if (fd.* >= 0) {
+        _ = std.c.close(fd.*);
+        fd.* = -1;
+    }
+}
+
+fn ignoreSigpipe() void {
+    const action = std.posix.Sigaction{
+        .handler = .{ .handler = std.c.SIG.IGN },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.PIPE, &action, null);
+}

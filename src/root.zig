@@ -24,6 +24,7 @@ pub const guestmem = @import("guestmem.zig");
 pub const lifecycle = @import("lifecycle.zig");
 pub const local_paths = @import("local_paths.zig");
 pub const monitor = @import("monitor.zig");
+pub const net_gateway = @import("net_gateway.zig");
 pub const platform = @import("platform.zig");
 const dirty_ram = @import("dirty_ram.zig");
 pub const hvf = @import("hvf/hvf.zig");
@@ -31,6 +32,7 @@ pub const resume_cmd = @import("resume.zig");
 pub const rootfs = @import("rootfs.zig");
 pub const rootfs_cache = @import("rootfs_cache.zig");
 pub const run = @import("run.zig");
+pub const spore_netd = @import("spore_netd.zig");
 pub const spore = @import("spore.zig");
 pub const kvm = if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)
     @import("kvm/kvm.zig")
@@ -61,11 +63,13 @@ test {
     testing.refAllDecls(lifecycle);
     testing.refAllDecls(local_paths);
     testing.refAllDecls(monitor);
+    testing.refAllDecls(net_gateway);
     testing.refAllDecls(platform);
     testing.refAllDecls(dirty_ram);
     testing.refAllDecls(resume_cmd);
     testing.refAllDecls(rootfs_cache);
     testing.refAllDecls(run);
+    testing.refAllDecls(spore_netd);
     testing.refAllDecls(virtio.queue);
     testing.refAllDecls(virtio.mmio);
     testing.refAllDecls(virtio.console);

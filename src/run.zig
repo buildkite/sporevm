@@ -12,10 +12,12 @@ const kvm = if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)
 else
     struct {};
 const local_paths = @import("local_paths.zig");
+const net_gateway = @import("net_gateway.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_mod = @import("rootfs.zig");
 const spore = @import("spore.zig");
 const virtio_blk = @import("virtio/blk.zig");
+const virtio_net = @import("virtio/net.zig");
 const vsock = @import("virtio/vsock.zig");
 
 const max_file_size = 256 * 1024 * 1024;
@@ -171,8 +173,7 @@ const cli_usage =
     \\  --from DIR              Resume from an existing spore, then run argv
     \\  --rootfs rootfs.ext4    Attach rootfs image read-only as virtio-blk
     \\  --image REF             Build or reuse cached OCI rootfs, then run from it
-    \\  --net                   Experimental SporeVM-managed networking; disabled
-    \\                          until the spore-netd gateway lands
+    \\  --net                   Experimental SporeVM-managed networking
     \\  --capture DIR           Snapshot to DIR; defaults to --capture-on EXIT
     \\  --capture-on WHEN       Capture trigger: EXIT, INT, TERM, HUP, USR1, or USR2
     \\  --continue-after-capture
@@ -200,6 +201,10 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
 
     const result = execute(init, arena, opts) catch |err| {
         if (isCaptureAborted(err)) std.process.exit(130);
+        if (isNetworkGatewayError(err)) {
+            printNetworkGatewayError(err);
+            std.process.exit(1);
+        }
         return err;
     };
     if (result.captured) {
@@ -1141,6 +1146,15 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     if (opts.vcpus != 1) return error.UnsupportedVcpuCount;
 
     const backend = try resolveBackend(opts.backend);
+    var gateway: net_gateway.Process = undefined;
+    var gateway_active = false;
+    if (opts.network == .spore) {
+        try gateway.start(init, allocator);
+        gateway_active = true;
+    }
+    defer if (gateway_active) gateway.deinit();
+    const network: virtio_net.Runtime = if (gateway_active) gateway.runtime() else .{};
+
     const resuming = opts.resume_dir != null;
     const kernel = if (resuming) "" else try std.Io.Dir.cwd().readFileAlloc(init.io, opts.kernel_path, allocator, .limited(max_file_size));
     const initrd: ?[]const u8 = if (resuming) null else try std.Io.Dir.cwd().readFileAlloc(init.io, opts.initrd_path, allocator, .limited(max_file_size));
@@ -1181,6 +1195,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .snapshot_on_probe_complete = exit_capture,
                 .capture_request = capture_request_ptr,
                 .continue_after_capture = opts.continue_after_capture,
+                .network = network,
             });
         },
         .kvm => blk: {
@@ -1200,6 +1215,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .snapshot_on_probe_complete = exit_capture,
                 .capture_request = capture_request_ptr,
                 .continue_after_capture = opts.continue_after_capture,
+                .network = network,
             });
         },
     }) catch |err| {
@@ -1208,6 +1224,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
         }
         return err;
     };
+    if (gateway_active and gateway.hasFailed()) return error.NetworkGatewayFailed;
     const signal_capture_observed = signal_capture and capture_request.isCompleted();
     return switch (cause) {
         .probe_complete => resultFromStream(backend, opts, &stream, signal_capture_observed),
@@ -1449,6 +1466,28 @@ fn isCaptureAborted(err: anyerror) bool {
     return std.mem.eql(u8, @errorName(err), "CaptureAborted");
 }
 
+fn isNetworkGatewayError(err: anyerror) bool {
+    return std.mem.eql(u8, @errorName(err), "NetdSpawnFailed") or
+        std.mem.eql(u8, @errorName(err), "NetdReadyTimedOut") or
+        std.mem.eql(u8, @errorName(err), "NetdReadyFailed") or
+        std.mem.eql(u8, @errorName(err), "NetdThreadFailed") or
+        std.mem.eql(u8, @errorName(err), "NetworkGatewayFailed");
+}
+
+fn printNetworkGatewayError(err: anyerror) void {
+    const message = if (std.mem.eql(u8, @errorName(err), "NetdSpawnFailed"))
+        "spore run: failed to start spore-netd"
+    else if (std.mem.eql(u8, @errorName(err), "NetdReadyTimedOut"))
+        "spore run: spore-netd did not become ready"
+    else if (std.mem.eql(u8, @errorName(err), "NetdReadyFailed"))
+        "spore run: spore-netd failed before ready"
+    else if (std.mem.eql(u8, @errorName(err), "NetdThreadFailed"))
+        "spore run: failed to monitor spore-netd"
+    else
+        "spore run: spore-netd exited during run";
+    std.debug.print("{s}\n", .{message});
+}
+
 fn parsePositive(comptime T: type, name: []const u8, raw: []const u8) !T {
     const parsed = std.fmt.parseInt(T, raw, 10) catch {
         std.debug.print("{s} must be a positive integer\n", .{name});
@@ -1602,6 +1641,15 @@ test "run cli parser accepts net flag" {
     try std.testing.expectEqual(NetworkMode.spore, opts.network);
     try std.testing.expectEqual(@as(usize, 1), opts.command.len);
     try std.testing.expectEqualStrings("/bin/true", opts.command[0]);
+}
+
+test "run network gateway errors are reported clearly" {
+    try std.testing.expect(isNetworkGatewayError(error.NetdSpawnFailed));
+    try std.testing.expect(isNetworkGatewayError(error.NetdReadyTimedOut));
+    try std.testing.expect(isNetworkGatewayError(error.NetdReadyFailed));
+    try std.testing.expect(isNetworkGatewayError(error.NetdThreadFailed));
+    try std.testing.expect(isNetworkGatewayError(error.NetworkGatewayFailed));
+    try std.testing.expect(!isNetworkGatewayError(error.UnsupportedBackend));
 }
 
 test "run cli parser accepts capture flags" {

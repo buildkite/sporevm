@@ -68,6 +68,8 @@ pub const Config = struct {
     exec_probe_timeout_ms: u64 = 30_000,
     exec_probe_completes_run: bool = true,
     exec_probe_failure_fatal: bool = true,
+    /// Optional virtio-net frame backend. The default remains closed.
+    network: net.Runtime = .{},
 };
 
 pub const DirtyTrackingOptions = struct {
@@ -178,7 +180,8 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
 
     var con = console.Console{ .sink = config.console_sink };
     var blk_dev: blk.Blk = undefined;
-    var net_dev = net.Net.init(.{});
+    var net_dev = net.Net.init(.{ .backend = config.network.backend });
+    defer net_dev.shutdown();
     var rng_dev = rng.Rng{};
     var vsock_dev = vsock.Vsock.init(.{});
     var gen_dev = generation.Device{};
@@ -307,6 +310,8 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     if (config.capture_request) |request_capture| {
         request_capture.setWake(wakeKvmRun, &capture_wake);
     }
+    config.network.setWake(.{ .context = &capture_wake, .wakeFn = wakeNetworkKvmRun });
+    defer config.network.clearWake();
     defer if (config.capture_request) |request_capture| request_capture.clearWake();
 
     const start_ms = try monotonicMs();
@@ -335,6 +340,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     var pending_kvm_completion = false;
     var did_capture_request = false;
     while (true) {
+        if (config.network.failed()) return error.NetworkGatewayFailed;
         if (config.capture_request) |request_capture| {
             if (request_capture.isAbortRequested()) return error.CaptureAborted;
             if (request_capture.isRequested() and !did_capture_request) {
@@ -407,6 +413,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         switch (try kvm.runVcpu(vcpu_fd)) {
             .completed => {
                 if (consumeCaptureWake(config.capture_request, run_bytes)) continue;
+                if (config.network.failed()) continue;
                 pending_kvm_completion = false;
             },
             .interrupted => {
@@ -414,6 +421,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                 if (config.capture_request) |request_capture| {
                     if (request_capture.isRequested() or request_capture.isAbortRequested()) continue;
                 }
+                if (config.network.failed()) continue;
                 std.log.err("KVM_RUN interrupted without a pending capture request", .{});
                 return error.KvmIoctlFailed;
             },
@@ -443,6 +451,11 @@ const KvmCaptureWake = struct {
 };
 
 fn wakeKvmRun(context: ?*anyopaque) callconv(.c) void {
+    const wake: *KvmCaptureWake = @ptrCast(@alignCast(context orelse return));
+    wake.run[kvm.RunLayout.immediate_exit] = 1;
+}
+
+fn wakeNetworkKvmRun(context: ?*anyopaque) void {
     const wake: *KvmCaptureWake = @ptrCast(@alignCast(context orelse return));
     wake.run[kvm.RunLayout.immediate_exit] = 1;
 }
