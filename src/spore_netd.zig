@@ -1,8 +1,8 @@
 //! Minimal `spore-netd` helper.
 //!
 //! The helper owns a bounded Ethernet frame stream, ARP replies for the fixed
-//! gateway address, and the first narrow DNS proxy path. TCP, policy, and
-//! zmoltcp integration land in later slices.
+//! gateway address, and the first narrow DNS proxy path. TCP relay and policy
+//! land in later slices.
 
 const std = @import("std");
 const Io = std.Io;

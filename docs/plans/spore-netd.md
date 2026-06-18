@@ -8,6 +8,8 @@ spec_refs:
   - https://github.com/lox/zmoltcp/pull/1
   - /Users/lachlan/Develop/zmoltcp/src/stack.zig
   - /Users/lachlan/Develop/zmoltcp/src/socket/tcp.zig
+  - build.zig.zon
+  - src/zmoltcp_gateway.zig
   - src/virtio/net.zig
   - src/run.zig
   - src/hvf/vm.zig
@@ -62,8 +64,8 @@ instead own the virtual link boundary and keep the gateway backend-neutral.
 - Keep the public contract backend-neutral across KVM and HVF.
 - Keep the VMM responsible for virtio queues and raw Ethernet frames only.
 - Put DNS, TCP proxying, policy, logging, and flow lifetime in `spore-netd`.
-- Use `lox/zmoltcp` as the bounded guest-facing ARP/IPv4/TCP engine once its
-  generic TCP forwarder support exists.
+- Use the pinned `lox/zmoltcp` dependency as the bounded guest-facing
+  ARP/IPv4/TCP engine.
 - Fail closed when networking is requested but unsupported, partially started,
   or policy cannot be enforced.
 - Preserve the frozen device model: this activates the existing virtio-net
@@ -133,8 +135,7 @@ avoid address allocation, DHCP, or multiple guests per virtual network.
 - `src/virtio/net.zig` owns virtio-net feature negotiation, config space,
   descriptor parsing, RX/TX queue movement, interrupts, backpressure, and
   translating guest-visible packets into complete Ethernet frames.
-- `lox/zmoltcp` owns the guest-facing ARP/IPv4/TCP state machine after it is
-  imported into the SporeVM build.
+- `lox/zmoltcp` owns the guest-facing ARP/IPv4/TCP state machine.
 - `spore-netd` owns the adapter around `zmoltcp`, DNS forwarding, egress policy
   checks, host socket creation, flow lifetime, timeouts, logging, and shutdown.
 - `src/run.zig` owns the user-facing `--net` option, helper startup, boot args,
@@ -181,7 +182,7 @@ avoid address allocation, DHCP, or multiple guests per virtual network.
   shutdown, ARP replies for the fixed gateway MAC/IP, and narrow IPv4 UDP/53 DNS
   proxying through the host resolver. Frame bounds, ARP handling, IPv4/UDP DNS
   dispatch, DNS name parsing, and malformed DNS handling have unit and fuzz
-  coverage. It does not implement TCP, policy, or zmoltcp integration yet.
+  coverage. It does not implement TCP relay or policy yet.
 - `src/net_gateway.zig` owns helper startup, stderr readiness, deterministic
   shutdown, SIGPIPE-safe helper writes, and the parent-side virtio-net backend
   adapter. Helper RX frames wake the hypervisor loop, which explicitly flushes
@@ -199,21 +200,14 @@ avoid address allocation, DHCP, or multiple guests per virtual network.
   the host-side proxy and receive IPv4 answers.
 - `SECURITY.md` already treats virtqueue descriptors and device request headers
   as guest-controlled attack surface requiring fuzz targets.
-- The local `lox/zmoltcp` fork exists at `/Users/lachlan/Develop/zmoltcp`. A
-  spike proved local gateway TCP relay, first-frame retransmit recovery, and
-  malformed short-frame dropping. That spike found the missing primitive:
-  public-destination egress needed a non-local IPv4 TCP forwarder hook because
-  ingress dropped packets unless the destination IP was configured locally.
-- `lox/zmoltcp` PR #1 adds the generic IPv4 TCP forwarder API on branch
-  `lox/tcp-forwarder` at commit `2295c9a6b56edf41a6cd99f4232430b56fff2a8c`.
-  SporeVM has not pinned or imported that fork yet; that remains Slice 6.
-
-  ```text
-  local gateway TCP relay: ok iterations=8 c2g_tcp=7 g2c_tcp=6
-  first TCP frame loss/retransmit: ok iterations=9 dropped=1 c2g_tcp=8 g2c_tcp=6
-  malformed short frame: dropped without response/crash
-  public destination via gateway MAC: not delivered iterations=1500 public_tcp_seen=900 gateway_tcp_responses=0
-  ```
+- `build.zig.zon` now pins `lox/zmoltcp` at `v0.2.12`, which includes the
+  generic IPv4 TCP forwarder API from PR #1 and the follow-up parser validation
+  fixes. The dependency is wired into the `sporevm` module, and
+  `src/zmoltcp_gateway.zig` contains a compile-level contract test proving
+  SporeVM can build against the caller-owned forwarder surface.
+- The next missing piece is the SporeVM adapter: feeding guest Ethernet frames
+  into `zmoltcp`, accepting non-local TCP SYNs through the forwarder callback,
+  and relaying established payloads to bounded host sockets under policy.
 
 ## Delivery Strategy
 
@@ -297,7 +291,8 @@ Definition of done:
 
 ### Slice 6: `zmoltcp` TCP Forwarder Dependency
 
-Status: fork work active in `lox/zmoltcp` PR #1; not imported into SporeVM.
+Status: landed. `lox/zmoltcp` PR #1 is merged, SporeVM pins `v0.2.12`, and
+the SporeVM test suite compiles against the forwarder contract.
 
 Land or import a generic `zmoltcp` TCP-forwarder primitive that lets a
 user-mode gateway accept non-local IPv4 TCP SYNs carried in Ethernet frames
@@ -382,10 +377,10 @@ Definition of done:
 - Writing a SporeVM TCP/IP stack is too broad. The plan now uses the `lox/zmoltcp`
   Zig fork as the guest-facing stack and keeps SporeVM focused on the gateway
   adapter, host sockets, DNS, policy, and lifecycle.
-- The `zmoltcp` spike showed the exact missing primitive: local gateway TCP
-  relay works, but public-destination egress needs a non-local IPv4 TCP
-  forwarder hook because current ingress filters packets to locally configured
-  IPs before TCP sockets see them.
+- The `zmoltcp` spike showed the exact missing primitive before PR #1 landed:
+  local gateway TCP relay worked, but public-destination egress needed a
+  non-local IPv4 TCP forwarder hook because ingress filtered packets to locally
+  configured IPs before TCP sockets saw them.
 - Pulling in libslirp/libvdeslirp would speed a prototype but make the build and
   license story more complex. This plan keeps C networking engines out of the
   core path while accepting a Zig source dependency that we can fix upstream.
@@ -400,8 +395,8 @@ Definition of done:
 
 - Build a minimal SporeVM-owned `spore-netd` instead of making libvdeslirp the
   core backend.
-- Use the `lox/zmoltcp` fork as the guest-facing ARP/IPv4/TCP engine once the
-  required generic TCP-forwarder API lands.
+- Use the pinned `lox/zmoltcp` dependency as the guest-facing ARP/IPv4/TCP
+  engine now that the required generic TCP-forwarder API has landed.
 - Contribute the TCP-forwarder primitive in `zmoltcp` as generic gateway support:
   no SporeVM host sockets, DNS, lifecycle, policy, or observability in that
   library.

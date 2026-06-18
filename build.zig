@@ -13,6 +13,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .link_libc = true,
     });
+    const zmoltcp_dep = b.dependency("zmoltcp", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    mod.addImport("zmoltcp", zmoltcp_dep.module("zmoltcp"));
     if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64) {
         mod.linkFramework("Hypervisor", .{});
     }
