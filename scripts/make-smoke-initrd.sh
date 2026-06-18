@@ -16,9 +16,8 @@ Modes:
           tracking pressure benchmarks
 
 Environment:
-  CC   C compiler command to use (default: cc). May include simple arguments,
-       for example: CC="zig cc -target aarch64-linux-musl". Must produce an
-       aarch64 static binary for the current guest profile.
+  CC   C compiler command. Defaults to `zig cc -target aarch64-linux-musl`
+       when zig is available, otherwise `cc`. May include simple arguments.
 EOF
 }
 
@@ -41,7 +40,20 @@ case "${mode}" in
 esac
 
 out="$1"
-read -r -a cc_cmd <<<"${CC:-cc}"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "${script_dir}/.." && pwd)"
+if [[ -f "${repo_root}/mise.toml" ]]; then
+  export MISE_TRUSTED_CONFIG_PATHS="${MISE_TRUSTED_CONFIG_PATHS:-${repo_root}/mise.toml}"
+fi
+if [[ -n "${CC:-}" ]]; then
+  read -r -a cc_cmd <<<"${CC}"
+elif command -v zig >/dev/null 2>&1; then
+  cc_cmd=(zig cc -target aarch64-linux-musl)
+elif command -v mise >/dev/null 2>&1; then
+  cc_cmd=(mise exec -- zig cc -target aarch64-linux-musl)
+else
+  cc_cmd=(cc)
+fi
 workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-smoke-initrd.XXXXXX")"
 trap 'rm -rf "${workdir}"' EXIT
 
