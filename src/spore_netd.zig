@@ -263,8 +263,7 @@ fn dnsReply(frame: []const u8, out: *[max_frame_len]u8, dns_forwarder: DnsForwar
         if (!validDnsResponse(request.payload, response)) break :valid buildDnsServfail(request.payload, request.question_end, &response_buf);
         if (policy) |policy_runtime| _ = policy_runtime.noteDnsResponse(request.payload, response);
         break :valid response;
-    } else
-        buildDnsServfail(request.payload, request.question_end, &response_buf);
+    } else buildDnsServfail(request.payload, request.question_end, &response_buf);
 
     return buildDnsUdpFrame(request, dns_payload, out);
 }

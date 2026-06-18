@@ -433,7 +433,7 @@ test "spore-net policy DNS rebinding answers cannot override hard floor" {
     var query_buf: [512]u8 = undefined;
     const query = testDnsQuery(0x1234, "example.com", &query_buf);
     var response_buf: [512]u8 = undefined;
-    const response = testDnsResponse(query, "*", &.{.{ 169, 254, 169, 254 }, .{ 93, 184, 216, 34 }}, &response_buf);
+    const response = testDnsResponse(query, "*", &.{ .{ 169, 254, 169, 254 }, .{ 93, 184, 216, 34 } }, &response_buf);
     try std.testing.expectEqual(@as(usize, 2), policy.noteDnsResponse(query, response));
     try std.testing.expectEqual(Decision.deny_hard_floor, policy.decideIpv4(.{ 169, 254, 169, 254 }));
     try std.testing.expectEqual(Decision.allow, policy.decideIpv4(.{ 93, 184, 216, 34 }));
