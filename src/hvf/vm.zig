@@ -411,6 +411,11 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             }
         }
         if (config.network.failed()) return error.NetworkGatewayFailed;
+        if (config.network.consumeWake()) {
+            const pager: ?*lazy_ram.Pager = if (lazy_pager) |*p| p else null;
+            try flushNetworkRxHvf(&net_dev, &transports_buf[net_transport_index], ram, pager, net_transport_index);
+            continue;
+        }
         if (config.exec_control) |control| {
             switch (try control.poll(&vsock_dev)) {
                 .keep_running => {},
