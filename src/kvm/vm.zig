@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const linux = std.os.linux;
+const posix = std.posix;
 const capture = @import("../capture.zig");
 const dirty_ram = @import("../dirty_ram.zig");
 const kvm = @import("kvm.zig");
@@ -309,11 +310,17 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         0,
     );
     defer std.posix.munmap(run_bytes);
-    var capture_wake = KvmCaptureWake{ .run = run_bytes };
+    var network_wake_signal = KvmNetworkWakeSignal.install();
+    defer network_wake_signal.deinit();
+    var run_wake = KvmRunWake{
+        .run = run_bytes,
+        .process_id = linux.getpid(),
+        .thread_id = linux.gettid(),
+    };
     if (config.capture_request) |request_capture| {
-        request_capture.setWake(wakeKvmRun, &capture_wake);
+        request_capture.setWake(wakeKvmRun, &run_wake);
     }
-    config.network.setWake(.{ .context = &capture_wake, .wakeFn = wakeNetworkKvmRun });
+    config.network.setWake(.{ .context = &run_wake, .wakeFn = wakeNetworkKvmRun });
     defer config.network.clearWake();
     defer if (config.capture_request) |request_capture| request_capture.clearWake();
 
@@ -458,18 +465,54 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     }
 }
 
-const KvmCaptureWake = struct {
+const kvm_network_wake_signal = posix.SIG.URG;
+
+const KvmRunWake = struct {
     run: []u8,
+    process_id: linux.pid_t,
+    thread_id: linux.pid_t,
+
+    fn wakeNetwork(self: *KvmRunWake) void {
+        self.run[kvm.RunLayout.immediate_exit] = 1;
+        _ = linux.tgkill(self.process_id, self.thread_id, kvm_network_wake_signal);
+    }
+};
+
+const KvmNetworkWakeSignal = struct {
+    old_action: posix.Sigaction,
+    active: bool = false,
+
+    fn install() KvmNetworkWakeSignal {
+        var old_action: posix.Sigaction = undefined;
+        const action = posix.Sigaction{
+            .handler = .{ .sigaction = handleKvmNetworkWakeSignal },
+            .mask = posix.sigemptyset(),
+            .flags = posix.SA.SIGINFO,
+        };
+        posix.sigaction(kvm_network_wake_signal, &action, &old_action);
+        return .{ .old_action = old_action, .active = true };
+    }
+
+    fn deinit(self: *KvmNetworkWakeSignal) void {
+        if (!self.active) return;
+        posix.sigaction(kvm_network_wake_signal, &self.old_action, null);
+        self.active = false;
+    }
 };
 
 fn wakeKvmRun(context: ?*anyopaque) callconv(.c) void {
-    const wake: *KvmCaptureWake = @ptrCast(@alignCast(context orelse return));
+    const wake: *KvmRunWake = @ptrCast(@alignCast(context orelse return));
     wake.run[kvm.RunLayout.immediate_exit] = 1;
 }
 
 fn wakeNetworkKvmRun(context: ?*anyopaque) void {
-    const wake: *KvmCaptureWake = @ptrCast(@alignCast(context orelse return));
-    wake.run[kvm.RunLayout.immediate_exit] = 1;
+    const wake: *KvmRunWake = @ptrCast(@alignCast(context orelse return));
+    wake.wakeNetwork();
+}
+
+fn handleKvmNetworkWakeSignal(_: posix.SIG, _: *const posix.siginfo_t, _: ?*anyopaque) callconv(.c) void {
+    // Empty handler: the signal exists only to interrupt KVM_RUN after
+    // `immediate_exit` is set by a helper thread.
 }
 
 fn flushNetworkRxKvm(
