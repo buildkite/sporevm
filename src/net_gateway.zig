@@ -11,6 +11,7 @@ const spore_netd = @import("spore_netd.zig");
 const virtio_net = @import("virtio/net.zig");
 
 const ready_timeout_ms = 1_000;
+const max_rx_pending = 16;
 
 pub const StartError = error{
     NetdSpawnFailed,
@@ -34,9 +35,10 @@ pub const Process = struct {
     wake: virtio_net.Wake = .{},
     rx_lock: SpinLock = .{},
     link_closed: bool = false,
-    rx_pending: bool = false,
-    rx_len: usize = 0,
-    rx_buf: [virtio_net.max_frame_len]u8 = undefined,
+    rx_head: usize = 0,
+    rx_count: usize = 0,
+    rx_lens: [max_rx_pending]usize = [_]usize{0} ** max_rx_pending,
+    rx_bufs: [max_rx_pending][virtio_net.max_frame_len]u8 = undefined,
 
     pub fn start(self: *Process, init: std.process.Init, allocator: std.mem.Allocator, policy: spore_net_policy.Config) StartError!void {
         self.* = .{};
@@ -181,24 +183,27 @@ pub const Process = struct {
         const self: *Process = @ptrCast(@alignCast(ctx.?));
         self.rx_lock.lock();
         defer self.rx_lock.unlock();
-        if (!self.rx_pending) return null;
-        return self.rx_buf[0..self.rx_len];
+        if (self.rx_count == 0) return null;
+        return self.rx_bufs[self.rx_head][0..self.rx_lens[self.rx_head]];
     }
 
     fn consumeRx(ctx: ?*anyopaque) void {
         const self: *Process = @ptrCast(@alignCast(ctx.?));
         self.rx_lock.lock();
         defer self.rx_lock.unlock();
-        self.rx_pending = false;
-        self.rx_len = 0;
+        if (self.rx_count == 0) return;
+        self.rx_lens[self.rx_head] = 0;
+        self.rx_head = (self.rx_head + 1) % max_rx_pending;
+        self.rx_count -= 1;
     }
 
     fn reset(ctx: ?*anyopaque) void {
         const self: *Process = @ptrCast(@alignCast(ctx.?));
         self.rx_lock.lock();
         defer self.rx_lock.unlock();
-        self.rx_pending = false;
-        self.rx_len = 0;
+        self.rx_head = 0;
+        self.rx_count = 0;
+        @memset(&self.rx_lens, 0);
     }
 
     fn shutdownBackend(ctx: ?*anyopaque) void {
@@ -228,6 +233,18 @@ pub const Process = struct {
         self.wake_lock.lock();
         defer self.wake_lock.unlock();
         self.wake = .{};
+    }
+
+    fn enqueueRxFrame(self: *Process, frame: []const u8) bool {
+        self.rx_lock.lock();
+        defer self.rx_lock.unlock();
+        if (self.rx_count >= max_rx_pending) return false;
+        const tail = (self.rx_head + self.rx_count) % max_rx_pending;
+        @memcpy(self.rx_bufs[tail][0..frame.len], frame);
+        self.rx_lens[tail] = frame.len;
+        self.rx_count += 1;
+        self.wake_pending.store(true, .release);
+        return true;
     }
 };
 
@@ -310,19 +327,11 @@ fn readStdout(self: *Process) void {
             },
         };
         std.log.debug("spore-net gateway rx frame len={d}", .{frame.len});
-        var should_wake = false;
-        self.rx_lock.lock();
-        if (!self.rx_pending) {
-            @memcpy(self.rx_buf[0..frame.len], frame);
-            self.rx_len = frame.len;
-            self.rx_pending = true;
-            self.wake_pending.store(true, .release);
-            should_wake = true;
+        if (self.enqueueRxFrame(frame)) {
+            self.wakeGuest();
         } else {
-            std.log.debug("spore-net gateway dropped rx frame len={d}: one-frame queue full", .{frame.len});
+            std.log.debug("spore-net gateway dropped rx frame len={d}: rx queue full", .{frame.len});
         }
-        self.rx_lock.unlock();
-        if (should_wake) self.wakeGuest();
     }
     if (!self.shutdown_requested.load(.acquire)) self.markFailed();
     closeIfOpen(&self.from_child_fd);
@@ -378,4 +387,27 @@ fn parentDebugEnabled(args: []const []const u8) bool {
 test "spore-net gateway detects parent global debug flag" {
     try std.testing.expect(parentDebugEnabled(&.{ "spore", "--debug", "run", "--net", "--", "/bin/true" }));
     try std.testing.expect(!parentDebugEnabled(&.{ "spore", "run", "--net", "--", "/bin/true" }));
+}
+
+test "spore-net gateway buffers multiple rx frames" {
+    var process = Process{};
+    try std.testing.expect(process.enqueueRxFrame("arp-reply"));
+    try std.testing.expect(process.enqueueRxFrame("dns-reply"));
+    try std.testing.expect(process.runtime().consumeWake());
+
+    const backend = process.backend();
+    try std.testing.expectEqualStrings("arp-reply", backend.peekRx().?);
+    backend.consumeRx();
+    try std.testing.expectEqualStrings("dns-reply", backend.peekRx().?);
+    backend.consumeRx();
+    try std.testing.expect(backend.peekRx() == null);
+}
+
+test "spore-net gateway drops rx frames only after queue capacity" {
+    var process = Process{};
+    var i: usize = 0;
+    while (i < max_rx_pending) : (i += 1) {
+        try std.testing.expect(process.enqueueRxFrame("frame"));
+    }
+    try std.testing.expect(!process.enqueueRxFrame("overflow"));
 }
