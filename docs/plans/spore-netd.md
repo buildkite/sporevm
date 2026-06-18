@@ -40,7 +40,9 @@ transport are implementation details.
 
 The first useful version should be deliberately narrow: IPv4, static guest
 configuration, ARP for the gateway, DNS UDP/53 proxying, outbound TCP proxying,
-and a hard default egress floor. Published ports, general UDP, IPv6, DHCP, and
+and a hard default egress floor. Captured spores now persist the requested
+network capability and allow policy so `spore run --from` can attach a fresh
+gateway under the same rules. Published ports, general UDP, IPv6, DHCP, and
 live-flow preservation across suspend/resume are later work.
 
 ## Problem
@@ -356,6 +358,8 @@ Definition of done:
 
 ### Slice 9: Lifecycle Integration
 
+Status: implemented in the Slice 9 branch.
+
 Define how networking behaves for capture, resume, fork, and named lifecycle.
 
 Definition of done:
@@ -380,6 +384,8 @@ Definition of done:
   `mise run smoke:run-net-http` covers the first outbound HTTP path with the
   minimal initrd `/bin/wget` helper.
   `mise run smoke:run-net-deny` covers hard-floor denial and debug visibility.
+  `mise run smoke:run-net-capture` covers manifest policy persistence and
+  fresh gateway reattachment through `spore run --from`.
 - Backend smokes: the same one-shot network smoke on HVF and KVM.
 - Regression checks: no behavior change for `spore run` without `--net`,
   capture without network, rootfs-backed run, and lifecycle commands.

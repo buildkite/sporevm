@@ -36,6 +36,8 @@ pub const Config = struct {
     disk_fd: ?std.c.fd_t = null,
     /// Immutable rootfs artifact metadata for disk-backed snapshots.
     rootfs: ?spore.Rootfs = null,
+    /// Requested network capability and policy metadata for snapshots.
+    network_manifest: ?spore.Network = null,
     /// Resume from a spore directory instead of booting the kernel.
     resume_dir: ?[]const u8 = null,
     /// Trusted same-host RAM backing fd supplied by the caller or future
@@ -350,7 +352,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     pending_kvm_completion = false;
                 }
                 const dir = config.snapshot_dir orelse return error.KvmIoctlFailed;
-                try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, config.rootfs, if (dirty_tracker) |*tracker| tracker else null);
+                try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, config.rootfs, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null);
                 request_capture.markCompleted();
                 if (request_capture.isAbortRequested()) return error.CaptureAborted;
                 if (config.continue_after_capture) {
@@ -379,7 +381,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     if (config.exec_probe_completes_run) {
                         if (config.snapshot_on_probe_complete) {
                             const dir = config.snapshot_dir orelse return error.KvmIoctlFailed;
-                            try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, config.rootfs, if (dirty_tracker) |*tracker| tracker else null);
+                            try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, config.rootfs, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null);
                             return .snapshotted;
                         }
                         return .probe_complete;
@@ -406,7 +408,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     pending_kvm_completion = false;
                 }
                 const dir = config.snapshot_dir orelse return error.KvmIoctlFailed;
-                try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, config.rootfs, if (dirty_tracker) |*tracker| tracker else null);
+                try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, config.rootfs, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null);
                 return .snapshotted;
             }
         }
@@ -865,6 +867,7 @@ fn takeSnapshot(
     ram_bytes: []const u8,
     ram_size: u64,
     rootfs: ?spore.Rootfs,
+    network_manifest: ?spore.Network,
     dirty_tracker: ?*DirtyTracker,
 ) !void {
     if (vsock_dev.pending_len != 0) {
@@ -913,6 +916,7 @@ fn takeSnapshot(
         .devices = devices,
         .generation = gen_state,
         .rootfs = rootfs,
+        .network = network_manifest,
         .memory = memory,
     });
     const manifest_ms = (try monotonicMs()) - manifest_start;

@@ -161,8 +161,14 @@ pub const CliOptions = struct {
     capture_trigger: capture.Trigger = .exit,
     continue_after_capture: bool = false,
     network: NetworkMode = .disabled,
+    network_requested: bool = false,
     network_policy: spore_net_policy.Config = .{},
     command: []const []const u8,
+};
+
+pub const NetworkOptions = struct {
+    network: NetworkMode = .disabled,
+    policy: spore_net_policy.Config = .{},
 };
 
 const cli_usage =
@@ -233,6 +239,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     var capture_trigger_set = false;
     var continue_after_capture = false;
     var network: NetworkMode = .disabled;
+    var network_requested = false;
     var network_policy = spore_net_policy.Config{};
     var command: ?[]const []const u8 = null;
 
@@ -266,6 +273,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
             continue_after_capture = true;
         } else if (std.mem.eql(u8, args[i], "--net")) {
             network = .spore;
+            network_requested = true;
         } else if (std.mem.eql(u8, args[i], "--allow-cidr")) {
             const raw = takeValue(args, &i, args[i]);
             network_policy.addAllowCidr(raw) catch |err| {
@@ -339,6 +347,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         .capture_trigger = capture_trigger,
         .continue_after_capture = continue_after_capture,
         .network = network,
+        .network_requested = network_requested,
         .network_policy = network_policy,
         .command = argv,
     };
@@ -351,15 +360,19 @@ fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parse
         };
         defer manifest.deinit();
 
+        if (parsed.network_requested or parsed.network_policy.hasRules()) {
+            failRunSetup("spore run: --from uses the captured network policy; omit --net and network allow flags", .{});
+        }
         const rootfs = try resumeRootfsForRun(allocator, manifest.value);
+        const network_options = try networkOptionsFromManifest(allocator, manifest.value.network);
         var opts = parsed.shared.completeWithAssets(parsed.backend, "", "", null, rootfs, parsed.command, true);
         opts.resume_dir = spore_dir;
         opts.memory_mib = runMemoryMiBFromManifest(manifest.value);
         opts.capture_path = parsed.capture_path;
         opts.capture_trigger = parsed.capture_trigger;
         opts.continue_after_capture = parsed.continue_after_capture;
-        opts.network = parsed.network;
-        opts.network_policy = parsed.network_policy;
+        opts.network = network_options.network;
+        opts.network_policy = network_options.policy;
         return opts;
     }
 
@@ -381,6 +394,27 @@ fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parse
     opts.network = parsed.network;
     opts.network_policy = parsed.network_policy;
     return opts;
+}
+
+pub fn networkOptionsFromManifest(allocator: std.mem.Allocator, manifest_network: ?spore.Network) !NetworkOptions {
+    const network = manifest_network orelse return .{};
+    try spore.validateNetwork(network);
+    var policy = spore_net_policy.Config{};
+    for (network.allow_cidrs) |cidr| {
+        try policy.addAllowCidr(try allocator.dupe(u8, cidr));
+    }
+    for (network.allow_hosts) |host| {
+        try policy.addAllowHost(try allocator.dupe(u8, host));
+    }
+    return .{ .network = .spore, .policy = policy };
+}
+
+fn manifestNetworkFromOptions(network: NetworkMode, policy: *const spore_net_policy.Config) ?spore.Network {
+    if (network != .spore) return null;
+    return .{
+        .allow_cidrs = policy.allowCidrSlice(),
+        .allow_hosts = policy.allowHostSlice(),
+    };
 }
 
 fn runMemoryMiBFromManifest(manifest: spore.Manifest) u64 {
@@ -1179,6 +1213,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     }
     defer if (gateway_active) gateway.deinit();
     const network: virtio_net.Runtime = if (gateway_active) gateway.runtime() else .{};
+    const network_manifest = manifestNetworkFromOptions(opts.network, &opts.network_policy);
 
     const resuming = opts.resume_dir != null;
     const kernel = if (resuming) "" else try std.Io.Dir.cwd().readFileAlloc(init.io, opts.kernel_path, allocator, .limited(max_file_size));
@@ -1213,6 +1248,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .console_sink = consoleSink,
                 .disk_fd = rootfs_fd,
                 .rootfs = opts.rootfs,
+                .network_manifest = network_manifest,
                 .resume_dir = opts.resume_dir,
                 .exec_probe = &stream,
                 .exec_probe_timeout_ms = opts.timeout_ms,
@@ -1233,6 +1269,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .console_sink = consoleSink,
                 .disk_fd = rootfs_fd,
                 .rootfs = opts.rootfs,
+                .network_manifest = network_manifest,
                 .resume_dir = opts.resume_dir,
                 .exec_probe = &stream,
                 .exec_probe_timeout_ms = opts.timeout_ms,
@@ -1667,6 +1704,7 @@ test "run cli parser accepts source spore" {
 test "run cli parser accepts net flag" {
     const opts = try parseCliArgs(&.{ "--net", "--", "/bin/true" });
     try std.testing.expectEqual(NetworkMode.spore, opts.network);
+    try std.testing.expect(opts.network_requested);
     try std.testing.expectEqual(@as(usize, 1), opts.command.len);
     try std.testing.expectEqualStrings("/bin/true", opts.command[0]);
 }
@@ -1682,11 +1720,47 @@ test "run cli parser accepts network allow rules" {
         "/bin/true",
     });
     try std.testing.expectEqual(NetworkMode.spore, opts.network);
+    try std.testing.expect(opts.network_requested);
     try std.testing.expectEqual(@as(usize, 1), opts.network_policy.allow_cidr_count);
     try std.testing.expectEqualStrings("93.184.216.34/32", opts.network_policy.allow_cidrs[0]);
     try std.testing.expectEqual(@as(usize, 1), opts.network_policy.allow_host_count);
     try std.testing.expectEqualStrings("example.com", opts.network_policy.allow_hosts[0]);
     try std.testing.expectEqualStrings("/bin/true", opts.command[0]);
+}
+
+test "run restores network options from manifest policy" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const manifest_network = spore.Network{
+        .allow_cidrs = &.{"93.184.216.34/32"},
+        .allow_hosts = &.{"example.com"},
+    };
+
+    const opts = try networkOptionsFromManifest(arena, manifest_network);
+    try std.testing.expectEqual(NetworkMode.spore, opts.network);
+    try std.testing.expectEqual(@as(usize, 1), opts.policy.allow_cidr_count);
+    try std.testing.expectEqualStrings("93.184.216.34/32", opts.policy.allow_cidrs[0]);
+    try std.testing.expectEqual(@as(usize, 1), opts.policy.allow_host_count);
+    try std.testing.expectEqualStrings("example.com", opts.policy.allow_hosts[0]);
+
+    const disabled = try networkOptionsFromManifest(arena, null);
+    try std.testing.expectEqual(NetworkMode.disabled, disabled.network);
+    try std.testing.expect(!disabled.policy.hasRules());
+}
+
+test "run builds manifest network from active policy" {
+    var policy = spore_net_policy.Config{};
+    try policy.addAllowCidr("93.184.216.34/32");
+    try policy.addAllowHost("example.com");
+
+    const network = manifestNetworkFromOptions(.spore, &policy) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(spore.network_kind_spore, network.kind);
+    try std.testing.expectEqualStrings("93.184.216.34/32", network.allow_cidrs[0]);
+    try std.testing.expectEqualStrings("example.com", network.allow_hosts[0]);
+
+    try std.testing.expect(manifestNetworkFromOptions(.disabled, &policy) == null);
 }
 
 test "run network gateway errors are reported clearly" {

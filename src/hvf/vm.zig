@@ -37,6 +37,8 @@ pub const Config = struct {
     disk_fd: ?std.c.fd_t = null,
     /// Immutable rootfs artifact metadata for disk-backed snapshots.
     rootfs: ?spore.Rootfs = null,
+    /// Requested network capability and policy metadata for snapshots.
+    network_manifest: ?spore.Network = null,
     /// Poll fd 0 (set non-blocking by the caller) for console input on
     /// guest idle exits.
     poll_stdin: bool = false,
@@ -418,7 +420,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                         .dist_base = dist_base,
                         .redist_base = vcpu_redist_base,
                         .ram_size = config.ram_size,
-                    }, config.rootfs, if (dirty_tracker) |*tracker| tracker else null);
+                    }, config.rootfs, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null);
                     return .snapshotted;
                 },
             }
@@ -432,7 +434,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     .dist_base = dist_base,
                     .redist_base = vcpu_redist_base,
                     .ram_size = config.ram_size,
-                }, config.rootfs, if (dirty_tracker) |*tracker| tracker else null);
+                }, config.rootfs, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null);
                 request_capture.markCompleted();
                 if (request_capture.isAbortRequested()) return error.CaptureAborted;
                 if (config.continue_after_capture) {
@@ -457,7 +459,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                                 .dist_base = dist_base,
                                 .redist_base = vcpu_redist_base,
                                 .ram_size = config.ram_size,
-                            }, config.rootfs, if (dirty_tracker) |*tracker| tracker else null);
+                            }, config.rootfs, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null);
                             return .snapshotted;
                         }
                         return .probe_complete;
@@ -480,7 +482,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     .dist_base = dist_base,
                     .redist_base = vcpu_redist_base,
                     .ram_size = config.ram_size,
-                }, config.rootfs, if (dirty_tracker) |*tracker| tracker else null);
+                }, config.rootfs, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null);
                 return .snapshotted;
             }
         }
@@ -940,6 +942,7 @@ fn takeSnapshot(
     ram_bytes: []const u8,
     platform: SnapshotPlatform,
     rootfs: ?spore.Rootfs,
+    network_manifest: ?spore.Network,
     dirty_tracker: ?*DirtyTracker,
 ) !void {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -983,6 +986,7 @@ fn takeSnapshot(
         .devices = devices,
         .generation = gen_state,
         .rootfs = rootfs,
+        .network = network_manifest,
         .memory = memory,
     });
     const manifest_ms = monotonicMs() - manifest_start;
