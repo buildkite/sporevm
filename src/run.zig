@@ -73,6 +73,12 @@ pub const Options = struct {
     capture_path: ?[]const u8 = null,
     capture_trigger: capture.Trigger = .exit,
     continue_after_capture: bool = false,
+    network: NetworkMode = .disabled,
+};
+
+pub const NetworkMode = enum {
+    disabled,
+    spore,
 };
 
 pub const Result = struct {
@@ -150,6 +156,7 @@ pub const CliOptions = struct {
     capture_path: ?[]const u8 = null,
     capture_trigger: capture.Trigger = .exit,
     continue_after_capture: bool = false,
+    network: NetworkMode = .disabled,
     command: []const []const u8,
 };
 
@@ -164,6 +171,8 @@ const cli_usage =
     \\  --from DIR              Resume from an existing spore, then run argv
     \\  --rootfs rootfs.ext4    Attach rootfs image read-only as virtio-blk
     \\  --image REF             Build or reuse cached OCI rootfs, then run from it
+    \\  --net                   Experimental SporeVM-managed networking; disabled
+    \\                          until the spore-netd gateway lands
     \\  --capture DIR           Snapshot to DIR; defaults to --capture-on EXIT
     \\  --capture-on WHEN       Capture trigger: EXIT, INT, TERM, HUP, USR1, or USR2
     \\  --continue-after-capture
@@ -213,6 +222,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     var capture_trigger: capture.Trigger = .exit;
     var capture_trigger_set = false;
     var continue_after_capture = false;
+    var network: NetworkMode = .disabled;
     var command: ?[]const []const u8 = null;
 
     var i: usize = 0;
@@ -243,6 +253,8 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
             capture_trigger_set = true;
         } else if (std.mem.eql(u8, args[i], "--continue-after-capture")) {
             continue_after_capture = true;
+        } else if (std.mem.eql(u8, args[i], "--net")) {
+            network = .spore;
         } else if (try parseSharedOption(&shared, args, &i)) {
             continue;
         } else if (std.mem.startsWith(u8, args[i], "--")) {
@@ -299,6 +311,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         .capture_path = capture_path,
         .capture_trigger = capture_trigger,
         .continue_after_capture = continue_after_capture,
+        .network = network,
         .command = argv,
     };
 }
@@ -317,6 +330,7 @@ fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parse
         opts.capture_path = parsed.capture_path;
         opts.capture_trigger = parsed.capture_trigger;
         opts.continue_after_capture = parsed.continue_after_capture;
+        opts.network = parsed.network;
         return opts;
     }
 
@@ -335,6 +349,7 @@ fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parse
     opts.capture_path = parsed.capture_path;
     opts.capture_trigger = parsed.capture_trigger;
     opts.continue_after_capture = parsed.continue_after_capture;
+    opts.network = parsed.network;
     return opts;
 }
 
@@ -1580,6 +1595,13 @@ test "run cli parser accepts source spore" {
     try std.testing.expect(opts.image_ref == null);
     try std.testing.expectEqual(@as(usize, 1), opts.command.len);
     try std.testing.expectEqualStrings("/bin/writeout", opts.command[0]);
+}
+
+test "run cli parser accepts net flag" {
+    const opts = try parseCliArgs(&.{ "--net", "--", "/bin/true" });
+    try std.testing.expectEqual(NetworkMode.spore, opts.network);
+    try std.testing.expectEqual(@as(usize, 1), opts.command.len);
+    try std.testing.expectEqualStrings("/bin/true", opts.command[0]);
 }
 
 test "run cli parser accepts capture flags" {
