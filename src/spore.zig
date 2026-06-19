@@ -11,17 +11,27 @@
 //! fails closed on any mismatch. See SECURITY.md.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const board = @import("board.zig");
 const chunklib = @import("chunk.zig");
 const generation = @import("generation.zig");
 const gicv3 = @import("gicv3.zig");
+const local_paths = @import("local_paths.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 const Blake3 = std.crypto.hash.Blake3;
+const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
 pub const format_version: u32 = 0;
 pub const chunk_size: usize = 2 * 1024 * 1024;
 pub const ram_backing_kind = "map-private-file-v0";
 pub const ram_backing_path = "ram.backing";
+pub const ram_backing_proof_path = "ram.backing.proof";
+
+const local_backing_proof_version: u32 = 1;
+const local_backing_producer = "sporevm-local-ram-backing-v0";
+const local_backing_key_path = "local-ram-backing.key";
+const local_backing_key_len = HmacSha256.key_length;
+const local_backing_proof_max_bytes = 16 * 1024;
 
 pub const Error = error{
     BadManifest,
@@ -112,6 +122,63 @@ pub const MemoryManifest = struct {
     /// verified source of truth; backends may ignore this and materialize
     /// from chunks instead.
     backing: ?MemoryBacking = null,
+};
+
+pub const LocalBackingRestoreSource = enum {
+    local_backing,
+    chunks,
+};
+
+pub const LocalBackingPlan = struct {
+    fd: ?std.c.fd_t = null,
+    source: LocalBackingRestoreSource = .chunks,
+    reason: []const u8 = "not_attempted",
+};
+
+const LocalBackingProof = struct {
+    schema_version: u32,
+    memory_fingerprint: []const u8,
+    backing: LocalBackingProofBacking,
+    file: LocalBackingFileIdentity,
+    producer: []const u8,
+    mac: []const u8,
+};
+
+const LocalBackingProofBacking = struct {
+    kind: []const u8,
+    path: []const u8,
+    size: u64,
+};
+
+const LocalBackingFileIdentity = struct {
+    file_type: []const u8 = "regular",
+    device: u64,
+    inode: u64,
+    owner_uid: u64,
+    size: u64,
+    mtime_sec: i64,
+    mtime_nsec: i64,
+};
+
+const LocalFileStat = struct {
+    mode: u64,
+    device: u64,
+    inode: u64,
+    owner_uid: u64,
+    size: u64,
+    mtime_sec: i64,
+    mtime_nsec: i64,
+
+    fn identity(self: LocalFileStat) LocalBackingFileIdentity {
+        return .{
+            .device = self.device,
+            .inode = self.inode,
+            .owner_uid = self.owner_uid,
+            .size = self.size,
+            .mtime_sec = self.mtime_sec,
+            .mtime_nsec = self.mtime_nsec,
+        };
+    }
 };
 
 pub const rootfs_kind = "immutable-ext4-rootfs-v0";
@@ -270,6 +337,311 @@ fn symlinkPath(target: []const u8, link_path: []const u8) Error!void {
         if (std.c.access(link_z, 0) == 0) return error.AlreadyExists;
         return error.IoFailed;
     }
+}
+
+fn hardlinkPath(target: []const u8, link_path: []const u8) Error!void {
+    const target_z = try std.heap.c_allocator.dupeZ(u8, target);
+    defer std.heap.c_allocator.free(target_z);
+    const link_z = try std.heap.c_allocator.dupeZ(u8, link_path);
+    defer std.heap.c_allocator.free(link_z);
+    if (std.c.link(target_z, link_z) != 0) return error.IoFailed;
+}
+
+fn openReadOnlyNoFollow(path: [:0]const u8) Error!std.c.fd_t {
+    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    if (fd < 0) return error.IoFailed;
+    return fd;
+}
+
+fn fstatLocalFile(fd: std.c.fd_t) Error!LocalFileStat {
+    if (comptime builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var statx_buf: linux.Statx = undefined;
+        const flags: u32 = linux.AT.EMPTY_PATH;
+        const rc = linux.statx(fd, "", flags, .{
+            .TYPE = true,
+            .MODE = true,
+            .UID = true,
+            .INO = true,
+            .SIZE = true,
+            .MTIME = true,
+        }, &statx_buf);
+        if (linux.errno(rc) != .SUCCESS) return error.IoFailed;
+        if (!linux.S.ISREG(statx_buf.mode)) return error.BadManifest;
+        return .{
+            .mode = statx_buf.mode,
+            .device = (@as(u64, statx_buf.dev_major) << 32) | statx_buf.dev_minor,
+            .inode = statx_buf.ino,
+            .owner_uid = statx_buf.uid,
+            .size = statx_buf.size,
+            .mtime_sec = statx_buf.mtime.sec,
+            .mtime_nsec = statx_buf.mtime.nsec,
+        };
+    } else {
+        var st: std.c.Stat = undefined;
+        if (std.c.fstat(fd, &st) != 0) return error.IoFailed;
+        if (!std.c.S.ISREG(st.mode)) return error.BadManifest;
+        const mtim = st.mtime();
+        return .{
+            .mode = @intCast(st.mode),
+            .device = @intCast(st.dev),
+            .inode = @intCast(st.ino),
+            .owner_uid = @intCast(st.uid),
+            .size = @intCast(st.size),
+            .mtime_sec = mtim.sec,
+            .mtime_nsec = mtim.nsec,
+        };
+    }
+}
+
+fn localBackingChunksPlan(reason: []const u8) LocalBackingPlan {
+    return .{ .source = .chunks, .reason = reason };
+}
+
+fn memoryFingerprintHex(allocator: std.mem.Allocator, memory: MemoryManifest, expected_size: u64) Error![]const u8 {
+    if (expected_size > std.math.maxInt(usize)) return error.BadManifest;
+    const plan = try validateMemoryForRam(memory, @intCast(expected_size));
+    var h = Blake3.init(.{});
+    h.update("sporevm-memory-fingerprint-v1");
+    hashU64(&h, expected_size);
+    hashU64(&h, memory.chunk_size);
+    hashU64(&h, plan.chunk_count);
+    for (memory.chunks) |maybe_ref| {
+        if (maybe_ref) |ref| {
+            h.update(&.{1});
+            hashBytes(&h, ref);
+        } else {
+            h.update(&.{0});
+        }
+    }
+    var digest: [Blake3.digest_length]u8 = undefined;
+    h.final(&digest);
+    return hexAlloc(allocator, &digest);
+}
+
+fn hashU64(hasher: *Blake3, value: u64) void {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, value, .little);
+    hasher.update(&bytes);
+}
+
+fn hashBytes(hasher: *Blake3, value: []const u8) void {
+    hashU64(hasher, value.len);
+    hasher.update(value);
+}
+
+fn proofMac(
+    allocator: std.mem.Allocator,
+    key: *const [local_backing_key_len]u8,
+    memory_fingerprint: []const u8,
+    backing: LocalBackingProofBacking,
+    file: LocalBackingFileIdentity,
+    producer: []const u8,
+) Error![HmacSha256.mac_length]u8 {
+    _ = allocator;
+    var mac = HmacSha256.init(key);
+    mac.update("sporevm-local-ram-backing-proof-v1");
+    macU64(&mac, local_backing_proof_version);
+    macBytes(&mac, memory_fingerprint);
+    macBytes(&mac, backing.kind);
+    macBytes(&mac, backing.path);
+    macU64(&mac, backing.size);
+    macBytes(&mac, file.file_type);
+    macU64(&mac, file.device);
+    macU64(&mac, file.inode);
+    macU64(&mac, file.owner_uid);
+    macU64(&mac, file.size);
+    macI64(&mac, file.mtime_sec);
+    macI64(&mac, file.mtime_nsec);
+    macBytes(&mac, producer);
+    var out: [HmacSha256.mac_length]u8 = undefined;
+    mac.final(&out);
+    return out;
+}
+
+fn macU64(mac: *HmacSha256, value: u64) void {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, value, .little);
+    mac.update(&bytes);
+}
+
+fn macI64(mac: *HmacSha256, value: i64) void {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(i64, &bytes, value, .little);
+    mac.update(&bytes);
+}
+
+fn macBytes(mac: *HmacSha256, value: []const u8) void {
+    macU64(mac, value.len);
+    mac.update(value);
+}
+
+fn localBackingRuntimeRoot(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map) Error![]const u8 {
+    const root = local_paths.runtimeRootPath(allocator, environ) catch return error.IoFailed;
+    const root_z = try pathZ(allocator, "{s}", .{root});
+    if (std.c.mkdir(root_z, 0o700) != 0 and std.c.access(root_z, 0) != 0) return error.IoFailed;
+    const fd = std.c.open(root_z, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    if (fd < 0) return error.IoFailed;
+    defer _ = std.c.close(fd);
+    if (std.c.fchmod(fd, 0o700) != 0) return error.IoFailed;
+    return root;
+}
+
+fn localBackingKey(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map, create: bool) Error!?[local_backing_key_len]u8 {
+    const root = try localBackingRuntimeRoot(allocator, environ);
+    const path = try pathZ(allocator, "{s}/{s}", .{ root, local_backing_key_path });
+    var fd = std.c.open(path, .{ .ACCMODE = .RDWR, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    if (fd < 0) {
+        if (!create) return null;
+        fd = std.c.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0o600));
+        if (fd < 0) return error.IoFailed;
+        defer _ = std.c.close(fd);
+        var key: [local_backing_key_len]u8 = undefined;
+        try fillRandom(&key);
+        try writeFdAll(fd, &key);
+        if (std.c.fchmod(fd, 0o600) != 0) return error.IoFailed;
+        return key;
+    }
+    defer _ = std.c.close(fd);
+    const st = try fstatLocalFile(fd);
+    if (st.owner_uid != std.c.getuid() or st.size != local_backing_key_len) return error.IoFailed;
+    if (std.c.fchmod(fd, 0o600) != 0) return error.IoFailed;
+    var key: [local_backing_key_len]u8 = undefined;
+    try readFdExact(fd, &key);
+    return key;
+}
+
+fn writeFdAll(fd: std.c.fd_t, data: []const u8) Error!void {
+    var done: usize = 0;
+    while (done < data.len) {
+        const n = std.c.write(fd, data.ptr + done, data.len - done);
+        if (n <= 0) return error.IoFailed;
+        done += @intCast(n);
+    }
+}
+
+fn readFdExact(fd: std.c.fd_t, out: []u8) Error!void {
+    if (std.c.lseek(fd, 0, std.c.SEEK.SET) < 0) return error.IoFailed;
+    var done: usize = 0;
+    while (done < out.len) {
+        const n = std.c.read(fd, out.ptr + done, out.len - done);
+        if (n <= 0) return error.IoFailed;
+        done += @intCast(n);
+    }
+}
+
+fn readRegularFileAllNoFollow(allocator: std.mem.Allocator, path: [:0]const u8, max: usize) Error![]u8 {
+    const fd = try openReadOnlyNoFollow(path);
+    defer _ = std.c.close(fd);
+    const st = try fstatLocalFile(fd);
+    if (st.size > std.math.maxInt(usize)) return error.BadChunk;
+    const size: usize = @intCast(st.size);
+    if (size > max) return error.BadChunk;
+    const buf = try allocator.alloc(u8, size);
+    errdefer allocator.free(buf);
+    try readFdExact(fd, buf);
+    return buf;
+}
+
+fn proofBackingFromManifest(backing: MemoryBacking) LocalBackingProofBacking {
+    return .{
+        .kind = backing.kind,
+        .path = backing.path,
+        .size = backing.size,
+    };
+}
+
+fn proofFieldsMatch(
+    proof: LocalBackingProof,
+    memory_fingerprint: []const u8,
+    backing: LocalBackingProofBacking,
+    file: LocalBackingFileIdentity,
+) bool {
+    return proof.schema_version == local_backing_proof_version and
+        std.mem.eql(u8, proof.memory_fingerprint, memory_fingerprint) and
+        std.mem.eql(u8, proof.backing.kind, backing.kind) and
+        std.mem.eql(u8, proof.backing.path, backing.path) and
+        proof.backing.size == backing.size and
+        std.mem.eql(u8, proof.file.file_type, "regular") and
+        proof.file.device == file.device and
+        proof.file.inode == file.inode and
+        proof.file.owner_uid == file.owner_uid and
+        proof.file.size == file.size and
+        proof.file.mtime_sec == file.mtime_sec and
+        proof.file.mtime_nsec == file.mtime_nsec and
+        std.mem.eql(u8, proof.producer, local_backing_producer);
+}
+
+pub fn writeLocalMemoryBackingProof(
+    allocator: std.mem.Allocator,
+    environ: *const std.process.Environ.Map,
+    dir: []const u8,
+    memory: MemoryManifest,
+    expected_size: u64,
+) Error!void {
+    const backing = memory.backing orelse return;
+    try validateMemoryBacking(backing, expected_size);
+    const backing_path = try memoryBackingPath(allocator, dir, backing);
+    const fd = try openReadOnlyNoFollow(backing_path);
+    defer _ = std.c.close(fd);
+    const file = (try fstatLocalFile(fd)).identity();
+    if (file.size != expected_size) return error.BadManifest;
+    const key = (try localBackingKey(allocator, environ, true)) orelse return error.IoFailed;
+    const memory_fingerprint = try memoryFingerprintHex(allocator, memory, expected_size);
+    const proof_backing = proofBackingFromManifest(backing);
+    const mac = try proofMac(allocator, &key, memory_fingerprint, proof_backing, file, local_backing_producer);
+    const mac_hex = try hexAlloc(allocator, &mac);
+    const proof = LocalBackingProof{
+        .schema_version = local_backing_proof_version,
+        .memory_fingerprint = memory_fingerprint,
+        .backing = proof_backing,
+        .file = file,
+        .producer = local_backing_producer,
+        .mac = mac_hex,
+    };
+    const json = std.json.Stringify.valueAlloc(allocator, proof, .{ .whitespace = .indent_2 }) catch return error.OutOfMemory;
+    const proof_path = try pathZ(allocator, "{s}/{s}", .{ dir, ram_backing_proof_path });
+    try writeFileAll(proof_path, json);
+}
+
+pub fn openProvenLocalMemoryBacking(
+    allocator: std.mem.Allocator,
+    environ: *const std.process.Environ.Map,
+    dir: []const u8,
+    memory: MemoryManifest,
+    expected_size: u64,
+) Error!LocalBackingPlan {
+    const backing = memory.backing orelse return localBackingChunksPlan("no_backing");
+    validateMemoryBacking(backing, expected_size) catch return localBackingChunksPlan("bad_backing_metadata");
+    const backing_path = try memoryBackingPath(allocator, dir, backing);
+    const fd = openReadOnlyNoFollow(backing_path) catch return localBackingChunksPlan("backing_unavailable");
+    var handoff_fd = false;
+    defer if (!handoff_fd) {
+        _ = std.c.close(fd);
+    };
+    const file = (fstatLocalFile(fd) catch return localBackingChunksPlan("backing_stat_failed")).identity();
+    if (file.size != expected_size) return localBackingChunksPlan("backing_size_mismatch");
+
+    const proof_path = try pathZ(allocator, "{s}/{s}", .{ dir, ram_backing_proof_path });
+    const proof_bytes = readRegularFileAllNoFollow(allocator, proof_path, local_backing_proof_max_bytes) catch return localBackingChunksPlan("proof_unavailable");
+    const parsed = std.json.parseFromSlice(LocalBackingProof, allocator, proof_bytes, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = false,
+    }) catch return localBackingChunksPlan("proof_invalid");
+    defer parsed.deinit();
+
+    const key = (localBackingKey(allocator, environ, false) catch return localBackingChunksPlan("key_unavailable")) orelse
+        return localBackingChunksPlan("key_unavailable");
+    const memory_fingerprint = try memoryFingerprintHex(allocator, memory, expected_size);
+    const proof_backing = proofBackingFromManifest(backing);
+    if (!proofFieldsMatch(parsed.value, memory_fingerprint, proof_backing, file)) return localBackingChunksPlan("proof_mismatch");
+    if (parsed.value.mac.len != HmacSha256.mac_length * 2) return localBackingChunksPlan("proof_mac_invalid");
+    var actual_mac: [HmacSha256.mac_length]u8 = undefined;
+    _ = std.fmt.hexToBytes(&actual_mac, parsed.value.mac) catch return localBackingChunksPlan("proof_mac_invalid");
+    const expected_mac = try proofMac(allocator, &key, memory_fingerprint, proof_backing, file, local_backing_producer);
+    if (!std.crypto.timing_safe.eql([HmacSha256.mac_length]u8, actual_mac, expected_mac)) return localBackingChunksPlan("proof_mac_mismatch");
+    handoff_fd = true;
+    return .{ .fd = fd, .source = .local_backing, .reason = "proof_valid" };
 }
 
 pub fn validateMemoryBacking(backing: MemoryBacking, expected_size: u64) Error!void {
@@ -496,6 +868,7 @@ pub const ForkOptions = struct {
     parent_dir: []const u8,
     out_dir: []const u8,
     count: usize,
+    environ_map: ?*const std.process.Environ.Map = null,
 };
 
 pub const ForkResult = struct {
@@ -521,11 +894,19 @@ pub fn fork(allocator: std.mem.Allocator, options: ForkOptions) Error!ForkResult
     const shared_chunks = try realpathAlloc(allocator, parent_chunks);
     var shared_backing: ?[]const u8 = null;
     if (parent.memory.backing) |backing| {
-        const parent_backing = try memoryBackingPath(allocator, options.parent_dir, backing);
-        shared_backing = realpathAlloc(allocator, parent_backing) catch |err| switch (err) {
-            error.IoFailed => null,
-            else => |e| return e,
-        };
+        if (options.environ_map) |environ| {
+            const parent_backing_plan = try openProvenLocalMemoryBacking(allocator, environ, options.parent_dir, parent.memory, parent.platform.ram_size);
+            defer if (parent_backing_plan.fd) |fd| {
+                _ = std.c.close(fd);
+            };
+            if (parent_backing_plan.source == .local_backing) {
+                const parent_backing = try memoryBackingPath(allocator, options.parent_dir, backing);
+                shared_backing = realpathAlloc(allocator, parent_backing) catch |err| switch (err) {
+                    error.IoFailed => null,
+                    else => |e| return e,
+                };
+            }
+        }
     }
     try ensureDir(try pathZ(allocator, "{s}", .{options.out_dir}));
 
@@ -541,7 +922,9 @@ pub fn fork(allocator: std.mem.Allocator, options: ForkOptions) Error!ForkResult
         if (shared_backing == null) child.memory.backing = null;
         if (child.memory.backing) |backing| {
             const backing_link = try pathZ(allocator, "{s}/{s}", .{ child_dir, backing.path });
-            try symlinkPath(shared_backing.?, backing_link);
+            hardlinkPath(shared_backing.?, backing_link) catch {
+                child.memory.backing = null;
+            };
         }
 
         const child_generation = parent.generation.generation + i + 1;
@@ -567,6 +950,11 @@ pub fn fork(allocator: std.mem.Allocator, options: ForkOptions) Error!ForkResult
             .params_b64 = params_b64,
         };
         child.machine.gic = try forkGicState(allocator, parent.machine.gic);
+        if (child.memory.backing != null) {
+            if (options.environ_map) |environ| {
+                writeLocalMemoryBackingProof(allocator, environ, child_dir, child.memory, child.platform.ram_size) catch {};
+            }
+        }
         try saveManifest(allocator, child_dir, child);
     }
 
@@ -890,6 +1278,107 @@ test "memory backing is sparse local acceleration metadata" {
     try std.testing.expectEqualSlices(u8, ram, out);
 }
 
+test "local memory backing proof opens local fd and falls back safely" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root_dir = try testDir(arena);
+    const dir = try pathZ(arena, "{s}/spore", .{root_dir});
+    const runtime_dir = try pathZ(arena, "{s}/runtime", .{root_dir});
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.runtime_dir_env, runtime_dir);
+
+    const ram = try arena.alloc(u8, 2 * chunk_size + 32);
+    @memset(ram, 0);
+    ram[13] = 0x33;
+    ram[chunk_size + 7] = 0x44;
+    const mm = try saveMemoryWithBacking(arena, dir, ram);
+    try writeLocalMemoryBackingProof(arena, &env, dir, mm, ram.len);
+
+    const plan = try openProvenLocalMemoryBacking(arena, &env, dir, mm, ram.len);
+    defer if (plan.fd) |fd| {
+        _ = std.c.close(fd);
+    };
+    try std.testing.expectEqual(LocalBackingRestoreSource.local_backing, plan.source);
+    try std.testing.expect(plan.fd != null);
+    try std.testing.expectEqualStrings("proof_valid", plan.reason);
+
+    const proof_path = try pathZ(arena, "{s}/{s}", .{ dir, ram_backing_proof_path });
+    try writeFileAll(proof_path, "{}");
+    const corrupt_plan = try openProvenLocalMemoryBacking(arena, &env, dir, mm, ram.len);
+    defer if (corrupt_plan.fd) |fd| {
+        _ = std.c.close(fd);
+    };
+    try std.testing.expectEqual(LocalBackingRestoreSource.chunks, corrupt_plan.source);
+    try std.testing.expect(corrupt_plan.fd == null);
+    try std.testing.expectEqualStrings("proof_invalid", corrupt_plan.reason);
+
+    try writeLocalMemoryBackingProof(arena, &env, dir, mm, ram.len);
+    const proof_real_path = try pathZ(arena, "{s}/{s}.real", .{ dir, ram_backing_proof_path });
+    if (std.c.rename(proof_path.ptr, proof_real_path.ptr) != 0) return error.IoFailed;
+    try symlinkPath(proof_real_path, proof_path);
+    const symlink_plan = try openProvenLocalMemoryBacking(arena, &env, dir, mm, ram.len);
+    defer if (symlink_plan.fd) |fd| {
+        _ = std.c.close(fd);
+    };
+    try std.testing.expectEqual(LocalBackingRestoreSource.chunks, symlink_plan.source);
+    try std.testing.expect(symlink_plan.fd == null);
+    try std.testing.expectEqualStrings("proof_unavailable", symlink_plan.reason);
+}
+
+test "local memory backing proof rejects foreign key and manifest mismatch" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root_dir = try testDir(arena);
+    const dir = try pathZ(arena, "{s}/spore", .{root_dir});
+    const runtime_a = try pathZ(arena, "{s}/runtime-a", .{root_dir});
+    const runtime_b = try pathZ(arena, "{s}/runtime-b", .{root_dir});
+    var env_a = std.process.Environ.Map.init(allocator);
+    defer env_a.deinit();
+    var env_b = std.process.Environ.Map.init(allocator);
+    defer env_b.deinit();
+    try env_a.put(local_paths.runtime_dir_env, runtime_a);
+    try env_b.put(local_paths.runtime_dir_env, runtime_b);
+
+    const ram = try arena.alloc(u8, chunk_size);
+    @memset(ram, 0x5A);
+    const mm = try saveMemoryWithBacking(arena, dir, ram);
+    try writeLocalMemoryBackingProof(arena, &env_a, dir, mm, ram.len);
+
+    const missing_key_plan = try openProvenLocalMemoryBacking(arena, &env_b, dir, mm, ram.len);
+    defer if (missing_key_plan.fd) |fd| {
+        _ = std.c.close(fd);
+    };
+    try std.testing.expectEqual(LocalBackingRestoreSource.chunks, missing_key_plan.source);
+    try std.testing.expectEqualStrings("key_unavailable", missing_key_plan.reason);
+
+    _ = try localBackingKey(arena, &env_b, true);
+    const foreign_key_plan = try openProvenLocalMemoryBacking(arena, &env_b, dir, mm, ram.len);
+    defer if (foreign_key_plan.fd) |fd| {
+        _ = std.c.close(fd);
+    };
+    try std.testing.expectEqual(LocalBackingRestoreSource.chunks, foreign_key_plan.source);
+    try std.testing.expectEqualStrings("proof_mac_mismatch", foreign_key_plan.reason);
+
+    var refs = try arena.alloc(?[]const u8, mm.chunks.len);
+    @memcpy(refs, mm.chunks);
+    refs[0] = null;
+    var changed = mm;
+    changed.chunks = refs;
+    const mismatch_plan = try openProvenLocalMemoryBacking(arena, &env_a, dir, changed, ram.len);
+    defer if (mismatch_plan.fd) |fd| {
+        _ = std.c.close(fd);
+    };
+    try std.testing.expectEqual(LocalBackingRestoreSource.chunks, mismatch_plan.source);
+    try std.testing.expectEqualStrings("proof_mismatch", mismatch_plan.reason);
+}
+
 test "memory backing rejects non-canonical paths" {
     const valid_size: u64 = 4096;
     const invalid_paths = [_][]const u8{
@@ -1205,6 +1694,11 @@ test "fork mints child manifests with shared chunks and pending generation" {
     ram[0] = 0x42;
     ram[ram.len - 1] = 0x99;
     const memory = try saveMemoryWithBacking(arena, parent_dir, ram);
+    const runtime_dir = try pathZ(arena, "{s}/runtime", .{root_dir});
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.runtime_dir_env, runtime_dir);
+    try writeLocalMemoryBackingProof(arena, &env, parent_dir, memory, ram.len);
 
     var devices = [_]TransportState{
         testTransport(3),
@@ -1219,7 +1713,7 @@ test "fork mints child manifests with shared chunks and pending generation" {
     };
     try saveManifest(arena, parent_dir, parent_manifest);
 
-    const result = try fork(arena, .{ .parent_dir = parent_dir, .out_dir = out_dir, .count = 2 });
+    const result = try fork(arena, .{ .parent_dir = parent_dir, .out_dir = out_dir, .count = 2, .environ_map = &env });
     try std.testing.expectEqual(@as(usize, 2), result.count);
     try std.testing.expectEqual(@as(u64, 41), result.parent_generation);
     try std.testing.expectEqual(@as(u64, 42), result.first_generation);
@@ -1244,6 +1738,18 @@ test "fork mints child manifests with shared chunks and pending generation" {
     try std.testing.expectEqualStrings(ram_backing_path, first_backing.path);
     const first_backing_path = try memoryBackingPath(arena, first_child_dir, first_backing);
     try std.testing.expectEqual(@as(c_int, 0), std.c.access(first_backing_path, 0));
+    const first_backing_plan = try openProvenLocalMemoryBacking(arena, &env, first_child_dir, first.value.memory, first.value.platform.ram_size);
+    defer if (first_backing_plan.fd) |fd| {
+        _ = std.c.close(fd);
+    };
+    try std.testing.expectEqual(LocalBackingRestoreSource.local_backing, first_backing_plan.source);
+
+    const parent_backing_path = try memoryBackingPath(arena, parent_dir, memory.backing.?);
+    const parent_backing_fd = try openReadOnlyNoFollow(parent_backing_path);
+    defer _ = std.c.close(parent_backing_fd);
+    const child_backing_fd = try openReadOnlyNoFollow(first_backing_path);
+    defer _ = std.c.close(child_backing_fd);
+    try std.testing.expectEqual((try fstatLocalFile(parent_backing_fd)).inode, (try fstatLocalFile(child_backing_fd)).inode);
 
     const second_child_dir = try pathZ(arena, "{s}/000001", .{out_dir});
     const second = try loadManifest(arena, second_child_dir);
@@ -1291,6 +1797,37 @@ test "fork mints child manifests with shared chunks and pending generation" {
     const out = try arena.alloc(u8, ram.len);
     @memset(out, 0);
     try loadMemory(arena, second_child_dir, second.value.memory, out);
+    try std.testing.expectEqualSlices(u8, ram, out);
+}
+
+test "fork does not mint child backing proof from unproven parent backing" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const root_dir = try testDir(arena);
+    const parent_dir = try pathZ(arena, "{s}/parent", .{root_dir});
+    const out_dir = try pathZ(arena, "{s}/children", .{root_dir});
+    const runtime_dir = try pathZ(arena, "{s}/runtime", .{root_dir});
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.runtime_dir_env, runtime_dir);
+
+    const ram = try arena.alloc(u8, chunk_size);
+    @memset(ram, 0x7B);
+    const memory = try saveMemoryWithBacking(arena, parent_dir, ram);
+    try saveManifest(arena, parent_dir, testForkManifest(memory, ram.len, 11));
+
+    _ = try fork(arena, .{ .parent_dir = parent_dir, .out_dir = out_dir, .count = 1, .environ_map = &env });
+    const child_dir = try pathZ(arena, "{s}/000000", .{out_dir});
+    const child = try loadManifest(arena, child_dir);
+    defer child.deinit();
+    try std.testing.expect(child.value.memory.backing == null);
+
+    const out = try arena.alloc(u8, ram.len);
+    @memset(out, 0);
+    try loadMemory(arena, child_dir, child.value.memory, out);
     try std.testing.expectEqualSlices(u8, ram, out);
 }
 

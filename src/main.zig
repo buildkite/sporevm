@@ -110,7 +110,7 @@ pub fn main(init: std.process.Init) !void {
         defer manifest.deinit();
         try printJson(arena, stdout, inspectSummary(manifest.value));
     } else if (std.mem.eql(u8, command, "fork")) {
-        const result = try forkCommand(arena, command_args);
+        const result = try forkCommand(init, arena, command_args);
         try printJson(arena, stdout, result);
     } else if (std.mem.eql(u8, command, "fanout")) {
         try sporevm.fanout.cli(init, command_args, stdout);
@@ -186,7 +186,7 @@ fn wantsNamedResume(args: []const []const u8) bool {
     return false;
 }
 
-fn forkCommand(allocator: std.mem.Allocator, args: []const []const u8) !sporevm.spore.ForkResult {
+fn forkCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []const []const u8) !sporevm.spore.ForkResult {
     var parent_dir: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
     var count: ?usize = null;
@@ -219,6 +219,7 @@ fn forkCommand(allocator: std.mem.Allocator, args: []const []const u8) !sporevm.
         .parent_dir = parent_dir.?,
         .out_dir = out_dir.?,
         .count = count.?,
+        .environ_map = init.environ_map,
     });
 }
 

@@ -13,6 +13,7 @@ spec_refs:
 related_plans:
   - docs/plans/foundation.md
   - docs/plans/lifecycle-monitor.md
+  - docs/plans/automatic-local-ram-backing.md
 ---
 
 # Automatic Memory and Runtime Accounting
@@ -322,6 +323,10 @@ Done when:
   zero-elided chunks, and a 16GiB `ram.backing` allocated at about 264MiB.
   `SPORE_SMOKE_FANOUT_COUNT=3 scripts/smoke-counter-fanout.sh` passed with the
   default 20s capture timeout.
+- Automatic local `ram.backing` restore is proof-gated, not flag-gated.
+  `docs/plans/automatic-local-ram-backing.md` tracks the local provenance
+  contract: product restore paths can use a validated same-host backing fd, while
+  missing or invalid proof falls back to chunks with no user-facing trust mode.
 
 ## Key Learnings From Pressure-Testing
 

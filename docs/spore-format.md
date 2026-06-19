@@ -18,7 +18,8 @@ A spore is a directory:
 <spore>/
 ├── manifest.json
 ├── chunks/<blake3-hex>     # content-addressed data chunks
-└── ram.backing             # optional local same-host RAM acceleration file
+├── ram.backing             # optional local same-host RAM acceleration file
+└── ram.backing.proof       # optional local-only provenance proof
 ```
 
 Spores captured from `spore run --image ... --capture` may also require
@@ -145,16 +146,19 @@ sources, `peer_bytes_read` for HTTP(S) peer sources, `remote_bundle_cache_hit`,
   generation interrupt.
 - `memory`: `chunk_size` plus one entry per chunk — a blake3-hex chunk
   reference, or null for an all-zero chunk. `backing` is optional local
-  acceleration metadata for trusted same-host KVM/HVF fork/fan-out: `kind:
+  acceleration metadata for same-host KVM/HVF fork/fan-out: `kind:
   "map-private-file-v0"`, `path: "ram.backing"`, and `size`. Chunks
-  remain the portable verified source of truth; unsupported backends,
-  imported/cold spores, and normal untrusted restore must ignore `backing` and
-  materialize from chunks instead. KVM and HVF same-host restore can consume
-  backing as a trusted fd supplied by a same-host caller, then map it
+  remain the portable verified source of truth; unsupported backends and
+  imported/cold spores materialize from chunks instead. Product restore paths
+  (`spore resume` and `spore run --from`) may automatically map `ram.backing`
+  only when the local `ram.backing.proof` validates against the manifest memory
+  fingerprint, backing metadata, opened file identity, and host-local runtime
+  key. A missing, corrupt, foreign-key, or mismatched proof falls back to chunks.
+  The proof is local provenance metadata; it is not a portable trust root and
+  does not prove every RAM byte still matches the manifest's chunk refs. KVM and
+  HVF map a validated fd
   `MAP_PRIVATE` to share clean parent pages across fork children while child
-  writes fault into private CoW pages. The product CLI currently restores from
-  chunks; a future monitor or same-host fan-out caller must pass any trusted
-  RAM-backing fd explicitly because the backends do not resolve manifest paths.
+  writes fault into private CoW pages.
 - `rootfs`: optional immutable rootfs artifact required by a captured
   read-only virtio-blk root device. `kind` is
   `immutable-ext4-rootfs-v0`, `mode` is `read-only`, `device` binds the
@@ -212,11 +216,11 @@ sources, `peer_bytes_read` for HTTP(S) peer sources, `remote_bundle_cache_hit`,
 - Immutable rootfs artifacts are portable by digest, not by local path. Resume
   opens the digest-addressed rootfs cache entry read-only, verifies the same fd
   by BLAKE3 and size, and only then attaches it to the VM.
-- Local RAM backing files are same-host acceleration hints, not portable trust
-  roots. The current path/symlink form records locality, not a sealed-fd
-  security boundary. Consumers that need portable or untrusted restore must use
-  the chunk manifest path. Same-host acceleration must pass a sealed
-  RAM-backing fd explicitly, rather than trusting a backing file by pathname.
+- Local RAM backing files and `ram.backing.proof` are same-host acceleration
+  hints, not portable trust roots. Product restore paths treat a valid proof as
+  local provenance for opening a backing fd; invalid or absent proof uses the
+  chunk manifest path. Bundles and pulls remain chunk-authoritative, and proof
+  files must not be treated as distribution authority.
 - Machine state is normalized architectural aarch64 state. Raw KVM structures
   never appear in the format; the only documented temporary exception is the
   explicitly tagged HVF `backend_private` GIC blob, which other backends must
