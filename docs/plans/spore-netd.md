@@ -217,9 +217,11 @@ avoid address allocation, DHCP, or multiple guests per virtual network.
   fixes. The dependency is wired into the `sporevm` module, and
   `src/zmoltcp_gateway.zig` contains a compile-level contract test proving
   SporeVM can build against the caller-owned forwarder surface.
-- The next missing piece is lifecycle integration: capture/resume/fork must
-  record requested network capability and policy without pretending live TCP
-  flow state is portable.
+- One-shot lifecycle integration has landed for captured network spores:
+  capture records requested network capability and policy, `spore run --from`
+  reattaches a fresh helper-backed gateway under the recorded policy, and live
+  TCP flow state remains non-portable. Named lifecycle networking is still
+  deferred.
 
 ## Delivery Strategy
 

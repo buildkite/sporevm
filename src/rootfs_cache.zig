@@ -298,12 +298,8 @@ test "digest cache installs rootfs bytes atomically and verifies final content" 
     _ = std.c.close(fd);
 
     const digest_path = try digestPath(arena, cache_root, artifact.digest);
-    const digest_z = try arena.dupeZ(u8, digest_path);
-    const write_fd = std.c.open(digest_z, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, @as(c_uint, 0));
-    if (write_fd >= 0) {
-        _ = std.c.close(write_fd);
-        return error.TestExpectedError;
-    }
+    const stat = try Io.Dir.cwd().statFile(io, digest_path, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(@as(u32, 0o444), @as(u32, @intCast(@intFromEnum(stat.permissions) & 0o777)));
 
     try Io.Dir.cwd().deleteFile(io, digest_path);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = digest_path, .data = "tampered" });
