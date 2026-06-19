@@ -530,6 +530,19 @@ fn readFdExact(fd: std.c.fd_t, out: []u8) Error!void {
     }
 }
 
+fn readRegularFileAllNoFollow(allocator: std.mem.Allocator, path: [:0]const u8, max: usize) Error![]u8 {
+    const fd = try openReadOnlyNoFollow(path);
+    defer _ = std.c.close(fd);
+    const st = try fstatLocalFile(fd);
+    if (st.size > std.math.maxInt(usize)) return error.BadChunk;
+    const size: usize = @intCast(st.size);
+    if (size > max) return error.BadChunk;
+    const buf = try allocator.alloc(u8, size);
+    errdefer allocator.free(buf);
+    try readFdExact(fd, buf);
+    return buf;
+}
+
 fn proofBackingFromManifest(backing: MemoryBacking) LocalBackingProofBacking {
     return .{
         .kind = backing.kind,
@@ -610,7 +623,7 @@ pub fn openProvenLocalMemoryBacking(
     if (file.size != expected_size) return localBackingChunksPlan("backing_size_mismatch");
 
     const proof_path = try pathZ(allocator, "{s}/{s}", .{ dir, ram_backing_proof_path });
-    const proof_bytes = readFileAll(allocator, proof_path, local_backing_proof_max_bytes) catch return localBackingChunksPlan("proof_unavailable");
+    const proof_bytes = readRegularFileAllNoFollow(allocator, proof_path, local_backing_proof_max_bytes) catch return localBackingChunksPlan("proof_unavailable");
     const parsed = std.json.parseFromSlice(LocalBackingProof, allocator, proof_bytes, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = false,
@@ -1302,6 +1315,18 @@ test "local memory backing proof opens local fd and falls back safely" {
     try std.testing.expectEqual(LocalBackingRestoreSource.chunks, corrupt_plan.source);
     try std.testing.expect(corrupt_plan.fd == null);
     try std.testing.expectEqualStrings("proof_invalid", corrupt_plan.reason);
+
+    try writeLocalMemoryBackingProof(arena, &env, dir, mm, ram.len);
+    const proof_real_path = try pathZ(arena, "{s}/{s}.real", .{ dir, ram_backing_proof_path });
+    if (std.c.rename(proof_path.ptr, proof_real_path.ptr) != 0) return error.IoFailed;
+    try symlinkPath(proof_real_path, proof_path);
+    const symlink_plan = try openProvenLocalMemoryBacking(arena, &env, dir, mm, ram.len);
+    defer if (symlink_plan.fd) |fd| {
+        _ = std.c.close(fd);
+    };
+    try std.testing.expectEqual(LocalBackingRestoreSource.chunks, symlink_plan.source);
+    try std.testing.expect(symlink_plan.fd == null);
+    try std.testing.expectEqualStrings("proof_unavailable", symlink_plan.reason);
 }
 
 test "local memory backing proof rejects foreign key and manifest mismatch" {

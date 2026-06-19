@@ -119,8 +119,9 @@ reboot, resume simply uses chunks.
 Resume behavior:
 
 1. Load and validate the manifest as today.
-2. If `ram.backing` and `ram.backing.proof` exist, open the backing read-only
-   without following symlinks where the platform supports that.
+2. If `ram.backing` and `ram.backing.proof` exist, open both read-only without
+   following symlinks where the platform supports that. The proof must be a
+   regular file.
 3. Validate backing metadata, memory fingerprint, and proof MAC.
 4. If every check passes, pass the fd to the backend for `MAP_PRIVATE` restore.
 5. Record the selected restore source as `local_backing`.
@@ -159,11 +160,12 @@ parent proof before hard-linking local backing into children and writing
 child-local proofs, and product `spore resume` automatically chooses between
 `local_backing` and `chunks`.
 
-The proof is validated with bounded metadata-scale work. It checks the manifest
-memory fingerprint, canonical backing metadata, opened file identity, producer,
-and HMAC from the host-local runtime key. Missing proof, corrupt proof, missing
-or foreign key, file identity mismatch, or manifest mismatch all fall back to
-verified chunks.
+The proof is validated with bounded metadata-scale work. It is opened without
+following symlinks, must be a regular file, and is capped at 16KiB before JSON
+parsing. It checks the manifest memory fingerprint, canonical backing metadata,
+opened file identity, producer, and HMAC from the host-local runtime key. Missing
+proof, corrupt proof, symlinked proof, missing or foreign key, file identity
+mismatch, or manifest mismatch all fall back to verified chunks.
 
 ## Delivery Strategy
 
@@ -217,7 +219,7 @@ Done when:
 ## Verification
 
 - Unit tests for memory fingerprinting, proof MAC validation, bad proof fallback,
-  wrong manifest fallback, and foreign-key fallback.
+  wrong manifest fallback, foreign-key fallback, and symlinked proof fallback.
 - Fork tests that children get hard-linked backing plus child-local proof, or no
   backing metadata when hard-linking is unavailable.
 - Tests that proof validation ignores link count and ctime but rejects wrong
