@@ -1261,6 +1261,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .continue_after_capture = capture_plan.continue_after_capture,
                 .dirty_tracking = .{ .enabled = capture_plan.dirty_tracking.enabled, .epoch_ms = capture_plan.dirty_tracking.epoch_ms },
                 .network = network,
+                .environ_map = init.environ_map,
             });
         },
         .kvm => blk: {
@@ -1283,6 +1284,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .continue_after_capture = capture_plan.continue_after_capture,
                 .dirty_tracking = .{ .enabled = capture_plan.dirty_tracking.enabled, .epoch_ms = capture_plan.dirty_tracking.epoch_ms },
                 .network = network,
+                .environ_map = init.environ_map,
             });
         },
     }) catch |err| {
@@ -1330,6 +1332,7 @@ pub fn executeMonitor(init: std.process.Init, allocator: std.mem.Allocator, opts
                 .resume_dir = opts.resume_dir,
                 .ram_restore_mode = .eager_chunks,
                 .exec_control = control,
+                .environ_map = init.environ_map,
             });
         },
         .kvm => blk: {
@@ -1345,6 +1348,7 @@ pub fn executeMonitor(init: std.process.Init, allocator: std.mem.Allocator, opts
                 .resume_dir = opts.resume_dir,
                 .ram_restore_mode = .eager_chunks,
                 .exec_control = control,
+                .environ_map = init.environ_map,
             });
         },
     };

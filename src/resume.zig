@@ -116,6 +116,11 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
 
     const backend = try resolveBackend(opts.backend);
     const ram_size = resumeRamSize(parsed.value.platform);
+    const local_backing = try spore.openProvenLocalMemoryBacking(allocator, init.environ_map, opts.spore_dir, parsed.value.memory, ram_size);
+    defer if (local_backing.fd) |fd| {
+        _ = std.c.close(fd);
+    };
+    std.log.info("resume memory restore source={s} reason={s}", .{ @tagName(local_backing.source), local_backing.reason });
     const cause = switch (backend) {
         .auto => unreachable,
         .hvf => blk: {
@@ -126,6 +131,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .console_sink = consoleSink,
                 .disk_fd = rootfs_fd,
                 .resume_dir = opts.spore_dir,
+                .ram_backing_fd = local_backing.fd,
                 .network = network,
                 .exec_probe = identity_probe,
                 .exec_probe_timeout_ms = generation_probe_timeout_ms,
@@ -142,6 +148,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .console_sink = consoleSink,
                 .disk_fd = rootfs_fd,
                 .resume_dir = opts.spore_dir,
+                .ram_backing_fd = local_backing.fd,
                 .network = network,
                 .exec_probe = identity_probe,
                 .exec_probe_timeout_ms = generation_probe_timeout_ms,

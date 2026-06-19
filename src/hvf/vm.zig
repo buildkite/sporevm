@@ -44,11 +44,14 @@ pub const Config = struct {
     poll_stdin: bool = false,
     /// Resume from a spore directory instead of booting the kernel.
     resume_dir: ?[]const u8 = null,
-    /// Trusted same-host RAM backing fd supplied by the caller or future
-    /// monitor. The fd must refer to the manifest's optional RAM backing and
-    /// is mapped MAP_PRIVATE; imported or untrusted spores must leave this
-    /// null so RAM is materialized through verified chunks.
+    /// Proof-validated or harness-supplied same-host RAM backing fd. The fd
+    /// must refer to the manifest's optional RAM backing and is mapped
+    /// MAP_PRIVATE; imported or unproven spores must leave this null so RAM is
+    /// materialized through verified chunks.
     ram_backing_fd: ?std.c.fd_t = null,
+    /// Product callers provide their environment so snapshot code can write
+    /// local-only RAM backing proofs under the configured runtime root.
+    environ_map: ?*const std.process.Environ.Map = null,
     /// Chunk restore strategy for cold/imported HVF resumes. Eager remains the
     /// default; lazy is an explicit development path backed by RAM abort exits
     /// on unmapped guest memory.
@@ -295,7 +298,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             stats.nonzero_chunk_count = memory_plan.nonzero_chunk_count;
         }
         if (ram_mapping.file_backed) {
-            if (restore_stats) |*stats| stats.mode = "trusted_file_backed";
+            if (restore_stats) |*stats| stats.mode = "local_backing";
         } else switch (config.ram_restore_mode) {
             .eager_chunks => {
                 if (restore_stats) |*stats| stats.mode = "eager_chunks";
@@ -429,7 +432,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                         .dist_base = dist_base,
                         .redist_base = vcpu_redist_base,
                         .ram_size = config.ram_size,
-                    }, config.rootfs, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null);
+                    }, config.rootfs, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
                     return .snapshotted;
                 },
             }
@@ -443,7 +446,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     .dist_base = dist_base,
                     .redist_base = vcpu_redist_base,
                     .ram_size = config.ram_size,
-                }, config.rootfs, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null);
+                }, config.rootfs, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
                 request_capture.markCompleted();
                 if (request_capture.isAbortRequested()) return error.CaptureAborted;
                 if (config.continue_after_capture) {
@@ -468,7 +471,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                                 .dist_base = dist_base,
                                 .redist_base = vcpu_redist_base,
                                 .ram_size = config.ram_size,
-                            }, config.rootfs, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null);
+                            }, config.rootfs, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
                             return .snapshotted;
                         }
                         return .probe_complete;
@@ -491,7 +494,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                     .dist_base = dist_base,
                     .redist_base = vcpu_redist_base,
                     .ram_size = config.ram_size,
-                }, config.rootfs, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null);
+                }, config.rootfs, config.network_manifest, if (dirty_tracker) |*tracker| tracker else null, config.environ_map);
                 return .snapshotted;
             }
         }
@@ -953,6 +956,7 @@ fn takeSnapshot(
     rootfs: ?spore.Rootfs,
     network_manifest: ?spore.Network,
     dirty_tracker: ?*DirtyTracker,
+    environ_map: ?*const std.process.Environ.Map,
 ) !void {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -980,6 +984,11 @@ fn takeSnapshot(
     else
         try spore.saveMemoryWithBacking(arena, dir, ram_bytes);
     const memory_ms = monotonicMs() - memory_start;
+    if (environ_map) |environ| {
+        spore.writeLocalMemoryBackingProof(arena, environ, dir, memory, platform.ram_size) catch |err| {
+            std.log.debug("local RAM backing proof unavailable: {s}", .{@errorName(err)});
+        };
+    }
     const manifest_start = monotonicMs();
     try spore.saveManifest(arena, dir, .{
         .platform = .{

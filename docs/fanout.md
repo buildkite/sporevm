@@ -12,6 +12,14 @@ Children are named `000000` through zero-padded `N-1` and share the parent's
 chunk store. `spore fanout` is local orchestration over child spore directories;
 distributed offset/range partitioning is deferred.
 
+When the parent has a proof-validated local `ram.backing` file, `spore fork`
+hard-links that file into each child and writes a child-local
+`ram.backing.proof`. If the parent proof is missing or stale, children omit
+backing metadata and resume from chunks. `spore fanout` does not need a trust
+flag or special mode: each child uses normal `spore resume`, which maps local
+backing only when the proof validates and otherwise restores from verified
+chunks.
+
 ## Local Child Identity
 
 For a local fork batch, each child records explicit Buildkite-shaped SporeVM
