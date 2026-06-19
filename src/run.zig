@@ -37,10 +37,6 @@ const direct_image_platform = rootfs_mod.Platform{};
 const max_rootfs_metadata_bytes = 1024 * 1024;
 const max_image_ref_cache_record_bytes = 64 * 1024;
 const image_ref_cache_record_version: u32 = 1;
-// Product capture needs a coherent run-bridge snapshot; seal the final dirty
-// set at capture time instead of racing a periodic worker against the active
-// exec/vsock session.
-const product_capture_dirty_epoch_ms = 0;
 
 pub const Backend = enum {
     auto,
@@ -332,7 +328,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         std.debug.print("spore run: --continue-after-capture requires --capture\n", .{});
         std.process.exit(2);
     }
-    if (continue_after_capture and captureTriggerIsExit(capture_trigger)) {
+    if (continue_after_capture and capture_trigger.isExit()) {
         std.debug.print("spore run: --continue-after-capture requires a signal capture trigger\n", .{});
         std.process.exit(2);
     }
@@ -1232,11 +1228,15 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     var capture_request = capture.Request{};
     var signal_registration: ?capture.SignalRegistration = null;
     defer if (signal_registration) |*registration| registration.deinit();
-    const signal_capture = opts.capture_path != null and captureTriggerSignal(opts.capture_trigger) != null;
-    const exit_capture = opts.capture_path != null and captureTriggerIsExit(opts.capture_trigger);
-    const capture_request_ptr: ?*capture.Request = if (signal_capture) &capture_request else null;
-    if (capture_request_ptr) |request_capture| {
-        signal_registration = capture.SignalRegistration.install(captureTriggerSignal(opts.capture_trigger).?, request_capture);
+    const capture_plan = capture.Plan.productRun(.{
+        .capture_path = opts.capture_path,
+        .trigger = opts.capture_trigger,
+        .resume_dir = opts.resume_dir,
+        .request = &capture_request,
+        .continue_after_capture = opts.continue_after_capture,
+    });
+    if (capture_plan.signal) |signal| {
+        signal_registration = capture.SignalRegistration.install(signal, capture_plan.request.?);
     }
 
     const cause = (switch (backend) {
@@ -1255,11 +1255,11 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .resume_dir = opts.resume_dir,
                 .exec_probe = &stream,
                 .exec_probe_timeout_ms = opts.timeout_ms,
-                .snapshot_dir = opts.capture_path,
-                .snapshot_on_probe_complete = exit_capture,
-                .capture_request = capture_request_ptr,
-                .continue_after_capture = opts.continue_after_capture,
-                .dirty_tracking = .{ .enabled = shouldDirtyTrackRunCapture(opts), .epoch_ms = product_capture_dirty_epoch_ms },
+                .snapshot_dir = capture_plan.snapshot_dir,
+                .snapshot_on_probe_complete = capture_plan.snapshot_on_probe_complete,
+                .capture_request = capture_plan.request,
+                .continue_after_capture = capture_plan.continue_after_capture,
+                .dirty_tracking = .{ .enabled = capture_plan.dirty_tracking.enabled, .epoch_ms = capture_plan.dirty_tracking.epoch_ms },
                 .network = network,
             });
         },
@@ -1277,34 +1277,30 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .resume_dir = opts.resume_dir,
                 .exec_probe = &stream,
                 .exec_probe_timeout_ms = opts.timeout_ms,
-                .snapshot_dir = opts.capture_path,
-                .snapshot_on_probe_complete = exit_capture,
-                .capture_request = capture_request_ptr,
-                .continue_after_capture = opts.continue_after_capture,
-                .dirty_tracking = .{ .enabled = shouldDirtyTrackRunCapture(opts), .epoch_ms = product_capture_dirty_epoch_ms },
+                .snapshot_dir = capture_plan.snapshot_dir,
+                .snapshot_on_probe_complete = capture_plan.snapshot_on_probe_complete,
+                .capture_request = capture_plan.request,
+                .continue_after_capture = capture_plan.continue_after_capture,
+                .dirty_tracking = .{ .enabled = capture_plan.dirty_tracking.enabled, .epoch_ms = capture_plan.dirty_tracking.epoch_ms },
                 .network = network,
             });
         },
     }) catch |err| {
-        if (signal_capture and capture_request.isCompleted() and isCaptureAborted(err)) {
+        if (capture_plan.isSignalCapture() and capture_request.isCompleted() and isCaptureAborted(err)) {
             return resultFromAbortedSignalCapture(backend, opts, &stream);
         }
         return err;
     };
     if (gateway_active and gateway.hasFailed()) return error.NetworkGatewayFailed;
-    const signal_capture_observed = signal_capture and capture_request.isCompleted();
+    const signal_capture_observed = capture_plan.isSignalCapture() and capture_request.isCompleted();
     return switch (cause) {
         .probe_complete => resultFromStream(backend, opts, &stream, signal_capture_observed),
-        .snapshotted => if (exit_capture)
+        .snapshotted => if (capture_plan.isExitCapture())
             resultFromExitCapture(backend, opts, &stream)
         else
             resultFromSignalCapture(backend, opts, &stream),
         else => error.ProbeDidNotComplete,
     };
-}
-
-fn shouldDirtyTrackRunCapture(opts: Options) bool {
-    return opts.capture_path != null and opts.resume_dir == null;
 }
 
 pub fn executeMonitor(init: std.process.Init, allocator: std.mem.Allocator, opts: Options, control: vsock.Control) !MonitorResult {
@@ -1519,20 +1515,6 @@ fn resultFromExitCapture(backend: Backend, opts: Options, stream: *const vsock.H
         .memory_bytes = opts.memory.bytes,
         .captured = true,
         .capture_path = opts.capture_path,
-    };
-}
-
-fn captureTriggerSignal(trigger: capture.Trigger) ?capture.Signal {
-    return switch (trigger) {
-        .exit => null,
-        .signal => |signal| signal,
-    };
-}
-
-fn captureTriggerIsExit(trigger: capture.Trigger) bool {
-    return switch (trigger) {
-        .exit => true,
-        .signal => false,
     };
 }
 
@@ -1800,7 +1782,7 @@ test "run network gateway errors are reported clearly" {
 test "run cli parser accepts capture flags" {
     const opts = try parseCliArgs(&.{ "--capture", "out.spore", "--capture-on", "USR1", "--continue-after-capture", "--", "/bin/sleeper" });
     try std.testing.expectEqualStrings("out.spore", opts.capture_path.?);
-    try std.testing.expectEqual(capture.Signal.USR1, captureTriggerSignal(opts.capture_trigger).?);
+    try std.testing.expectEqual(capture.Signal.USR1, opts.capture_trigger.signalValue().?);
     try std.testing.expect(opts.continue_after_capture);
     try std.testing.expectEqual(@as(usize, 1), opts.command.len);
     try std.testing.expectEqualStrings("/bin/sleeper", opts.command[0]);
@@ -1809,7 +1791,7 @@ test "run cli parser accepts capture flags" {
 test "run cli parser defaults capture trigger to exit" {
     const opts = try parseCliArgs(&.{ "--capture", "out.spore", "--", "/bin/true" });
     try std.testing.expectEqualStrings("out.spore", opts.capture_path.?);
-    try std.testing.expect(captureTriggerIsExit(opts.capture_trigger));
+    try std.testing.expect(opts.capture_trigger.isExit());
     try std.testing.expect(!opts.continue_after_capture);
 }
 
