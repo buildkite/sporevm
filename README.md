@@ -81,8 +81,9 @@ create, exec, list, and remove. Disk-backed lifecycle suspend/resume remains
 follow-up work. The backend smoke harnesses still exercise lower-level capture
 paths directly.
 
-Current active work is concentrated in remote proof for rootfs and disk
-artifacts, disk performance guardrails, and named lifecycle speed/KVM parity.
+Current active work after the v0.1.0 baseline is concentrated in disk
+performance guardrails, disk-backed named lifecycle suspend/resume, and
+cross-backend restore diagnostics.
 
 ## Development
 
