@@ -145,7 +145,7 @@ fn runCommand(
             }
             exitUnexpectedArgument(arena, stderr, mode, "host-info", command_args[0]);
         }
-        const info = try sporevm.platform.hostInfo();
+        const info = try sporevm.platform.hostInfo(arena, init.environ_map);
         if (mode == .json) {
             try machine_output.writeJson(arena, stdout, info);
         } else {
@@ -616,10 +616,37 @@ fn inspectSummary(manifest: sporevm.spore.Manifest) InspectSummary {
 
 fn writeHostInfo(writer: *Io.Writer, info: sporevm.platform.HostInfo) !void {
     try writer.writeAll("Host info\n");
-    try writer.print("  Arch: {s}\n", .{info.arch});
-    try writer.print("  CPU profile: {s}\n", .{info.cpu_profile});
-    try writer.print("  Device model version: {d}\n", .{info.device_model_version});
-    try writer.print("  Counter frequency: {d} Hz ({s})\n", .{ info.counter_frequency_hz, info.counter_frequency_source });
+    try writer.print("  Class: {s}\n", .{info.host_class});
+    try writer.print("  Platform: {s}/{s}\n", .{ info.platform.os, info.platform.arch });
+    try writer.print("  CPU profile: {s}\n", .{info.platform.cpu_profile});
+    try writer.print("  Device model version: {d}\n", .{info.platform.device_model_version});
+    try writer.print("  Counter frequency: {d} Hz ({s})\n", .{ info.platform.counter_frequency_hz, info.platform.counter_frequency_source });
+    try writer.writeAll("  Backends:\n");
+    for (info.backends) |backend| {
+        try writer.print("    {s}: supported={s} available={s} reason={s}\n", .{
+            backend.name,
+            yesNo(backend.supported),
+            yesNo(backend.available),
+            backend.reason,
+        });
+    }
+    try writer.writeAll("  Cache roots:\n");
+    try writePathFact(writer, "kernels", info.cache_roots.kernels);
+    try writePathFact(writer, "rootfs", info.cache_roots.rootfs);
+    try writePathFact(writer, "bundles", info.cache_roots.bundles);
+    try writePathFact(writer, "runtime", info.cache_roots.runtime);
+}
+
+fn writePathFact(writer: *Io.Writer, label: []const u8, fact: sporevm.platform.PathFact) !void {
+    if (fact.path) |path| {
+        try writer.print("    {s}: {s}\n", .{ label, path });
+    } else {
+        try writer.print("    {s}: unresolved ({s})\n", .{ label, fact.source });
+    }
+}
+
+fn yesNo(value: bool) []const u8 {
+    return if (value) "yes" else "no";
 }
 
 fn writeInspectSummary(writer: *Io.Writer, summary: InspectSummary) !void {

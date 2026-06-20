@@ -256,7 +256,10 @@ The first implementation should pin a small stable code table in tests:
   command dispatch, supported machine-mode parser failures emit
   `spore.error.v1`, existing JSON-default single-result commands have human
   defaults, and `system` now uses global JSON instead of command-local `--json`.
-- Slices 2 through 5 are still pending.
+- Slice 2 is implemented in this branch: `host-info` now emits
+  `spore.host-info.v1` under global `--json` and a human summary by default,
+  with host class, platform facts, backend availability, and cache roots.
+- Slices 3 through 5 are still pending.
 
 ## Delivery Strategy
 
