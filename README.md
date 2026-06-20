@@ -132,7 +132,8 @@ next semantic version from conventional commits with `svu`, verifies
 `src/root.zig` matches that version, and pushes the tag. The Buildkite tag build
 publishes GoReleaser archives for Linux ARM64 and macOS ARM64. The pipeline
 must build tags and provide `SPOREVM_GITHUB_RELEASE_TOKEN` to the release job.
-Use `mise run release:snapshot` to build the release archives locally without
+Pre-1.0 releases are published as GitHub prereleases. Use
+`mise run release:snapshot` to build the release archives locally without
 publishing.
 
 KVM work needs an aarch64 Linux host with KVM. Hypervisor.framework work needs
