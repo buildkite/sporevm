@@ -135,7 +135,7 @@ fi
   die "second spore exec wrote unexpected stdout"
 }
 
-if run_capture "${ls_stdout}" "${ls_stderr}" env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" ls; then
+if run_capture "${ls_stdout}" "${ls_stderr}" env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" --json ls; then
   :
 else
   status=$?
@@ -160,7 +160,7 @@ else
   require_success "${status}" "spore rm" "${rm_stderr}"
 fi
 
-if run_capture "${ls_after_stdout}" "${ls_after_stderr}" env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" ls; then
+if run_capture "${ls_after_stdout}" "${ls_after_stderr}" env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" --json ls; then
   :
 else
   status=$?

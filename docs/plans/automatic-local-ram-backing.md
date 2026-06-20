@@ -194,7 +194,7 @@ Done when:
 
 Make the local-only boundary explicit everywhere state moves. `spore pack`,
 `spore unpack`, and `spore pull` should ignore or strip proof files the same way
-portable bundles strip local backing metadata. `spore ls --json` can expose the
+portable bundles strip local backing metadata. `spore --json ls` can expose the
 same restore-source state once named runtime stats have a cheap source for it.
 
 Done when:

@@ -6,6 +6,7 @@ const Io = std.Io;
 const net = std.Io.net;
 
 const local_paths = @import("local_paths.zig");
+const machine_output = @import("machine_output.zig");
 const memory_config = @import("memory.zig");
 const run_mod = @import("run.zig");
 const spore = @import("spore.zig");
@@ -92,6 +93,9 @@ const ls_usage =
     \\
     \\Options:
     \\  -h, --help              Show this help
+    \\
+    \\Machine output:
+    \\  spore --json ls         Emit the VM list as JSON
     \\
 ;
 
@@ -408,21 +412,88 @@ pub fn resumeCli(init: std.process.Init, args: []const []const u8, stdout: *Io.W
     try waitForReady("resume", allocator, init.io, paths, spec.timeout_ms);
 }
 
-pub fn lsCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
+pub fn lsCli(
+    init: std.process.Init,
+    args: []const []const u8,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+) !void {
     if (wantsHelp(args)) {
+        if (mode == .json) {
+            exitLifecycleCliError(
+                init.arena.allocator(),
+                stderr,
+                mode,
+                machine_output.usageInvalidArgument("spore --json ls does not support help output", "ls"),
+                "spore --json ls does not support help output",
+            );
+        }
         try stdout.writeAll(ls_usage);
         return;
     }
-    if (args.len != 0) usageExit(ls_usage);
+    if (args.len != 0) {
+        if (args.len == 1 and std.mem.eql(u8, args[0], "--json")) {
+            exitLifecycleCliError(
+                init.arena.allocator(),
+                stderr,
+                mode,
+                machine_output.usageInvalidArgument("spore ls: use global --json before the command", "ls"),
+                "spore ls: use global --json before the command",
+            );
+        }
+        const message = "usage: spore ls";
+        exitLifecycleCliError(
+            init.arena.allocator(),
+            stderr,
+            mode,
+            machine_output.usageInvalidArgument(message, "ls"),
+            ls_usage,
+        );
+    }
 
     const allocator = init.arena.allocator();
-    const root = runtimeRootPath(allocator, init.environ_map) catch |err| {
-        cliRuntimePathExit("ls", err);
+    const root = runtimeRootPath(allocator, init.environ_map) catch |err| switch (err) {
+        error.InvalidRuntimeDir => {
+            const message = allocLifecycleMessage(allocator, "spore ls: invalid runtime directory; set {s} or XDG_RUNTIME_DIR to an absolute path", .{runtime_dir_env});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "ls"), message);
+        },
+        else => |e| return e,
     };
-    const entries = try listEntries(allocator, init.io, root, pidAlive);
-    const json = try std.json.Stringify.valueAlloc(allocator, entries, .{ .whitespace = .indent_2 });
-    try stdout.writeAll(json);
-    try stdout.writeByte('\n');
+    const entries = listEntries(allocator, init.io, root, pidAlive) catch |err| switch (err) {
+        error.InvalidRuntimeDir => {
+            const message = "spore ls: invalid runtime directory";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "ls"), message);
+        },
+        error.InsecureRuntimeDir => {
+            const message = "spore ls: insecure runtime directory; registry directories must be private to the current user";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "ls"), message);
+        },
+        else => |e| return e,
+    };
+    if (mode == .json) {
+        try machine_output.writeJson(allocator, stdout, entries);
+    } else {
+        try writeListEntries(stdout, entries);
+    }
+}
+
+fn writeListEntries(writer: *Io.Writer, entries: []const ListEntry) !void {
+    if (entries.len == 0) {
+        try writer.writeAll("No VMs\n");
+        return;
+    }
+
+    try writer.writeAll("NAME\tSTATE\tPID\n");
+    for (entries) |entry| {
+        try writer.print("{s}\t{s}\t", .{ entry.name, entry.state });
+        if (entry.pid) |pid| {
+            try writer.print("{d}", .{pid});
+        } else {
+            try writer.writeByte('-');
+        }
+        try writer.writeByte('\n');
+    }
 }
 
 pub fn validateName(name: []const u8) !void {
@@ -1053,6 +1124,27 @@ fn usageExit(comptime text: []const u8) noreturn {
     std.process.exit(2);
 }
 
+fn allocLifecycleMessage(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) []const u8 {
+    return std.fmt.allocPrint(allocator, fmt, args) catch "CLI argument error";
+}
+
+fn exitLifecycleCliError(
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+    err: machine_output.CliError,
+    human_text: []const u8,
+) noreturn {
+    if (mode == .json) {
+        machine_output.writeError(allocator, stderr, err) catch {};
+    } else {
+        stderr.writeAll(human_text) catch {};
+        if (!std.mem.endsWith(u8, human_text, "\n")) stderr.writeByte('\n') catch {};
+    }
+    stderr.flush() catch {};
+    std.process.exit(err.exit_code);
+}
+
 fn validateNameOrExit(command: []const u8, name: []const u8) !void {
     validateName(name) catch {
         std.debug.print("spore {s}: invalid VM name: {s}\n", .{ command, name });
@@ -1371,6 +1463,27 @@ test "lifecycle list entries sorts and classifies VM directories" {
     try std.testing.expectEqualStrings("b-stale", entries[1].name);
     try std.testing.expectEqualStrings("stale", entries[1].state);
     try std.testing.expectEqual(@as(?i64, 9001), entries[1].pid);
+}
+
+test "lifecycle list entries render human table" {
+    const allocator = std.testing.allocator;
+    var out: Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try writeListEntries(&out.writer, &.{
+        .{ .name = "a-ready", .state = "ready", .pid = 42 },
+        .{ .name = "b-stale", .state = "stale", .pid = null },
+    });
+    try std.testing.expectEqualStrings(
+        "NAME\tSTATE\tPID\n" ++
+            "a-ready\tready\t42\n" ++
+            "b-stale\tstale\t-\n",
+        out.written(),
+    );
+
+    out.clearRetainingCapacity();
+    try writeListEntries(&out.writer, &.{});
+    try std.testing.expectEqualStrings("No VMs\n", out.written());
 }
 
 fn alwaysDead(_: i64) bool {

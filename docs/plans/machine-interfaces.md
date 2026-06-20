@@ -107,6 +107,7 @@ For one-document machine output:
 ```console
 spore --json host-info
 spore --json inspect <spore-dir>
+spore --json ls
 spore --json inspect-bundle <bundle-ref> [--child ID|--child-range START..END]
 spore --json pull <bundle-ref> --child ID --out <spore-dir>
 ```
@@ -255,7 +256,8 @@ The first implementation should pin a small stable code table in tests:
 - Slice 1 is implemented in this branch: global `--json` is parsed before
   command dispatch, supported machine-mode parser failures emit
   `spore.error.v1`, existing JSON-default single-result commands have human
-  defaults, and `system` now uses global JSON instead of command-local `--json`.
+  defaults, `ls` now uses a human table by default, and `system` and `ls` now
+  use global JSON instead of command-local `--json`.
 - Slice 2 is implemented in this branch: `host-info` now emits
   `spore.host-info.v1` under global `--json` and a human summary by default,
   with host class, platform facts, backend availability, and cache roots.

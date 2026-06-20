@@ -133,7 +133,7 @@ fn runCommand(
     } else if (std.mem.eql(u8, command, "suspend")) {
         try sporevm.lifecycle.suspendCli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "ls")) {
-        try sporevm.lifecycle.lsCli(init, command_args, stdout);
+        try sporevm.lifecycle.lsCli(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "monitor")) {
         try sporevm.monitor.cli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "netd")) {
@@ -268,6 +268,7 @@ fn supportsJson(command: []const u8) bool {
     return std.mem.eql(u8, command, "system") or
         std.mem.eql(u8, command, "host-info") or
         std.mem.eql(u8, command, "inspect") or
+        std.mem.eql(u8, command, "ls") or
         std.mem.eql(u8, command, "fork") or
         std.mem.eql(u8, command, "pack") or
         std.mem.eql(u8, command, "unpack") or
