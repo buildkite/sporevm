@@ -267,9 +267,14 @@ The first implementation should pin a small stable code table in tests:
   `--events=jsonl`, stdout is JSONL in event mode, run guest stdout/stderr are
   base64-encoded typed events, resume console bytes are typed stdout events,
   vsock readiness emits `ready`, and runtime terminal failures emit
-  `failure` records using the shared error classification. Parser/setup direct
-  exits remain part of the slice 5 API-boundary cleanup.
-- Slice 5 is still pending.
+  `failure` records using the shared error classification. Older parser/setup
+  direct exits remain a follow-up hardening item outside the runtime stream
+  path.
+- Slice 5 is implemented in this branch: `src/api.zig` exposes option-based
+  internal calls for host-info, inspect-bundle, pull, run, and resume, pull
+  cache selection uses explicit `env`/`none`/`path` choices, and the CLI routes
+  host-info, inspect-bundle, and pull through the API boundary instead of using
+  command parsing as the product interface.
 
 ## Delivery Strategy
 

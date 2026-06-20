@@ -147,7 +147,7 @@ fn runCommand(
             }
             exitUnexpectedArgument(arena, stderr, mode, "host-info", command_args[0]);
         }
-        const info = try sporevm.platform.hostInfo(arena, init.environ_map);
+        const info = try sporevm.api.hostInfo(arena, init.environ_map);
         if (mode == .json) {
             try machine_output.writeJson(arena, stdout, info);
         } else {
@@ -576,7 +576,7 @@ fn inspectBundleCommand(
         exitUsage(allocator, stderr, mode, "inspect-bundle", "usage: spore inspect-bundle <bundle-ref> [--child ID|--child-range START..END]");
     }
 
-    return sporevm.bundle.inspectBundle(allocator, .{
+    return sporevm.api.inspectBundle(allocator, .{
         .source = source.?,
         .child_id = child_id,
         .child_range = child_range,
@@ -622,12 +622,9 @@ fn pullCommand(
         exitUsage(allocator, stderr, mode, "pull", "usage: spore pull file://BUNDLE|s3://BUNDLE@sha256:DIGEST|http(s)://BUNDLE@sha256:DIGEST [--child ID] [--allow-metadata-only-rootfs] --out DIR [--region REGION]");
     }
 
-    return sporevm.bundle.pull(allocator, .{
-        .io = init.io,
+    return sporevm.api.pull(init, allocator, .{
         .source = source.?,
         .out_dir = out_dir.?,
-        .rootfs_cache_dir = optionalRootfsCacheRoot(allocator, init),
-        .bundle_cache_dir = optionalBundleCacheRoot(allocator, init),
         .child_id = child_id,
         .allow_metadata_only_rootfs = allow_metadata_only_rootfs,
         .aws_region = aws_region,
@@ -663,10 +660,6 @@ fn parseRootfsBundlePolicy(value: []const u8) ?sporevm.bundle.RootfsBundlePolicy
 
 fn optionalRootfsCacheRoot(allocator: std.mem.Allocator, init: std.process.Init) ?[]const u8 {
     return sporevm.local_paths.rootfsCacheRootPath(allocator, init.environ_map) catch null;
-}
-
-fn optionalBundleCacheRoot(allocator: std.mem.Allocator, init: std.process.Init) ?[]const u8 {
-    return sporevm.local_paths.bundleCacheRootPath(allocator, init.environ_map) catch null;
 }
 
 const InspectSummary = struct {
