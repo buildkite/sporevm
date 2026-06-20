@@ -36,8 +36,9 @@ when intentionally measuring the full cold image path.
 
 ### Cold TTI
 
-Cold TTI follows the ComputeSDK benchmark shape: timer starts before sandbox
-creation and stops when the first command returns.
+Cold TTI follows the ComputeSDK benchmark shape: the timer starts before
+`spore run` creates the sandbox and stops when the `spore run` process exits
+after the command completes.
 
 ```text
 spore run --image node@sha256:... --memory auto -- /usr/local/bin/node -v

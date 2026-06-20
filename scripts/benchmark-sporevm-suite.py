@@ -127,6 +127,8 @@ def run_command(
                 check=False,
             )
         return completed.returncode, monotonic_ms() - started, None
+    except OSError as err:
+        return 127, monotonic_ms() - started, str(err)
     except subprocess.TimeoutExpired:
         return 124, monotonic_ms() - started, f"timed out after {timeout_s}s"
 
@@ -224,7 +226,7 @@ class BenchmarkRunner:
         self.bundle_cache_dir.mkdir(parents=True, exist_ok=True)
         if self.args.build:
             self.build()
-        if not self.spore_bin.exists():
+        if not self.spore_bin.is_file() or not os.access(self.spore_bin, os.X_OK):
             die(f"spore binary not executable: {self.spore_bin}")
         self.resolve_image()
         if self.args.prewarm_rootfs:
