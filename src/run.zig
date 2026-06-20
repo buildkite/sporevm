@@ -15,6 +15,7 @@ const kvm = if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)
 else
     struct {};
 const local_paths = @import("local_paths.zig");
+const machine_output = @import("machine_output.zig");
 const memory_config = @import("memory.zig");
 const net_gateway = @import("net_gateway.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
@@ -87,11 +88,22 @@ pub const Options = struct {
     continue_after_capture: bool = false,
     network: NetworkMode = .disabled,
     network_policy: spore_net_policy.Config = .{},
+    event_writer: ?*EventWriter = null,
 };
 
 pub const NetworkMode = enum {
     disabled,
     spore,
+};
+
+pub const EventMode = enum {
+    none,
+    jsonl,
+
+    pub fn parse(raw: []const u8) ?EventMode {
+        if (std.mem.eql(u8, raw, "jsonl")) return .jsonl;
+        return null;
+    }
 };
 
 pub const Result = struct {
@@ -111,6 +123,179 @@ pub const Result = struct {
         return @intCast(self.exit_code);
     }
 };
+
+pub const EventWriter = struct {
+    allocator: std.mem.Allocator,
+    writer: *Io.Writer,
+    command: []const u8,
+    backend: ?[]const u8 = null,
+    ready_emitted: bool = false,
+    terminal_emitted: bool = false,
+    stdout_offset: u64 = 0,
+    stderr_offset: u64 = 0,
+    write_failed: bool = false,
+
+    pub fn init(allocator: std.mem.Allocator, writer: *Io.Writer, command: []const u8) EventWriter {
+        return .{
+            .allocator = allocator,
+            .writer = writer,
+            .command = command,
+        };
+    }
+
+    pub fn emitStart(self: *EventWriter, requested_backend: Backend) !void {
+        const event = struct {
+            schema: []const u8 = machine_output.run_events_schema,
+            schema_version: u32 = machine_output.run_events_schema_version,
+            event: []const u8 = "start",
+            command: []const u8,
+            requested_backend: []const u8,
+        }{
+            .command = self.command,
+            .requested_backend = requested_backend.name(),
+        };
+        try self.write(event);
+    }
+
+    pub fn setBackend(self: *EventWriter, backend: Backend) void {
+        self.backend = backend.name();
+    }
+
+    pub fn emitReady(self: *EventWriter) !void {
+        if (self.ready_emitted) return;
+        self.ready_emitted = true;
+        const event = struct {
+            schema: []const u8 = machine_output.run_events_schema,
+            schema_version: u32 = machine_output.run_events_schema_version,
+            event: []const u8 = "ready",
+            command: []const u8,
+            backend: ?[]const u8,
+        }{
+            .command = self.command,
+            .backend = self.backend,
+        };
+        try self.write(event);
+    }
+
+    pub fn emitOutput(self: *EventWriter, output: vsock.HostStreamOutput, bytes: []const u8) !void {
+        if (bytes.len == 0) return;
+        try self.emitReady();
+        const offset = switch (output) {
+            .stdout => self.stdout_offset,
+            .stderr => self.stderr_offset,
+        };
+        const data_base64 = try base64Alloc(self.allocator, bytes);
+        defer self.allocator.free(data_base64);
+        const event = struct {
+            schema: []const u8 = machine_output.run_events_schema,
+            schema_version: u32 = machine_output.run_events_schema_version,
+            event: []const u8,
+            command: []const u8,
+            backend: ?[]const u8,
+            offset: u64,
+            byte_count: usize,
+            data_base64: []const u8,
+        }{
+            .event = @tagName(output),
+            .command = self.command,
+            .backend = self.backend,
+            .offset = offset,
+            .byte_count = bytes.len,
+            .data_base64 = data_base64,
+        };
+        try self.write(event);
+        const inc: u64 = @intCast(bytes.len);
+        switch (output) {
+            .stdout => self.stdout_offset += inc,
+            .stderr => self.stderr_offset += inc,
+        }
+    }
+
+    pub fn emitExit(self: *EventWriter, result: Result) !void {
+        if (self.terminal_emitted) return;
+        self.setBackend(result.backend);
+        try self.emitReady();
+        self.terminal_emitted = true;
+        const event = struct {
+            schema: []const u8 = machine_output.run_events_schema,
+            schema_version: u32 = machine_output.run_events_schema_version,
+            event: []const u8 = "exit",
+            command: []const u8,
+            backend: []const u8,
+            exit_code: i32,
+            vcpus: u32,
+            memory_bytes: u64,
+            captured: bool,
+            capture_path: ?[]const u8,
+            timings: Timings,
+
+            const Timings = struct {
+                start_ms: u64,
+                vsock_connect_ms: u64,
+                exec_response_ms: u64,
+                probe_duration_ms: u64,
+            };
+        }{
+            .command = self.command,
+            .backend = result.backend.name(),
+            .exit_code = result.exit_code,
+            .vcpus = result.vcpus,
+            .memory_bytes = result.memory_bytes,
+            .captured = result.captured,
+            .capture_path = result.capture_path,
+            .timings = .{
+                .start_ms = result.start_ms,
+                .vsock_connect_ms = result.vsock_connect_ms,
+                .exec_response_ms = result.exec_response_ms,
+                .probe_duration_ms = result.probe_duration_ms,
+            },
+        };
+        try self.write(event);
+    }
+
+    pub fn emitFailure(self: *EventWriter, err: anyerror) !void {
+        if (self.terminal_emitted) return;
+        self.terminal_emitted = true;
+        const classified = machine_output.fromZigError(err);
+        const event = struct {
+            schema: []const u8 = machine_output.run_events_schema,
+            schema_version: u32 = machine_output.run_events_schema_version,
+            event: []const u8 = "failure",
+            command: []const u8,
+            backend: ?[]const u8,
+            @"error": machine_output.ErrorBody,
+        }{
+            .command = self.command,
+            .backend = self.backend,
+            .@"error" = classified.envelope().@"error",
+        };
+        try self.write(event);
+    }
+
+    fn write(self: *EventWriter, event: anytype) !void {
+        const json = try std.json.Stringify.valueAlloc(self.allocator, event, .{});
+        defer self.allocator.free(json);
+        try self.writer.writeAll(json);
+        try self.writer.writeByte('\n');
+        try self.writer.flush();
+    }
+
+    pub fn emitReadyBestEffort(self: *EventWriter) void {
+        self.emitReady() catch {
+            self.write_failed = true;
+        };
+    }
+
+    pub fn emitOutputBestEffort(self: *EventWriter, output: vsock.HostStreamOutput, bytes: []const u8) void {
+        self.emitOutput(output, bytes) catch {
+            self.write_failed = true;
+        };
+    }
+};
+
+pub fn machineErrorExitCode(err: anyerror) u8 {
+    return machine_output.fromZigError(err).exit_code;
+}
 
 pub const MonitorExit = enum {
     stopped,
@@ -173,6 +358,7 @@ pub const CliOptions = struct {
     network: NetworkMode = .disabled,
     network_requested: bool = false,
     network_policy: spore_net_policy.Config = .{},
+    event_mode: EventMode = .none,
     command: []const []const u8,
 };
 
@@ -204,6 +390,7 @@ const cli_usage =
     \\  --guest-port N          Guest vsock listen port (default: 10700)
     \\  --timeout-ms N          Probe timeout in milliseconds (default: 30000)
     \\  --console-log PATH      Write guest console output to PATH
+    \\  --events=jsonl          Emit lifecycle and guest output events as JSONL on stdout
     \\  -h, --help              Show this help
     \\
 ;
@@ -216,11 +403,21 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
 
     const arena = init.arena.allocator();
     const parsed = try parseCliArgs(args);
-    const opts = try resolveCliOptions(init, arena, parsed);
+    var opts = try resolveCliOptions(init, arena, parsed);
+    var event_writer = EventWriter.init(std.heap.page_allocator, stdout, "run");
+    if (parsed.event_mode == .jsonl) {
+        opts.stream_output = false;
+        opts.event_writer = &event_writer;
+        try event_writer.emitStart(opts.backend);
+    }
     try openConsoleLog(opts.console_log_path);
     defer closeConsoleLog();
 
     const result = execute(init, arena, opts) catch |err| {
+        if (parsed.event_mode == .jsonl) {
+            try event_writer.emitFailure(err);
+            std.process.exit(machine_output.fromZigError(err).exit_code);
+        }
         if (isCaptureAborted(err)) std.process.exit(130);
         if (isNetworkGatewayError(err)) {
             printNetworkGatewayError(err);
@@ -228,11 +425,14 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         }
         return err;
     };
-    if (result.captured) {
+    if (result.captured and parsed.event_mode != .jsonl) {
         if (result.capture_path) |path| {
             const message = try std.fmt.allocPrint(arena, "spore run: captured snapshot at {s}\n", .{path});
             try writeSetupStderr(init, message);
         }
+    }
+    if (parsed.event_mode == .jsonl) {
+        try event_writer.emitExit(result);
     }
     const code = result.processExitCode();
     if (code != 0) std.process.exit(code);
@@ -251,6 +451,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     var network: NetworkMode = .disabled;
     var network_requested = false;
     var network_policy = spore_net_policy.Config{};
+    var event_mode: EventMode = .none;
     var command: ?[]const []const u8 = null;
 
     var i: usize = 0;
@@ -281,6 +482,18 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
             capture_trigger_set = true;
         } else if (std.mem.eql(u8, args[i], "--continue-after-capture")) {
             continue_after_capture = true;
+        } else if (std.mem.eql(u8, args[i], "--events") and i + 1 < args.len) {
+            i += 1;
+            event_mode = EventMode.parse(args[i]) orelse {
+                std.debug.print("--events must be jsonl\n", .{});
+                std.process.exit(2);
+            };
+        } else if (std.mem.startsWith(u8, args[i], "--events=")) {
+            const raw = args[i]["--events=".len..];
+            event_mode = EventMode.parse(raw) orelse {
+                std.debug.print("--events must be jsonl\n", .{});
+                std.process.exit(2);
+            };
         } else if (std.mem.eql(u8, args[i], "--net")) {
             network = .spore;
             network_requested = true;
@@ -359,6 +572,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         .network = network,
         .network_requested = network_requested,
         .network_policy = network_policy,
+        .event_mode = event_mode,
         .command = argv,
     };
 }
@@ -956,6 +1170,37 @@ fn jsonStringEquals(value: ?std.json.Value, expected: []const u8) bool {
     return std.mem.eql(u8, actual, expected);
 }
 
+fn expectJsonStringField(allocator: std.mem.Allocator, line: []const u8, field: []const u8, expected: []const u8) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.BadManifest,
+    };
+    try std.testing.expect(jsonStringEquals(object.get(field), expected));
+}
+
+fn expectNestedJsonStringField(
+    allocator: std.mem.Allocator,
+    line: []const u8,
+    object_field: []const u8,
+    field: []const u8,
+    expected: []const u8,
+) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.BadManifest,
+    };
+    const nested_value = object.get(object_field) orelse return error.BadManifest;
+    const nested_object = switch (nested_value) {
+        .object => |nested| nested,
+        else => return error.BadManifest,
+    };
+    try std.testing.expect(jsonStringEquals(nested_object.get(field), expected));
+}
+
 pub fn resolveDefaultKernelPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
     if (init.environ_map.get("SPOREVM_KERNEL_IMAGE")) |path| {
         if (!try readablePath(init.io, path)) {
@@ -1269,6 +1514,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     if (opts.vcpus != 1) return error.UnsupportedVcpuCount;
 
     const backend = try resolveBackend(opts.backend);
+    if (opts.event_writer) |writer| writer.setBackend(backend);
     var gateway: net_gateway.Process = undefined;
     var gateway_active = false;
     if (opts.network == .spore) {
@@ -1298,7 +1544,12 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     const request = try execRequestForRun(init, allocator, opts);
     var stream = try vsock.HostStream.init(opts.guest_port, request);
     if (resuming) stream.host_port = vsock.HostStream.deriveHostPort(request);
-    if (opts.stream_output) stream.setOutputSink(null, runOutputSink);
+    if (opts.event_writer) |writer| {
+        stream.setLifecycleSink(writer, runEventLifecycleSink);
+        stream.setOutputSink(writer, runEventOutputSink);
+    } else if (opts.stream_output) {
+        stream.setOutputSink(null, runOutputSink);
+    }
     var capture_request = capture.Request{};
     var signal_registration: ?capture.SignalRegistration = null;
     defer if (signal_registration) |*registration| registration.deinit();
@@ -1611,6 +1862,25 @@ fn runOutputSink(_: ?*anyopaque, output: vsock.HostStreamOutput, bytes: []const 
     }
 }
 
+fn runEventOutputSink(context: ?*anyopaque, output: vsock.HostStreamOutput, bytes: []const u8) void {
+    const writer: *EventWriter = @ptrCast(@alignCast(context.?));
+    writer.emitOutputBestEffort(output, bytes);
+}
+
+fn runEventLifecycleSink(context: ?*anyopaque, event: vsock.HostStreamLifecycle) void {
+    const writer: *EventWriter = @ptrCast(@alignCast(context.?));
+    switch (event) {
+        .ready => writer.emitReadyBestEffort(),
+    }
+}
+
+fn base64Alloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    const enc = std.base64.standard.Encoder;
+    const out = try allocator.alloc(u8, enc.calcSize(bytes.len));
+    _ = enc.encode(out, bytes);
+    return out;
+}
+
 pub fn consoleSink(bytes: []const u8) void {
     if (console_fd < 0) return;
     var remaining = bytes;
@@ -1883,6 +2153,67 @@ test "generation request encodes params json as a string" {
     try std.testing.expectEqualStrings("{\"type\":\"generation\",\"session_id\":\"default\",\"params_json\":\"{\\\"parallel_index\\\":2,\\\"parallel_count\\\":5}\"}\n", request);
 }
 
+test "event writer emits JSONL lifecycle and output records" {
+    const allocator = std.testing.allocator;
+    var out: Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var events = EventWriter.init(allocator, &out.writer, "run");
+
+    try events.emitStart(.hvf);
+    events.setBackend(.hvf);
+    try events.emitReady();
+    try events.emitOutput(.stdout, "hi\n");
+    try events.emitExit(.{
+        .backend = .hvf,
+        .start_ms = 1,
+        .vsock_connect_ms = 2,
+        .exec_response_ms = 4,
+        .probe_duration_ms = 2,
+        .exit_code = 7,
+        .vcpus = 1,
+        .memory_bytes = memory_config.auto_bytes,
+    });
+
+    var lines = std.mem.splitScalar(u8, out.written(), '\n');
+    const start_line = lines.next().?;
+    const ready_line = lines.next().?;
+    const stdout_line = lines.next().?;
+    const exit_line = lines.next().?;
+    try std.testing.expectEqualStrings("", lines.next().?);
+    try expectJsonStringField(allocator, start_line, "schema", machine_output.run_events_schema);
+    try expectJsonStringField(allocator, start_line, "event", "start");
+    try expectJsonStringField(allocator, ready_line, "event", "ready");
+    try expectJsonStringField(allocator, ready_line, "backend", "hvf");
+    try expectJsonStringField(allocator, stdout_line, "event", "stdout");
+    try expectJsonStringField(allocator, stdout_line, "data_base64", "aGkK");
+    try expectJsonStringField(allocator, exit_line, "event", "exit");
+}
+
+test "event writer emits exactly one terminal failure" {
+    const allocator = std.testing.allocator;
+    var out: Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var events = EventWriter.init(allocator, &out.writer, "run");
+
+    try events.emitFailure(error.BadChunk);
+    try events.emitExit(.{
+        .backend = .hvf,
+        .start_ms = 1,
+        .vsock_connect_ms = 2,
+        .exec_response_ms = 3,
+        .probe_duration_ms = 1,
+        .exit_code = 0,
+        .vcpus = 1,
+        .memory_bytes = memory_config.auto_bytes,
+    });
+
+    var lines = std.mem.splitScalar(u8, out.written(), '\n');
+    const failure_line = lines.next().?;
+    try std.testing.expectEqualStrings("", lines.next().?);
+    try expectJsonStringField(allocator, failure_line, "event", "failure");
+    try expectNestedJsonStringField(allocator, failure_line, "error", "code", "cache.integrity_failed");
+}
+
 test "run request rejects guest argv count overflow" {
     const argv = [_][]const u8{
         "/bin/true", "1",  "2",  "3",
@@ -2096,6 +2427,13 @@ test "run cli parser accepts capture flags" {
     try std.testing.expect(opts.continue_after_capture);
     try std.testing.expectEqual(@as(usize, 1), opts.command.len);
     try std.testing.expectEqualStrings("/bin/sleeper", opts.command[0]);
+}
+
+test "run cli parser accepts jsonl events" {
+    const opts = try parseCliArgs(&.{ "--events=jsonl", "--", "/bin/true" });
+    try std.testing.expectEqual(EventMode.jsonl, opts.event_mode);
+    try std.testing.expectEqual(@as(usize, 1), opts.command.len);
+    try std.testing.expectEqualStrings("/bin/true", opts.command[0]);
 }
 
 test "run cli parser defaults capture trigger to exit" {

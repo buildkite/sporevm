@@ -25,6 +25,8 @@ const hvf_generation_probe_rx_delay_ms: u64 = 25;
 pub const Options = struct {
     backend: Backend = .auto,
     spore_dir: []const u8,
+    event_mode: run_mod.EventMode = .none,
+    event_writer: ?*run_mod.EventWriter = null,
 };
 
 const cli_usage =
@@ -33,6 +35,7 @@ const cli_usage =
     \\
     \\Options:
     \\  --backend auto|hvf|kvm  Backend to run (default: auto)
+    \\  --events=jsonl          Emit lifecycle and console output events as JSONL on stdout
     \\  -h, --help              Show this help
     \\
 ;
@@ -43,13 +46,28 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         return;
     }
 
-    const opts = try parseCliArgs(args);
-    try execute(init, init.arena.allocator(), opts);
+    var opts = try parseCliArgs(args);
+    var event_writer = run_mod.EventWriter.init(std.heap.page_allocator, stdout, "resume");
+    if (opts.event_mode == .jsonl) {
+        opts.event_writer = &event_writer;
+        try event_writer.emitStart(opts.backend);
+    }
+    const result = execute(init, init.arena.allocator(), opts) catch |err| {
+        if (opts.event_mode == .jsonl) {
+            try event_writer.emitFailure(err);
+            std.process.exit(run_mod.machineErrorExitCode(err));
+        }
+        return err;
+    };
+    if (opts.event_mode == .jsonl) {
+        try event_writer.emitExit(result);
+    }
 }
 
 pub fn parseCliArgs(args: []const []const u8) !Options {
     var backend: Backend = .auto;
     var spore_dir: ?[]const u8 = null;
+    var event_mode: run_mod.EventMode = .none;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -57,6 +75,18 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
             i += 1;
             backend = Backend.parse(args[i]) orelse {
                 std.debug.print("--backend must be auto, hvf, or kvm\n", .{});
+                std.process.exit(2);
+            };
+        } else if (std.mem.eql(u8, args[i], "--events") and i + 1 < args.len) {
+            i += 1;
+            event_mode = run_mod.EventMode.parse(args[i]) orelse {
+                std.debug.print("--events must be jsonl\n", .{});
+                std.process.exit(2);
+            };
+        } else if (std.mem.startsWith(u8, args[i], "--events=")) {
+            const raw = args[i]["--events=".len..];
+            event_mode = run_mod.EventMode.parse(raw) orelse {
+                std.debug.print("--events must be jsonl\n", .{});
                 std.process.exit(2);
             };
         } else if (std.mem.eql(u8, args[i], "--count")) {
@@ -75,6 +105,7 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
 
     return .{
         .backend = backend,
+        .event_mode = event_mode,
         .spore_dir = spore_dir orelse {
             std.debug.print("{s}", .{cli_usage});
             std.process.exit(2);
@@ -82,7 +113,10 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
     };
 }
 
-pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Options) !void {
+pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Options) !run_mod.Result {
+    resume_event_writer = opts.event_writer;
+    defer resume_event_writer = null;
+
     const parsed = try spore.loadManifest(allocator, opts.spore_dir);
     defer parsed.deinit();
 
@@ -116,9 +150,13 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     else
         null;
     if (identity_stream) |*stream| stream.host_port = generation_probe_host_port;
+    if (identity_stream) |*stream| {
+        if (opts.event_writer) |writer| stream.setLifecycleSink(writer, resumeEventLifecycleSink);
+    }
     const identity_probe: ?*vsock.HostStream = if (identity_stream) |*stream| stream else null;
 
     const backend = try resolveBackend(opts.backend);
+    if (opts.event_writer) |writer| writer.setBackend(backend);
     const ram_size = resumeRamSize(parsed.value.platform);
     const local_backing = try spore.openProvenLocalMemoryBacking(allocator, init.environ_map, opts.spore_dir, parsed.value.memory, ram_size);
     defer if (local_backing.fd) |fd| {
@@ -132,7 +170,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
             break :blk try hvf.vm.run(allocator, .{
                 .kernel = "",
                 .ram_size = ram_size,
-                .console_sink = consoleSink,
+                .console_sink = if (opts.event_writer == null) consoleSink else eventConsoleSink,
                 .disk_backend = runtime_disk.backend(),
                 .resume_dir = opts.spore_dir,
                 .ram_backing_fd = local_backing.fd,
@@ -149,7 +187,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
             break :blk try kvm.vm.run(allocator, .{
                 .kernel = "",
                 .ram_size = ram_size,
-                .console_sink = consoleSink,
+                .console_sink = if (opts.event_writer == null) consoleSink else eventConsoleSink,
                 .disk_backend = runtime_disk.backend(),
                 .resume_dir = opts.spore_dir,
                 .ram_backing_fd = local_backing.fd,
@@ -174,6 +212,18 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
         }
     }
     if (gateway_active and gateway.hasFailed()) return error.NetworkGatewayFailed;
+    const connect_ms = if (identity_stream) |stream| stream.connect_ms orelse 0 else 0;
+    const response_ms = if (identity_stream) |stream| stream.response_ms orelse 0 else 0;
+    return .{
+        .backend = backend,
+        .start_ms = 0,
+        .vsock_connect_ms = connect_ms,
+        .exec_response_ms = response_ms,
+        .probe_duration_ms = if (response_ms >= connect_ms) response_ms - connect_ms else 0,
+        .exit_code = 0,
+        .vcpus = 1,
+        .memory_bytes = ram_size,
+    };
 }
 
 fn consoleSink(bytes: []const u8) void {
@@ -182,6 +232,21 @@ fn consoleSink(bytes: []const u8) void {
         const n = std.c.write(1, remaining.ptr, remaining.len);
         if (n <= 0) return;
         remaining = remaining[@intCast(n)..];
+    }
+}
+
+var resume_event_writer: ?*run_mod.EventWriter = null;
+
+fn eventConsoleSink(bytes: []const u8) void {
+    if (resume_event_writer) |writer| {
+        writer.emitOutputBestEffort(.stdout, bytes);
+    }
+}
+
+fn resumeEventLifecycleSink(context: ?*anyopaque, event: vsock.HostStreamLifecycle) void {
+    const writer: *run_mod.EventWriter = @ptrCast(@alignCast(context.?));
+    switch (event) {
+        .ready => writer.emitReadyBestEffort(),
     }
 }
 
@@ -246,6 +311,12 @@ fn failResumeSetup(comptime fmt: []const u8, args: anytype) noreturn {
 test "resume cli parser accepts one spore dir" {
     const opts = try parseCliArgs(&.{ "--backend", "hvf", "child.spore" });
     try std.testing.expectEqual(Backend.hvf, opts.backend);
+    try std.testing.expectEqualStrings("child.spore", opts.spore_dir);
+}
+
+test "resume cli parser accepts jsonl events" {
+    const opts = try parseCliArgs(&.{ "--events=jsonl", "child.spore" });
+    try std.testing.expectEqual(run_mod.EventMode.jsonl, opts.event_mode);
     try std.testing.expectEqualStrings("child.spore", opts.spore_dir);
 }
 

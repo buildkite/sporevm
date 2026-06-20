@@ -5,6 +5,8 @@ const Io = std.Io;
 
 pub const error_schema = "spore.error.v1";
 pub const error_schema_version: u32 = 1;
+pub const run_events_schema = "spore.run-events.v1";
+pub const run_events_schema_version: u32 = 1;
 
 pub const Mode = enum {
     human,

@@ -263,7 +263,13 @@ The first implementation should pin a small stable code table in tests:
   `spore.bundle.inspect.v1`, `pull` emits `spore.pull.result.v1` with shared
   digest, materialization, rootfs, remote, and child-selection summaries, and
   the smoke scripts consume the nested machine contract through global `--json`.
-- Slices 4 and 5 are still pending.
+- Slice 4 is implemented in this branch: `run` and `resume` accept
+  `--events=jsonl`, stdout is JSONL in event mode, run guest stdout/stderr are
+  base64-encoded typed events, resume console bytes are typed stdout events,
+  vsock readiness emits `ready`, and runtime terminal failures emit
+  `failure` records using the shared error classification. Parser/setup direct
+  exits remain part of the slice 5 API-boundary cleanup.
+- Slice 5 is still pending.
 
 ## Delivery Strategy
 
