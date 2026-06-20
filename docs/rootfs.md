@@ -85,7 +85,7 @@ Inspect local rootfs cache usage with:
 
 ```bash
 spore system df --rootfs
-spore system df --rootfs --json
+spore --json system df --rootfs
 ```
 
 Prune rebuildable or reimportable image-rootfs cache entries with a dry run
@@ -96,11 +96,12 @@ spore system prune --dry-run
 spore system prune --force
 spore system prune --rootfs --dry-run --max-bytes 20gb
 spore system prune --rootfs --force --max-bytes 20gb
-spore system prune --dry-run --json
+spore --json system prune --dry-run
 ```
 
-These commands render human summaries by default. Add `--json` when scripts need
-stable field names and exact byte counts. Without `--older-than` or
+These commands render human summaries by default. Put global `--json` before the
+command when scripts need stable field names and exact byte counts. Without
+`--older-than` or
 `--max-bytes`, prune selects all default-prunable rootfs entries: rebuildable or
 reimportable image-rootfs files that are not hardlinked to digest-addressed
 artifacts.

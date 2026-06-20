@@ -659,12 +659,12 @@ PY
   grep -Fq '"digest": "blake3:' "\${workdir}/spore/manifest.json" || { echo "rootfs synthetic manifest did not record digest" >&2; exit 1; }
 fi
 
-zig-out/bin/spore fork "\${workdir}/spore" --count "\${child_count}" --out "\${workdir}/spore.children" | tee "\${workdir}/fork-result.json"
+zig-out/bin/spore --json fork "\${workdir}/spore" --count "\${child_count}" --out "\${workdir}/spore.children" | tee "\${workdir}/fork-result.json"
 if [[ "\${workload}" == "rootfs" ]]; then
   SPOREVM_ROOTFS_CACHE_DIR="\${rootfs_cache}" \
-    zig-out/bin/spore pack "\${workdir}/spore" --children "\${workdir}/spore.children" --out "\${workdir}/spore.bundle" | tee "\${workdir}/pack-result.json"
+    zig-out/bin/spore --json pack "\${workdir}/spore" --children "\${workdir}/spore.children" --out "\${workdir}/spore.bundle" | tee "\${workdir}/pack-result.json"
 else
-  zig-out/bin/spore pack "\${workdir}/spore" --children "\${workdir}/spore.children" --out "\${workdir}/spore.bundle" | tee "\${workdir}/pack-result.json"
+  zig-out/bin/spore --json pack "\${workdir}/spore" --children "\${workdir}/spore.children" --out "\${workdir}/spore.bundle" | tee "\${workdir}/pack-result.json"
 fi
 
 bundle_bytes="\$(du -sb "\${workdir}/spore.bundle" | awk '{print \$1}')"
@@ -716,7 +716,7 @@ PY
     exit 1
   fi
 fi
-zig-out/bin/spore push "\${workdir}/spore.bundle" "s3://\${bucket}/\${run_prefix}/spore.bundle/" --region "\${region}" | tee "\${workdir}/push-result.json"
+zig-out/bin/spore --json push "\${workdir}/spore.bundle" "s3://\${bucket}/\${run_prefix}/spore.bundle/" --region "\${region}" | tee "\${workdir}/push-result.json"
 printf '%s\n' "\${bundle_key}" >"\${workdir}/bundle-key.txt"
 aws s3 cp "\${workdir}/bundle-key.txt" "s3://\${bucket}/\${run_prefix}/bundle-key.txt" --region "\${region}" --only-show-errors
 cat >"\${workdir}/source-result.json" <<JSON
@@ -994,13 +994,13 @@ for iteration in \$(seq 1 "\${dest_repeat}"); do
     pull_source="s3://\${bucket}/\${run_prefix}/spore.bundle@sha256:\${bundle_key}"
     SPOREVM_BUNDLE_CACHE_DIR="\${pull_bundle_cache}" \
       SPOREVM_ROOTFS_CACHE_DIR="\${pull_rootfs_cache}" \
-      zig-out/bin/spore pull "\${pull_source}" --child "\${iteration_child_id}" --out "\${unpacked_dir}" --region "\${region}" | tee "\${unpack_result}"
+      zig-out/bin/spore --json pull "\${pull_source}" --child "\${iteration_child_id}" --out "\${unpacked_dir}" --region "\${region}" | tee "\${unpack_result}"
     bundle_dir="\${pull_bundle_cache}/remote/s3/sha256/\${bundle_key}/bundle"
   else
     pull_source="http://\${peer_ip}:\${source_peer_port}/spore.bundle@sha256:\${bundle_key}"
     SPOREVM_BUNDLE_CACHE_DIR="\${pull_bundle_cache}" \
       SPOREVM_ROOTFS_CACHE_DIR="\${pull_rootfs_cache}" \
-      zig-out/bin/spore pull "\${pull_source}" --child "\${iteration_child_id}" --out "\${unpacked_dir}" | tee "\${unpack_result}"
+      zig-out/bin/spore --json pull "\${pull_source}" --child "\${iteration_child_id}" --out "\${unpacked_dir}" | tee "\${unpack_result}"
     bundle_dir="\${pull_bundle_cache}/remote/http/sha256/\${bundle_key}/bundle"
   fi
   cache_hit="\$(json_field "\${unpack_result}" remote_bundle_cache_hit)"

@@ -4,16 +4,16 @@ const std = @import("std");
 const Io = std.Io;
 
 const local_paths = @import("local_paths.zig");
+const machine_output = @import("machine_output.zig");
 const default_prune_max_bytes = 0;
 
 const usage =
     \\Usage:
-    \\  spore system df [--rootfs] [--json]
-    \\  spore system prune [--rootfs] [--dry-run|--force] [--older-than DURATION] [--max-bytes SIZE] [--include-digest-artifacts] [--json]
+    \\  spore system df [--rootfs]
+    \\  spore system prune [--rootfs] [--dry-run|--force] [--older-than DURATION] [--max-bytes SIZE] [--include-digest-artifacts]
     \\
     \\Options:
     \\  --rootfs                    Inspect or prune the rootfs cache
-    \\  --json                      Print stable machine-readable JSON
     \\  --dry-run                   Report prune candidates without deleting them (default)
     \\  --force                     Delete selected cache entries
     \\  --older-than DURATION       Select entries older than 7d, 24h, 30m, or seconds
@@ -112,61 +112,102 @@ const PrunePlanEntry = struct {
     }
 };
 
-pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
+pub fn run(
+    init: std.process.Init,
+    args: []const []const u8,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+) !void {
     if (args.len == 0 or wantsHelp(args[0])) {
+        if (mode == .json) {
+            exitWithCliError(
+                init.arena.allocator(),
+                stderr,
+                mode,
+                machine_output.usageMissingArgument("usage: spore system <df|prune>", "system"),
+                "usage: spore system <df|prune>",
+            );
+        }
         try stdout.writeAll(usage);
         return;
     }
 
     if (std.mem.eql(u8, args[0], "df")) {
-        try dfCli(init, args[1..], stdout);
+        try dfCli(init, args[1..], stdout, stderr, mode);
         return;
     }
     if (std.mem.eql(u8, args[0], "prune")) {
-        try pruneCli(init, args[1..], stdout);
+        try pruneCli(init, args[1..], stdout, stderr, mode);
         return;
     }
 
-    std.debug.print("unknown system command: {s}\n\n{s}", .{ args[0], usage });
-    std.process.exit(2);
+    const message = allocMessage(init.arena.allocator(), "unknown system command: {s}", .{args[0]});
+    exitWithCliError(init.arena.allocator(), stderr, mode, machine_output.usageInvalidArgument(message, "system"), messageWithUsage(init.arena.allocator(), message));
 }
 
-fn dfCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
-    var json = false;
+fn dfCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, stderr: *Io.Writer, mode: machine_output.Mode) !void {
     for (args) |arg| {
         if (wantsHelp(arg)) {
+            if (mode == .json) {
+                exitWithCliError(
+                    init.arena.allocator(),
+                    stderr,
+                    mode,
+                    machine_output.usageInvalidArgument("spore --json system df does not support help output", "system df"),
+                    "spore --json system df does not support help output",
+                );
+            }
             try stdout.writeAll(usage);
             return;
         } else if (std.mem.eql(u8, arg, "--json")) {
-            json = true;
+            exitLocalJsonUnsupported(init.arena.allocator(), stderr, mode, "system df");
         } else if (!std.mem.eql(u8, arg, "--rootfs")) {
-            std.debug.print("unknown system df argument: {s}\n\n{s}", .{ arg, usage });
-            std.process.exit(2);
+            exitUnknownArgument(init.arena.allocator(), stderr, mode, "system df", arg);
         }
     }
 
     const allocator = init.arena.allocator();
-    const cache_root = try rootfsCacheRootPath(allocator, init.environ_map);
+    const cache_root = rootfsCacheRootPath(allocator, init.environ_map) catch |err| switch (err) {
+        error.MissingHome => {
+            exitWithCliError(
+                allocator,
+                stderr,
+                mode,
+                machine_output.CliError.init(.cache_unavailable, "cannot resolve rootfs cache directory; set SPOREVM_ROOTFS_CACHE_DIR or HOME", "MissingHome"),
+                "spore system: cannot resolve rootfs cache directory; set SPOREVM_ROOTFS_CACHE_DIR or HOME",
+            );
+        },
+        else => |e| return e,
+    };
     const summary = try summarizeRootfsCache(allocator, init.io, cache_root);
-    if (json) {
-        try writeJson(allocator, stdout, summary);
+    if (mode == .json) {
+        try machine_output.writeJson(allocator, stdout, summary);
     } else {
         try writeRootfsSummary(stdout, summary);
     }
 }
 
-fn pruneCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
+fn pruneCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, stderr: *Io.Writer, mode: machine_output.Mode) !void {
     var opts = PruneOptions{};
-    var json = false;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (wantsHelp(arg)) {
+            if (mode == .json) {
+                exitWithCliError(
+                    init.arena.allocator(),
+                    stderr,
+                    mode,
+                    machine_output.usageInvalidArgument("spore --json system prune does not support help output", "system prune"),
+                    "spore --json system prune does not support help output",
+                );
+            }
             try stdout.writeAll(usage);
             return;
         } else if (std.mem.eql(u8, arg, "--json")) {
-            json = true;
+            exitLocalJsonUnsupported(init.arena.allocator(), stderr, mode, "system prune");
         } else if (std.mem.eql(u8, arg, "--rootfs")) {
             continue;
         } else if (std.mem.eql(u8, arg, "--dry-run")) {
@@ -177,38 +218,121 @@ fn pruneCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer
             opts.include_digest_artifacts = true;
         } else if (std.mem.eql(u8, arg, "--older-than")) {
             i += 1;
-            if (i >= args.len) return missingValue("--older-than");
-            const seconds = parseDurationSeconds(args[i]) catch return invalidValue("--older-than", args[i]);
+            if (i >= args.len) exitMissingValue(init.arena.allocator(), stderr, mode, "system prune", "--older-than");
+            const seconds = parseDurationSeconds(args[i]) catch {
+                exitInvalidValue(init.arena.allocator(), stderr, mode, "system prune", "--older-than", args[i]);
+            };
             opts.older_than_seconds = seconds;
             opts.older_than_ns = @as(i96, seconds) * std.time.ns_per_s;
         } else if (std.mem.eql(u8, arg, "--max-bytes")) {
             i += 1;
-            if (i >= args.len) return missingValue("--max-bytes");
-            opts.max_bytes = parseByteSize(args[i]) catch return invalidValue("--max-bytes", args[i]);
+            if (i >= args.len) exitMissingValue(init.arena.allocator(), stderr, mode, "system prune", "--max-bytes");
+            opts.max_bytes = parseByteSize(args[i]) catch {
+                exitInvalidValue(init.arena.allocator(), stderr, mode, "system prune", "--max-bytes", args[i]);
+            };
         } else {
-            std.debug.print("unknown system prune argument: {s}\n\n{s}", .{ arg, usage });
-            std.process.exit(2);
+            exitUnknownArgument(init.arena.allocator(), stderr, mode, "system prune", arg);
         }
     }
 
     if (opts.older_than_ns == null and opts.max_bytes == null) {
         if (opts.include_digest_artifacts) {
-            std.debug.print("spore system prune: set --older-than or --max-bytes when using --include-digest-artifacts\n\n{s}", .{usage});
-            std.process.exit(2);
+            const message = "spore system prune: set --older-than or --max-bytes when using --include-digest-artifacts";
+            exitWithCliError(init.arena.allocator(), stderr, mode, machine_output.usageMissingArgument(message, "system prune"), messageWithUsage(init.arena.allocator(), message));
         }
         opts.max_bytes = default_prune_max_bytes;
         opts.default_selection = true;
     }
 
     const allocator = init.arena.allocator();
-    const cache_root = try rootfsCacheRootPath(allocator, init.environ_map);
+    const cache_root = rootfsCacheRootPath(allocator, init.environ_map) catch |err| switch (err) {
+        error.MissingHome => {
+            exitWithCliError(
+                allocator,
+                stderr,
+                mode,
+                machine_output.CliError.init(.cache_unavailable, "cannot resolve rootfs cache directory; set SPOREVM_ROOTFS_CACHE_DIR or HOME", "MissingHome"),
+                "spore system: cannot resolve rootfs cache directory; set SPOREVM_ROOTFS_CACHE_DIR or HOME",
+            );
+        },
+        else => |e| return e,
+    };
     const now = Io.Clock.real.now(init.io).nanoseconds;
     const result = try pruneRootfsCache(allocator, init.io, cache_root, opts, now);
-    if (json) {
-        try writeJson(allocator, stdout, result);
+    if (mode == .json) {
+        try machine_output.writeJson(allocator, stdout, result);
     } else {
         try writeRootfsPruneResult(stdout, result);
     }
+}
+
+fn allocMessage(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) []const u8 {
+    return std.fmt.allocPrint(allocator, fmt, args) catch "CLI argument error";
+}
+
+fn messageWithUsage(allocator: std.mem.Allocator, message: []const u8) []const u8 {
+    return std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ message, usage }) catch message;
+}
+
+fn exitWithCliError(
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+    err: machine_output.CliError,
+    human_text: []const u8,
+) noreturn {
+    if (mode == .json) {
+        machine_output.writeError(allocator, stderr, err) catch {};
+    } else {
+        stderr.writeAll(human_text) catch {};
+        if (!std.mem.endsWith(u8, human_text, "\n")) stderr.writeByte('\n') catch {};
+    }
+    stderr.flush() catch {};
+    std.process.exit(err.exit_code);
+}
+
+fn exitLocalJsonUnsupported(
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+    command: []const u8,
+) noreturn {
+    const message = allocMessage(allocator, "spore {s}: use global --json before the command", .{command});
+    exitWithCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
+}
+
+fn exitUnknownArgument(
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+    command: []const u8,
+    arg: []const u8,
+) noreturn {
+    const message = allocMessage(allocator, "unknown {s} argument: {s}", .{ command, arg });
+    exitWithCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), messageWithUsage(allocator, message));
+}
+
+fn exitMissingValue(
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+    command: []const u8,
+    flag: []const u8,
+) noreturn {
+    const message = allocMessage(allocator, "spore {s}: {s} requires a value", .{ command, flag });
+    exitWithCliError(allocator, stderr, mode, machine_output.usageMissingArgument(message, command), message);
+}
+
+fn exitInvalidValue(
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+    command: []const u8,
+    flag: []const u8,
+    value: []const u8,
+) noreturn {
+    const message = allocMessage(allocator, "spore {s}: invalid {s}: {s}", .{ command, flag, value });
+    exitWithCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
 }
 
 fn summarizeRootfsCache(allocator: std.mem.Allocator, io: Io, cache_root: []const u8) !RootfsSystemSummary {
@@ -488,13 +612,7 @@ fn lessPrunePlanEntry(_: void, a: PrunePlanEntry, b: PrunePlanEntry) bool {
 }
 
 fn rootfsCacheRootPath(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map) ![]const u8 {
-    return local_paths.rootfsCacheRootPath(allocator, environ) catch |err| switch (err) {
-        error.MissingHome => {
-            std.debug.print("spore system: cannot resolve rootfs cache directory; set {s} or HOME\n", .{local_paths.rootfs_cache_env});
-            std.process.exit(2);
-        },
-        else => |e| return e,
-    };
+    return local_paths.rootfsCacheRootPath(allocator, environ);
 }
 
 fn parseDurationSeconds(raw: []const u8) !u64 {
@@ -547,25 +665,9 @@ fn wantsHelp(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "help") or std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help");
 }
 
-fn missingValue(flag: []const u8) noreturn {
-    std.debug.print("{s} requires a value\n", .{flag});
-    std.process.exit(2);
-}
-
-fn invalidValue(flag: []const u8, value: []const u8) noreturn {
-    std.debug.print("invalid {s}: {s}\n", .{ flag, value });
-    std.process.exit(2);
-}
-
 fn openDirPath(io: Io, path: []const u8, flags: Io.Dir.OpenOptions) !Io.Dir {
     if (Io.Dir.path.isAbsolute(path)) return Io.Dir.openDirAbsolute(io, path, flags);
     return Io.Dir.cwd().openDir(io, path, flags);
-}
-
-fn writeJson(allocator: std.mem.Allocator, writer: *Io.Writer, value: anytype) !void {
-    const json = try std.json.Stringify.valueAlloc(allocator, value, .{ .whitespace = .indent_2 });
-    try writer.writeAll(json);
-    try writer.writeByte('\n');
 }
 
 fn writeRootfsSummary(writer: *Io.Writer, summary: RootfsSystemSummary) !void {
@@ -587,7 +689,7 @@ fn writeRootfsSummary(writer: *Io.Writer, summary: RootfsSystemSummary) !void {
     try writer.writeAll("  Known logical data: ");
     try writeHumanBytes(writer, summary.known_logical_bytes);
     try writer.writeAll(" (categories can overlap through hardlinks)\n\n");
-    try writer.writeAll("Use --json for exact byte counts.\n");
+    try writer.writeAll("Use spore --json system df for exact byte counts.\n");
 }
 
 fn writeStatsLine(writer: *Io.Writer, label: []const u8, stats: CacheStats) !void {
@@ -653,14 +755,14 @@ fn writeRootfsPruneResult(writer: *Io.Writer, result: RootfsPruneResult) !void {
             try writer.writeByte('\n');
         }
         if (result.entries.len > visible_count) {
-            try writer.print("  ... {d} more entries omitted; use --json for the full list.\n", .{result.entries.len - visible_count});
+            try writer.print("  ... {d} more entries omitted; use spore --json system prune for the full list.\n", .{result.entries.len - visible_count});
         }
     }
 
     if (result.dry_run and result.candidate_count > 0) {
         try writer.writeAll("\nRun again with --force to delete the selected entries.\n");
     }
-    try writer.writeAll("Use --json for exact paths and byte counts.\n");
+    try writer.writeAll("Use spore --json system prune for exact paths and byte counts.\n");
 }
 
 fn yesNo(value: bool) []const u8 {
