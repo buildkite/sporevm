@@ -1,6 +1,9 @@
 .zig-cache/
+zig-cache/
 zig-out/
 zig-pkg/
+__pycache__/
+*.pyc
 benchmarks/results/
 dist/
 release-extra/
