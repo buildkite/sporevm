@@ -12,12 +12,13 @@ const chunklib = @import("chunk.zig");
 const cow_disk = @import("cow_disk.zig");
 const disk_layer = @import("disk_layer.zig");
 const gicv3 = @import("gicv3.zig");
+const machine_output = @import("machine_output.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
 const spore = @import("spore.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Io = std.Io;
 
-const Error = spore.Error;
+const Error = spore.Error || error{FileNotFound};
 
 pub const index_version: u32 = 0;
 pub const bundle_index_version: u32 = 0;
@@ -35,6 +36,9 @@ pub const rootfs_policy_exact_bytes = "exact-bytes";
 pub const rootfs_policy_metadata_only = "metadata-only";
 pub const disk_layers_blake3_dir_path = "disklayers/blake3";
 pub const disk_objects_blake3_dir_path = "diskobjects/blake3";
+pub const inspect_bundle_schema = "spore.bundle.inspect.v1";
+pub const pull_result_schema = "spore.pull.result.v1";
+pub const bundle_schema_version: u32 = 1;
 
 pub const RootfsBundlePolicy = enum {
     exact_bytes,
@@ -114,29 +118,84 @@ pub const PullOptions = struct {
     aws_executable: []const u8 = "aws",
 };
 
+pub const DigestRef = machine_output.DigestRef;
+pub const CacheState = machine_output.CacheState;
+pub const ChunkMaterializationSummary = machine_output.ChunkMaterializationSummary;
+pub const RootfsMaterializationSummary = machine_output.RootfsMaterializationSummary;
+
+pub const RemoteBundleCache = struct {
+    cache_hit: bool = false,
+    origin_bytes_read: u64 = 0,
+    peer_bytes_read: u64 = 0,
+};
+
+pub const BundleChildrenSummary = struct {
+    count: usize = 0,
+    selected_child: ?[]const u8 = null,
+};
+
 pub const PullResult = struct {
+    schema: []const u8 = pull_result_schema,
+    schema_version: u32 = bundle_schema_version,
     source: []const u8,
     bundle_dir: []const u8,
     out_dir: []const u8,
-    bundle_digest: []const u8,
+    bundle_digest: DigestRef,
+    materialization: ChunkMaterializationSummary,
+    rootfs: RootfsMaterializationSummary = .{},
+    remote: RemoteBundleCache = .{},
+    children: BundleChildrenSummary = .{},
+};
+
+pub const ChildRange = struct {
+    start: u32,
+    end: u32,
+};
+
+pub const InspectBundleOptions = struct {
+    source: []const u8,
+    child_id: ?[]const u8 = null,
+    child_range: ?ChildRange = null,
+};
+
+pub const BundleChildSummary = struct {
+    id: []const u8,
+    manifest: []const u8,
+};
+
+pub const BundleSelectionSummary = struct {
+    kind: []const u8,
+    selected_count: usize = 0,
+    children: []const BundleChildSummary = &.{},
+};
+
+pub const ChunkpackSummary = struct {
     chunk_count: usize,
-    materialized_chunk_count: usize,
+    pack_count: usize,
     payload_bytes: u64,
-    chunk_bytes_fetched: u64 = 0,
-    cache_hit_count: usize = 0,
-    cache_miss_count: usize = 0,
-    linked_chunk_count: usize = 0,
-    copied_chunk_count: usize = 0,
-    origin_bytes_read: u64 = 0,
-    peer_bytes_read: u64 = 0,
-    remote_bundle_cache_hit: bool = false,
-    rootfs_artifact_count: usize = 0,
-    rootfs_payload_bytes: u64 = 0,
-    rootfs_cache_hit_count: usize = 0,
-    rootfs_cache_miss_count: usize = 0,
-    rootfs_bytes_fetched: u64 = 0,
+};
+
+pub const RootfsBundleSummary = struct {
+    artifact_count: usize = 0,
+    exact_bytes_count: usize = 0,
+    metadata_only_count: usize = 0,
+    payload_bytes: u64 = 0,
+};
+
+pub const InspectBundleResult = struct {
+    schema: []const u8 = inspect_bundle_schema,
+    schema_version: u32 = bundle_schema_version,
+    source: []const u8,
+    bundle_dir: []const u8,
+    bundle_digest: DigestRef,
+    indexed: bool,
+    parent_manifest: []const u8,
+    chunkpack_index: []const u8,
+    chunkpack: ChunkpackSummary,
     child_count: usize = 0,
-    selected_child: ?[]const u8 = null,
+    children: []const BundleChildSummary = &.{},
+    selection: BundleSelectionSummary = .{ .kind = "none" },
+    rootfs: RootfsBundleSummary = .{},
 };
 
 pub const IndexChunk = struct {
@@ -241,6 +300,190 @@ const RootfsMaterializeResult = struct {
     cache_miss_count: usize = 0,
     bytes_fetched: u64 = 0,
 };
+
+pub fn inspectBundle(allocator: std.mem.Allocator, options: InspectBundleOptions) Error!InspectBundleResult {
+    if (options.child_id != null and options.child_range != null) return error.BadManifest;
+
+    const bundle_dir = try localBundleRefPath(allocator, options.source);
+    try ensureInspectableBundlePath(allocator, bundle_dir);
+    const bundle_digest = try digestHex(allocator, bundle_dir);
+    const parsed_index = try loadIndex(allocator, bundle_dir);
+    defer parsed_index.deinit();
+    const chunkpack = try summarizeChunkpack(allocator, parsed_index.value);
+
+    if (try hasBundleIndex(allocator, bundle_dir)) {
+        return inspectIndexedBundle(allocator, options, bundle_dir, bundle_digest, chunkpack);
+    }
+
+    if (options.child_id != null or options.child_range != null) return error.BadManifest;
+    const rootfs = try inspectLegacyRootfs(allocator, bundle_dir);
+    return .{
+        .source = options.source,
+        .bundle_dir = bundle_dir,
+        .bundle_digest = digestRef(bundle_digest),
+        .indexed = false,
+        .parent_manifest = "manifest.json",
+        .chunkpack_index = index_path,
+        .chunkpack = chunkpack,
+        .rootfs = rootfs,
+    };
+}
+
+fn inspectIndexedBundle(
+    allocator: std.mem.Allocator,
+    options: InspectBundleOptions,
+    bundle_dir: []const u8,
+    bundle_digest: []const u8,
+    chunkpack: ChunkpackSummary,
+) Error!InspectBundleResult {
+    const parsed_bundle = try loadBundleIndex(allocator, bundle_dir);
+    defer parsed_bundle.deinit();
+    const bundle_index = parsed_bundle.value;
+    const children = try childSummaries(allocator, bundle_index.children);
+    const selection = try inspectSelection(allocator, bundle_index, options.child_id, options.child_range);
+    const rootfs = try inspectIndexedRootfs(allocator, bundle_dir, bundle_index);
+    return .{
+        .source = options.source,
+        .bundle_dir = bundle_dir,
+        .bundle_digest = digestRef(bundle_digest),
+        .indexed = true,
+        .parent_manifest = bundle_index.parent_manifest,
+        .chunkpack_index = bundle_index.chunkpack_index,
+        .chunkpack = chunkpack,
+        .child_count = bundle_index.children.len,
+        .children = children,
+        .selection = selection,
+        .rootfs = rootfs,
+    };
+}
+
+fn localBundleRefPath(allocator: std.mem.Allocator, source: []const u8) Error![]const u8 {
+    if (std.mem.startsWith(u8, source, "file://")) return localFileUriPath(allocator, source);
+    if (std.mem.startsWith(u8, source, "s3://") or
+        std.mem.startsWith(u8, source, "http://") or
+        std.mem.startsWith(u8, source, "https://"))
+    {
+        return error.BadManifest;
+    }
+    return std.fs.path.resolve(allocator, &.{source}) catch return error.IoFailed;
+}
+
+fn ensureInspectableBundlePath(allocator: std.mem.Allocator, bundle_dir: []const u8) Error!void {
+    const path = try pathZ(allocator, "{s}", .{bundle_dir});
+    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    if (fd < 0) {
+        return switch (std.c.errno(fd)) {
+            .NOENT => error.FileNotFound,
+            .NOTDIR => error.BadManifest,
+            else => error.IoFailed,
+        };
+    }
+    _ = std.c.close(fd);
+}
+
+fn digestRef(hex: []const u8) DigestRef {
+    return machine_output.digestRef(hex);
+}
+
+fn summarizeChunkpack(allocator: std.mem.Allocator, index: Index) Error!ChunkpackSummary {
+    var packs = std.StringHashMap(void).init(allocator);
+    defer packs.deinit();
+    var payload_bytes: u64 = 0;
+    for (index.chunks) |chunk| {
+        const existing = packs.getOrPut(chunk.pack) catch return error.OutOfMemory;
+        _ = existing;
+        payload_bytes += chunk.size;
+    }
+    return .{
+        .chunk_count = index.chunks.len,
+        .pack_count = packs.count(),
+        .payload_bytes = payload_bytes,
+    };
+}
+
+fn childSummaries(allocator: std.mem.Allocator, children: []const BundleChild) Error![]const BundleChildSummary {
+    const out = allocator.alloc(BundleChildSummary, children.len) catch return error.OutOfMemory;
+    for (children, out) |child, *summary| {
+        summary.* = .{
+            .id = allocator.dupe(u8, child.id) catch return error.OutOfMemory,
+            .manifest = allocator.dupe(u8, child.manifest) catch return error.OutOfMemory,
+        };
+    }
+    return out;
+}
+
+fn inspectSelection(
+    allocator: std.mem.Allocator,
+    index: BundleIndex,
+    child_id: ?[]const u8,
+    child_range: ?ChildRange,
+) Error!BundleSelectionSummary {
+    if (child_id) |raw| {
+        const canonical = try canonicalChildId(allocator, raw);
+        const child = try findBundleChild(index, canonical);
+        const children = allocator.alloc(BundleChildSummary, 1) catch return error.OutOfMemory;
+        children[0] = .{
+            .id = allocator.dupe(u8, child.id) catch return error.OutOfMemory,
+            .manifest = allocator.dupe(u8, child.manifest) catch return error.OutOfMemory,
+        };
+        return .{ .kind = "child", .selected_count = 1, .children = children };
+    }
+
+    if (child_range) |range| {
+        if (range.start > range.end) return error.BadManifest;
+        var selected = std.array_list.Managed(BundleChildSummary).init(allocator);
+        for (index.children) |child| {
+            const value = std.fmt.parseInt(u32, child.id, 10) catch return error.BadManifest;
+            if (value < range.start or value > range.end) continue;
+            try selected.append(.{
+                .id = allocator.dupe(u8, child.id) catch return error.OutOfMemory,
+                .manifest = allocator.dupe(u8, child.manifest) catch return error.OutOfMemory,
+            });
+        }
+        if (selected.items.len == 0) return error.BadManifest;
+        const children = selected.toOwnedSlice() catch return error.OutOfMemory;
+        return .{ .kind = "child_range", .selected_count = children.len, .children = children };
+    }
+
+    return .{ .kind = "none" };
+}
+
+fn findBundleChild(index: BundleIndex, child_id: []const u8) Error!BundleChild {
+    try validateChildId(child_id);
+    for (index.children) |child| {
+        if (std.mem.eql(u8, child.id, child_id)) return child;
+    }
+    return error.BadManifest;
+}
+
+fn inspectLegacyRootfs(allocator: std.mem.Allocator, bundle_dir: []const u8) Error!RootfsBundleSummary {
+    const parsed_manifest = try spore.loadManifest(allocator, bundle_dir);
+    defer parsed_manifest.deinit();
+    const rootfs = parsed_manifest.value.rootfs orelse return .{};
+    return .{
+        .artifact_count = 1,
+        .exact_bytes_count = 1,
+        .payload_bytes = rootfs.artifact.size,
+    };
+}
+
+fn inspectIndexedRootfs(allocator: std.mem.Allocator, bundle_dir: []const u8, bundle_index: BundleIndex) Error!RootfsBundleSummary {
+    if (bundle_index.rootfs_index == null) return .{};
+    const parsed_rootfs = try loadRootfsIndex(allocator, bundle_dir);
+    defer parsed_rootfs.deinit();
+    var summary = RootfsBundleSummary{ .artifact_count = parsed_rootfs.value.artifacts.len };
+    for (parsed_rootfs.value.artifacts) |artifact| {
+        if (std.mem.eql(u8, artifact.policy, rootfs_policy_exact_bytes)) {
+            summary.exact_bytes_count += 1;
+            summary.payload_bytes += artifact.size;
+        } else if (std.mem.eql(u8, artifact.policy, rootfs_policy_metadata_only)) {
+            summary.metadata_only_count += 1;
+        } else {
+            return error.BadManifest;
+        }
+    }
+    return summary;
+}
 
 pub fn pack(allocator: std.mem.Allocator, options: PackOptions) Error!PackResult {
     if (options.children_dir != null) return packWithChildren(allocator, options);
@@ -559,8 +802,8 @@ pub fn pull(allocator: std.mem.Allocator, options: PullOptions) Error!PullResult
         const remote = try parseS3Source(allocator, options.source);
         const cached = try materializeS3Bundle(allocator, options, remote);
         var result = try pullLocalIndexedBundle(allocator, options, cached.bundle_dir, options.source);
-        result.origin_bytes_read = cached.origin_bytes_read;
-        result.remote_bundle_cache_hit = cached.cache_hit;
+        result.remote.origin_bytes_read = cached.origin_bytes_read;
+        result.remote.cache_hit = cached.cache_hit;
         return result;
     }
     if (std.mem.startsWith(u8, options.source, "http://") or std.mem.startsWith(u8, options.source, "https://")) {
@@ -569,8 +812,8 @@ pub fn pull(allocator: std.mem.Allocator, options: PullOptions) Error!PullResult
         defer client.deinit();
         const cached = try materializeHttpBundle(allocator, options, &client, remote);
         var result = try pullLocalIndexedBundle(allocator, options, cached.bundle_dir, options.source);
-        result.peer_bytes_read = cached.origin_bytes_read;
-        result.remote_bundle_cache_hit = cached.cache_hit;
+        result.remote.peer_bytes_read = cached.origin_bytes_read;
+        result.remote.cache_hit = cached.cache_hit;
         return result;
     }
     const bundle_dir = try localFileUriPath(allocator, options.source);
@@ -635,22 +878,32 @@ fn pullLocalIndexedBundle(
         .source = source,
         .bundle_dir = bundle_dir,
         .out_dir = options.out_dir,
-        .bundle_digest = bundle_digest,
-        .chunk_count = plan.chunk_count,
-        .materialized_chunk_count = materialized.materialized_chunk_count,
-        .payload_bytes = materialized.payload_bytes,
-        .chunk_bytes_fetched = materialized.payload_bytes,
-        .cache_hit_count = materialized.cache_hit_count,
-        .cache_miss_count = materialized.cache_miss_count,
-        .linked_chunk_count = materialized.linked_chunk_count,
-        .copied_chunk_count = materialized.copied_chunk_count,
-        .rootfs_artifact_count = rootfs_result.artifact_count,
-        .rootfs_payload_bytes = rootfs_result.payload_bytes,
-        .rootfs_cache_hit_count = rootfs_result.cache_hit_count,
-        .rootfs_cache_miss_count = rootfs_result.cache_miss_count,
-        .rootfs_bytes_fetched = rootfs_result.bytes_fetched,
-        .child_count = bundle_index.children.len,
-        .selected_child = child_id,
+        .bundle_digest = digestRef(bundle_digest),
+        .materialization = .{
+            .chunk_count = plan.chunk_count,
+            .materialized_chunk_count = materialized.materialized_chunk_count,
+            .payload_bytes = materialized.payload_bytes,
+            .linked_chunk_count = materialized.linked_chunk_count,
+            .copied_chunk_count = materialized.copied_chunk_count,
+            .cache = .{
+                .hit_count = materialized.cache_hit_count,
+                .miss_count = materialized.cache_miss_count,
+                .bytes_fetched = materialized.payload_bytes,
+            },
+        },
+        .rootfs = .{
+            .artifact_count = rootfs_result.artifact_count,
+            .payload_bytes = rootfs_result.payload_bytes,
+            .cache = .{
+                .hit_count = rootfs_result.cache_hit_count,
+                .miss_count = rootfs_result.cache_miss_count,
+                .bytes_fetched = rootfs_result.bytes_fetched,
+            },
+        },
+        .children = .{
+            .count = bundle_index.children.len,
+            .selected_child = child_id,
+        },
     };
 }
 
@@ -3005,6 +3258,31 @@ test "pack children writes bundle index and unpacks selected child" {
     try std.testing.expectEqualStrings("000001", bundle_index.value.children[1].id);
     try std.testing.expect(bundle_index.value.rootfs_index == null);
 
+    const inspected = try inspectBundle(arena, .{ .source = bundle_dir });
+    try std.testing.expectEqualStrings(inspect_bundle_schema, inspected.schema);
+    try std.testing.expectEqual(bundle_schema_version, inspected.schema_version);
+    try std.testing.expect(inspected.indexed);
+    try std.testing.expectEqualStrings(pack_result.bundle_digest, inspected.bundle_digest.hex);
+    try std.testing.expectEqualStrings(parent_manifest_path, inspected.parent_manifest);
+    try std.testing.expectEqual(@as(usize, 2), inspected.child_count);
+    try std.testing.expectEqual(@as(usize, 2), inspected.children.len);
+    try std.testing.expectEqual(@as(usize, 2), inspected.chunkpack.chunk_count);
+    try std.testing.expectEqual(@as(usize, 1), inspected.chunkpack.pack_count);
+    try std.testing.expectEqualStrings("none", inspected.selection.kind);
+    try std.testing.expectEqual(@as(usize, 0), inspected.selection.selected_count);
+
+    const selected = try inspectBundle(arena, .{ .source = bundle_dir, .child_id = "1" });
+    try std.testing.expectEqualStrings("child", selected.selection.kind);
+    try std.testing.expectEqual(@as(usize, 1), selected.selection.selected_count);
+    try std.testing.expectEqualStrings("000001", selected.selection.children[0].id);
+
+    const ranged = try inspectBundle(arena, .{ .source = bundle_dir, .child_range = .{ .start = 0, .end = 1 } });
+    try std.testing.expectEqualStrings("child_range", ranged.selection.kind);
+    try std.testing.expectEqual(@as(usize, 2), ranged.selection.selected_count);
+    try std.testing.expectEqualStrings("000000", ranged.selection.children[0].id);
+    try std.testing.expectEqualStrings("000001", ranged.selection.children[1].id);
+    try std.testing.expectError(error.BadManifest, inspectBundle(arena, .{ .source = bundle_dir, .child_id = "missing" }));
+
     const unpacked = try unpack(arena, .{
         .io = io,
         .bundle_dir = bundle_dir,
@@ -3069,16 +3347,16 @@ test "pull file bundle materializes children through chunk cache" {
         .bundle_cache_dir = chunk_cache_dir,
         .child_id = "0",
     });
-    try std.testing.expectEqualStrings(pack_result.bundle_digest, pulled0.bundle_digest);
-    try std.testing.expectEqualStrings("000000", pulled0.selected_child.?);
-    try std.testing.expectEqual(@as(usize, 2), pulled0.materialized_chunk_count);
-    try std.testing.expectEqual(@as(usize, 0), pulled0.cache_hit_count);
-    try std.testing.expectEqual(@as(usize, 2), pulled0.cache_miss_count);
-    try std.testing.expectEqual(@as(u64, @intCast(ram.len)), pulled0.chunk_bytes_fetched);
-    try std.testing.expectEqual(@as(usize, 2), pulled0.linked_chunk_count);
-    try std.testing.expectEqual(@as(usize, 0), pulled0.rootfs_cache_hit_count);
-    try std.testing.expectEqual(@as(usize, 1), pulled0.rootfs_cache_miss_count);
-    try std.testing.expectEqual(artifact.size, pulled0.rootfs_bytes_fetched);
+    try std.testing.expectEqualStrings(pack_result.bundle_digest, pulled0.bundle_digest.hex);
+    try std.testing.expectEqualStrings("000000", pulled0.children.selected_child.?);
+    try std.testing.expectEqual(@as(usize, 2), pulled0.materialization.materialized_chunk_count);
+    try std.testing.expectEqual(@as(usize, 0), pulled0.materialization.cache.hit_count);
+    try std.testing.expectEqual(@as(usize, 2), pulled0.materialization.cache.miss_count);
+    try std.testing.expectEqual(@as(u64, @intCast(ram.len)), pulled0.materialization.cache.bytes_fetched);
+    try std.testing.expectEqual(@as(usize, 2), pulled0.materialization.linked_chunk_count);
+    try std.testing.expectEqual(@as(usize, 0), pulled0.rootfs.cache.hit_count);
+    try std.testing.expectEqual(@as(usize, 1), pulled0.rootfs.cache.miss_count);
+    try std.testing.expectEqual(artifact.size, pulled0.rootfs.cache.bytes_fetched);
 
     const pulled1 = try pull(arena, .{
         .io = io,
@@ -3088,15 +3366,15 @@ test "pull file bundle materializes children through chunk cache" {
         .bundle_cache_dir = chunk_cache_dir,
         .child_id = "1",
     });
-    try std.testing.expectEqualStrings("000001", pulled1.selected_child.?);
-    try std.testing.expectEqual(@as(usize, 2), pulled1.materialized_chunk_count);
-    try std.testing.expectEqual(@as(usize, 2), pulled1.cache_hit_count);
-    try std.testing.expectEqual(@as(usize, 0), pulled1.cache_miss_count);
-    try std.testing.expectEqual(@as(u64, 0), pulled1.chunk_bytes_fetched);
-    try std.testing.expectEqual(@as(usize, 2), pulled1.linked_chunk_count);
-    try std.testing.expectEqual(@as(usize, 1), pulled1.rootfs_cache_hit_count);
-    try std.testing.expectEqual(@as(usize, 0), pulled1.rootfs_cache_miss_count);
-    try std.testing.expectEqual(@as(u64, 0), pulled1.rootfs_bytes_fetched);
+    try std.testing.expectEqualStrings("000001", pulled1.children.selected_child.?);
+    try std.testing.expectEqual(@as(usize, 2), pulled1.materialization.materialized_chunk_count);
+    try std.testing.expectEqual(@as(usize, 2), pulled1.materialization.cache.hit_count);
+    try std.testing.expectEqual(@as(usize, 0), pulled1.materialization.cache.miss_count);
+    try std.testing.expectEqual(@as(u64, 0), pulled1.materialization.cache.bytes_fetched);
+    try std.testing.expectEqual(@as(usize, 2), pulled1.materialization.linked_chunk_count);
+    try std.testing.expectEqual(@as(usize, 1), pulled1.rootfs.cache.hit_count);
+    try std.testing.expectEqual(@as(usize, 0), pulled1.rootfs.cache.miss_count);
+    try std.testing.expectEqual(@as(u64, 0), pulled1.rootfs.cache.bytes_fetched);
 
     const restored_manifest = try spore.loadManifest(arena, out1_dir);
     defer restored_manifest.deinit();
@@ -3173,15 +3451,15 @@ test "push and pull s3 indexed bundle through verified remote cache" {
         .aws_region = "ap-southeast-2",
         .aws_executable = fake_aws,
     });
-    try std.testing.expectEqualStrings("000000", pulled0.selected_child.?);
-    try std.testing.expectEqualStrings(push_result.bundle_digest, pulled0.bundle_digest);
-    try std.testing.expect(!pulled0.remote_bundle_cache_hit);
-    try std.testing.expectEqual(push_result.uploaded_bytes, pulled0.origin_bytes_read);
-    try std.testing.expectEqual(@as(usize, 2), pulled0.cache_miss_count);
-    try std.testing.expectEqual(@as(u64, @intCast(ram.len)), pulled0.chunk_bytes_fetched);
-    try std.testing.expectEqual(@as(usize, 0), pulled0.rootfs_cache_hit_count);
-    try std.testing.expectEqual(@as(usize, 1), pulled0.rootfs_cache_miss_count);
-    try std.testing.expectEqual(artifact.size, pulled0.rootfs_bytes_fetched);
+    try std.testing.expectEqualStrings("000000", pulled0.children.selected_child.?);
+    try std.testing.expectEqualStrings(push_result.bundle_digest, pulled0.bundle_digest.hex);
+    try std.testing.expect(!pulled0.remote.cache_hit);
+    try std.testing.expectEqual(push_result.uploaded_bytes, pulled0.remote.origin_bytes_read);
+    try std.testing.expectEqual(@as(usize, 2), pulled0.materialization.cache.miss_count);
+    try std.testing.expectEqual(@as(u64, @intCast(ram.len)), pulled0.materialization.cache.bytes_fetched);
+    try std.testing.expectEqual(@as(usize, 0), pulled0.rootfs.cache.hit_count);
+    try std.testing.expectEqual(@as(usize, 1), pulled0.rootfs.cache.miss_count);
+    try std.testing.expectEqual(artifact.size, pulled0.rootfs.cache.bytes_fetched);
 
     const pulled1 = try pull(arena, .{
         .io = io,
@@ -3193,14 +3471,14 @@ test "push and pull s3 indexed bundle through verified remote cache" {
         .aws_region = "ap-southeast-2",
         .aws_executable = fake_aws,
     });
-    try std.testing.expectEqualStrings("000001", pulled1.selected_child.?);
-    try std.testing.expect(pulled1.remote_bundle_cache_hit);
-    try std.testing.expectEqual(@as(u64, 0), pulled1.origin_bytes_read);
-    try std.testing.expectEqual(@as(usize, 2), pulled1.cache_hit_count);
-    try std.testing.expectEqual(@as(u64, 0), pulled1.chunk_bytes_fetched);
-    try std.testing.expectEqual(@as(usize, 1), pulled1.rootfs_cache_hit_count);
-    try std.testing.expectEqual(@as(usize, 0), pulled1.rootfs_cache_miss_count);
-    try std.testing.expectEqual(@as(u64, 0), pulled1.rootfs_bytes_fetched);
+    try std.testing.expectEqualStrings("000001", pulled1.children.selected_child.?);
+    try std.testing.expect(pulled1.remote.cache_hit);
+    try std.testing.expectEqual(@as(u64, 0), pulled1.remote.origin_bytes_read);
+    try std.testing.expectEqual(@as(usize, 2), pulled1.materialization.cache.hit_count);
+    try std.testing.expectEqual(@as(u64, 0), pulled1.materialization.cache.bytes_fetched);
+    try std.testing.expectEqual(@as(usize, 1), pulled1.rootfs.cache.hit_count);
+    try std.testing.expectEqual(@as(usize, 0), pulled1.rootfs.cache.miss_count);
+    try std.testing.expectEqual(@as(u64, 0), pulled1.rootfs.cache.bytes_fetched);
 
     const restored_manifest = try spore.loadManifest(arena, out1_dir);
     defer restored_manifest.deinit();
@@ -3299,10 +3577,10 @@ test "push and pull s3 indexed bundle carries disk layers" {
         .aws_region = "ap-southeast-2",
         .aws_executable = fake_aws,
     });
-    try std.testing.expectEqualStrings("000000", pulled0.selected_child.?);
-    try std.testing.expectEqualStrings(push_result.bundle_digest, pulled0.bundle_digest);
-    try std.testing.expect(!pulled0.remote_bundle_cache_hit);
-    try std.testing.expectEqual(push_result.uploaded_bytes, pulled0.origin_bytes_read);
+    try std.testing.expectEqualStrings("000000", pulled0.children.selected_child.?);
+    try std.testing.expectEqualStrings(push_result.bundle_digest, pulled0.bundle_digest.hex);
+    try std.testing.expect(!pulled0.remote.cache_hit);
+    try std.testing.expectEqual(push_result.uploaded_bytes, pulled0.remote.origin_bytes_read);
     const restored0 = try spore.loadManifest(arena, out0_dir);
     defer restored0.deinit();
     _ = try disk_layer.loadLayerChain(arena, out0_dir, restored0.value.disk orelse return error.BadManifest);
@@ -3317,9 +3595,9 @@ test "push and pull s3 indexed bundle carries disk layers" {
         .aws_region = "ap-southeast-2",
         .aws_executable = fake_aws,
     });
-    try std.testing.expectEqualStrings("000001", pulled1.selected_child.?);
-    try std.testing.expect(pulled1.remote_bundle_cache_hit);
-    try std.testing.expectEqual(@as(u64, 0), pulled1.origin_bytes_read);
+    try std.testing.expectEqualStrings("000001", pulled1.children.selected_child.?);
+    try std.testing.expect(pulled1.remote.cache_hit);
+    try std.testing.expectEqual(@as(u64, 0), pulled1.remote.origin_bytes_read);
     const restored1 = try spore.loadManifest(arena, out1_dir);
     defer restored1.deinit();
     _ = try disk_layer.loadLayerChain(arena, out1_dir, restored1.value.disk orelse return error.BadManifest);
@@ -3401,16 +3679,16 @@ test "pull http indexed bundle through verified peer cache" {
         .bundle_cache_dir = peer_cache_dir,
         .child_id = "0",
     });
-    try std.testing.expectEqualStrings("000000", pulled0.selected_child.?);
-    try std.testing.expectEqualStrings(pack_result.bundle_digest, pulled0.bundle_digest);
-    try std.testing.expect(!pulled0.remote_bundle_cache_hit);
-    try std.testing.expectEqual(@as(u64, 0), pulled0.origin_bytes_read);
-    try std.testing.expectEqual(expected_peer_bytes, pulled0.peer_bytes_read);
-    try std.testing.expectEqual(@as(usize, 2), pulled0.cache_miss_count);
-    try std.testing.expectEqual(@as(u64, @intCast(ram.len)), pulled0.chunk_bytes_fetched);
-    try std.testing.expectEqual(@as(usize, 0), pulled0.rootfs_cache_hit_count);
-    try std.testing.expectEqual(@as(usize, 1), pulled0.rootfs_cache_miss_count);
-    try std.testing.expectEqual(artifact.size, pulled0.rootfs_bytes_fetched);
+    try std.testing.expectEqualStrings("000000", pulled0.children.selected_child.?);
+    try std.testing.expectEqualStrings(pack_result.bundle_digest, pulled0.bundle_digest.hex);
+    try std.testing.expect(!pulled0.remote.cache_hit);
+    try std.testing.expectEqual(@as(u64, 0), pulled0.remote.origin_bytes_read);
+    try std.testing.expectEqual(expected_peer_bytes, pulled0.remote.peer_bytes_read);
+    try std.testing.expectEqual(@as(usize, 2), pulled0.materialization.cache.miss_count);
+    try std.testing.expectEqual(@as(u64, @intCast(ram.len)), pulled0.materialization.cache.bytes_fetched);
+    try std.testing.expectEqual(@as(usize, 0), pulled0.rootfs.cache.hit_count);
+    try std.testing.expectEqual(@as(usize, 1), pulled0.rootfs.cache.miss_count);
+    try std.testing.expectEqual(artifact.size, pulled0.rootfs.cache.bytes_fetched);
 
     const pulled1 = try pull(arena, .{
         .io = io,
@@ -3420,15 +3698,15 @@ test "pull http indexed bundle through verified peer cache" {
         .bundle_cache_dir = peer_cache_dir,
         .child_id = "1",
     });
-    try std.testing.expectEqualStrings("000001", pulled1.selected_child.?);
-    try std.testing.expect(pulled1.remote_bundle_cache_hit);
-    try std.testing.expectEqual(@as(u64, 0), pulled1.origin_bytes_read);
-    try std.testing.expectEqual(@as(u64, 0), pulled1.peer_bytes_read);
-    try std.testing.expectEqual(@as(usize, 2), pulled1.cache_hit_count);
-    try std.testing.expectEqual(@as(u64, 0), pulled1.chunk_bytes_fetched);
-    try std.testing.expectEqual(@as(usize, 1), pulled1.rootfs_cache_hit_count);
-    try std.testing.expectEqual(@as(usize, 0), pulled1.rootfs_cache_miss_count);
-    try std.testing.expectEqual(@as(u64, 0), pulled1.rootfs_bytes_fetched);
+    try std.testing.expectEqualStrings("000001", pulled1.children.selected_child.?);
+    try std.testing.expect(pulled1.remote.cache_hit);
+    try std.testing.expectEqual(@as(u64, 0), pulled1.remote.origin_bytes_read);
+    try std.testing.expectEqual(@as(u64, 0), pulled1.remote.peer_bytes_read);
+    try std.testing.expectEqual(@as(usize, 2), pulled1.materialization.cache.hit_count);
+    try std.testing.expectEqual(@as(u64, 0), pulled1.materialization.cache.bytes_fetched);
+    try std.testing.expectEqual(@as(usize, 1), pulled1.rootfs.cache.hit_count);
+    try std.testing.expectEqual(@as(usize, 0), pulled1.rootfs.cache.miss_count);
+    try std.testing.expectEqual(@as(u64, 0), pulled1.rootfs.cache.bytes_fetched);
 
     const restored_manifest = try spore.loadManifest(arena, out1_dir);
     defer restored_manifest.deinit();
@@ -3758,11 +4036,11 @@ test "metadata-only rootfs policy requires explicit prepared cache" {
         .child_id = "000000",
         .allow_metadata_only_rootfs = true,
     });
-    try std.testing.expectEqual(@as(usize, 1), pulled.rootfs_artifact_count);
-    try std.testing.expectEqual(@as(u64, 0), pulled.rootfs_payload_bytes);
-    try std.testing.expectEqual(@as(usize, 1), pulled.rootfs_cache_hit_count);
-    try std.testing.expectEqual(@as(usize, 0), pulled.rootfs_cache_miss_count);
-    try std.testing.expectEqual(@as(u64, 0), pulled.rootfs_bytes_fetched);
+    try std.testing.expectEqual(@as(usize, 1), pulled.rootfs.artifact_count);
+    try std.testing.expectEqual(@as(u64, 0), pulled.rootfs.payload_bytes);
+    try std.testing.expectEqual(@as(usize, 1), pulled.rootfs.cache.hit_count);
+    try std.testing.expectEqual(@as(usize, 0), pulled.rootfs.cache.miss_count);
+    try std.testing.expectEqual(@as(u64, 0), pulled.rootfs.cache.bytes_fetched);
 }
 
 test "pack rejects rootfs manifests without cache artifact" {

@@ -342,9 +342,10 @@ The run captured an Alpine rootfs-backed writable parent, forked two children,
 packed the disk layer into an S3 bundle, pulled both children on both hosts,
 booted them with `spore run --from`, rejected one corrupt disk object per host,
 and proved warm cache reuse: iteration 2 on each host reported
-`remote_bundle_cache_hit=true`, `origin_bytes_read=0`,
-`chunk_bytes_fetched=0`, and `rootfs_bytes_fetched=0`. The bundle carried 12
-disk objects, 49,152 bytes of disk object payload, and digest
+`remote.cache_hit=true`, `remote.origin_bytes_read=0`,
+`materialization.cache.bytes_fetched=0`, and
+`rootfs.cache.bytes_fetched=0`. The bundle carried 12 disk objects, 49,152
+bytes of disk object payload, and digest
 `38cd7e6539cb77b81533e1c66b3c88a190cd668b6a60925c007afcfd77580060`.
 
 Extend `spore pack`, `spore pull`, and cache metrics to include disk layer

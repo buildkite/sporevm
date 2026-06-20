@@ -816,7 +816,10 @@ mise exec -- zig build
 mise exec -- zig build kvm-boot
 
 json_field() {
-  python3 -c 'import json, sys; value=json.load(open(sys.argv[1], encoding="utf-8"))[sys.argv[2]]; print(str(value).lower() if isinstance(value, bool) else value)' "\$1" "\$2"
+  python3 -c 'import json, sys; value=json.load(open(sys.argv[1], encoding="utf-8"));
+for part in sys.argv[2].split("."):
+    value = value[part]
+print(str(value).lower() if isinstance(value, bool) else value)' "\$1" "\$2"
 }
 
 assert_corrupt_bundle_rejected() {
@@ -1003,15 +1006,15 @@ for iteration in \$(seq 1 "\${dest_repeat}"); do
       zig-out/bin/spore --json pull "\${pull_source}" --child "\${iteration_child_id}" --out "\${unpacked_dir}" | tee "\${unpack_result}"
     bundle_dir="\${pull_bundle_cache}/remote/http/sha256/\${bundle_key}/bundle"
   fi
-  cache_hit="\$(json_field "\${unpack_result}" remote_bundle_cache_hit)"
-  origin_bytes="\$(json_field "\${unpack_result}" origin_bytes_read)"
-  peer_bytes="\$(json_field "\${unpack_result}" peer_bytes_read)"
-  selected_child="\$(json_field "\${unpack_result}" selected_child)"
-  chunk_bytes_fetched="\$(json_field "\${unpack_result}" chunk_bytes_fetched)"
-  rootfs_artifact_count="\$(json_field "\${unpack_result}" rootfs_artifact_count)"
-  rootfs_bytes_fetched="\$(json_field "\${unpack_result}" rootfs_bytes_fetched)"
-  rootfs_cache_hits="\$(json_field "\${unpack_result}" rootfs_cache_hit_count)"
-  rootfs_cache_misses="\$(json_field "\${unpack_result}" rootfs_cache_miss_count)"
+  cache_hit="\$(json_field "\${unpack_result}" remote.cache_hit)"
+  origin_bytes="\$(json_field "\${unpack_result}" remote.origin_bytes_read)"
+  peer_bytes="\$(json_field "\${unpack_result}" remote.peer_bytes_read)"
+  selected_child="\$(json_field "\${unpack_result}" children.selected_child)"
+  chunk_bytes_fetched="\$(json_field "\${unpack_result}" materialization.cache.bytes_fetched)"
+  rootfs_artifact_count="\$(json_field "\${unpack_result}" rootfs.artifact_count)"
+  rootfs_bytes_fetched="\$(json_field "\${unpack_result}" rootfs.cache.bytes_fetched)"
+  rootfs_cache_hits="\$(json_field "\${unpack_result}" rootfs.cache.hit_count)"
+  rootfs_cache_misses="\$(json_field "\${unpack_result}" rootfs.cache.miss_count)"
   if [[ "\${workload}" == "rootfs" ]]; then
     [[ "\${rootfs_artifact_count}" -gt 0 ]] || { echo "rootfs pull did not report a rootfs artifact" >&2; exit 1; }
     if [[ "\${iteration}" == "1" ]]; then
@@ -1066,7 +1069,7 @@ for iteration in \$(seq 1 "\${dest_repeat}"); do
       rootfs_corrupt_rejected=true
     fi
   fi
-  unpack_bundle_key="\$(json_field "\${unpack_result}" bundle_digest)"
+  unpack_bundle_key="\$(json_field "\${unpack_result}" bundle_digest.hex)"
   if [[ "\${unpack_bundle_key}" != "\${bundle_key}" ]]; then
     echo "unpacked bundle digest mismatch: expected \${bundle_key}, got \${unpack_bundle_key}" >&2
     exit 1

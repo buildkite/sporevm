@@ -259,7 +259,11 @@ The first implementation should pin a small stable code table in tests:
 - Slice 2 is implemented in this branch: `host-info` now emits
   `spore.host-info.v1` under global `--json` and a human summary by default,
   with host class, platform facts, backend availability, and cache roots.
-- Slices 3 through 5 are still pending.
+- Slice 3 is implemented in this branch: `inspect-bundle` exposes
+  `spore.bundle.inspect.v1`, `pull` emits `spore.pull.result.v1` with shared
+  digest, materialization, rootfs, remote, and child-selection summaries, and
+  the smoke scripts consume the nested machine contract through global `--json`.
+- Slices 4 and 5 are still pending.
 
 ## Delivery Strategy
 

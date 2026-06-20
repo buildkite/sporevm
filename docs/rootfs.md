@@ -146,9 +146,9 @@ s3://bucket/prefix@sha256:<bundle_digest> --child 42 --out child.spore` and
 bundled rootfs bytes through the same digest-cache path. Use
 `SPOREVM_ROOTFS_CACHE_DIR` to choose the destination rootfs digest cache and
 `SPOREVM_BUNDLE_CACHE_DIR` to choose the node-local bundle and memory chunk
-caches used by pull. Pull JSON reports `rootfs_cache_hit_count`,
-`rootfs_cache_miss_count`, and `rootfs_bytes_fetched` so repeated pulls can
-prove a warm digest cache is not refetching or reinstalling rootfs bytes.
+caches used by pull. Pull JSON reports `rootfs.cache.hit_count`,
+`rootfs.cache.miss_count`, and `rootfs.cache.bytes_fetched` so repeated pulls
+can prove a warm digest cache is not refetching or reinstalling rootfs bytes.
 
 Plain `spore run --rootfs PATH` remains a local run escape hatch. Combining
 `--rootfs PATH` with `--capture` is rejected until an import/preload

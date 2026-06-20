@@ -11,6 +11,36 @@ pub const Mode = enum {
     json,
 };
 
+pub const DigestRef = struct {
+    algorithm: []const u8 = "sha256",
+    hex: []const u8,
+};
+
+pub const CacheState = struct {
+    hit_count: usize = 0,
+    miss_count: usize = 0,
+    bytes_fetched: u64 = 0,
+};
+
+pub const ChunkMaterializationSummary = struct {
+    chunk_count: usize,
+    materialized_chunk_count: usize,
+    payload_bytes: u64,
+    linked_chunk_count: usize = 0,
+    copied_chunk_count: usize = 0,
+    cache: CacheState = .{},
+};
+
+pub const RootfsMaterializationSummary = struct {
+    artifact_count: usize = 0,
+    payload_bytes: u64 = 0,
+    cache: CacheState = .{},
+};
+
+pub fn digestRef(hex: []const u8) DigestRef {
+    return .{ .hex = hex };
+}
+
 pub const Scope = enum {
     usage,
     host,
