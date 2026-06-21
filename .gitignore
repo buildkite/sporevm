@@ -6,4 +6,3 @@ __pycache__/
 *.pyc
 benchmarks/results/
 dist/
-release-extra/
