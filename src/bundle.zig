@@ -312,6 +312,7 @@ const MaterializeResult = struct {
     payload_bytes: u64 = 0,
     cache_hit_count: usize = 0,
     cache_miss_count: usize = 0,
+    cache_reused_bytes: u64 = 0,
     linked_chunk_count: usize = 0,
     copied_chunk_count: usize = 0,
 };
@@ -322,6 +323,7 @@ const RootfsMaterializeResult = struct {
     cache_hit_count: usize = 0,
     cache_miss_count: usize = 0,
     bytes_fetched: u64 = 0,
+    bytes_reused: u64 = 0,
 };
 
 pub fn inspectBundle(allocator: std.mem.Allocator, options: InspectBundleOptions) Error!InspectBundleResult {
@@ -950,6 +952,7 @@ fn pullLocalIndexedBundle(
                 .hit_count = materialized.cache_hit_count,
                 .miss_count = materialized.cache_miss_count,
                 .bytes_fetched = materialized.payload_bytes,
+                .bytes_reused = materialized.cache_reused_bytes,
             },
         },
         .rootfs = .{
@@ -959,6 +962,7 @@ fn pullLocalIndexedBundle(
                 .hit_count = rootfs_result.cache_hit_count,
                 .miss_count = rootfs_result.cache_miss_count,
                 .bytes_fetched = rootfs_result.bytes_fetched,
+                .bytes_reused = rootfs_result.bytes_reused,
             },
         },
         .children = .{
@@ -1316,6 +1320,7 @@ fn materializeChunkViaCache(
     if (try pathExistsNoSymlink(io, cache_path)) {
         try verifyChunkPath(io, allocator, cache_path, expected_id, expected_size);
         result.cache_hit_count += 1;
+        result.cache_reused_bytes += @intCast(expected_size);
     } else {
         const data = try source.readChunk(allocator, entry, expected_id, expected_size);
         defer allocator.free(data);
@@ -1612,6 +1617,7 @@ fn unpackRootfsArtifact(allocator: std.mem.Allocator, options: UnpackOptions, ma
         .cache_hit_count = if (installed.cache_hit) 1 else 0,
         .cache_miss_count = if (installed.cache_hit) 0 else 1,
         .bytes_fetched = installed.bytes_fetched,
+        .bytes_reused = if (installed.cache_hit) rootfs.artifact.size else 0,
     };
 }
 
@@ -1649,6 +1655,7 @@ fn unpackRootfsArtifactIndexed(
             .cache_hit_count = 1,
             .cache_miss_count = 0,
             .bytes_fetched = 0,
+            .bytes_reused = rootfs.artifact.size,
         };
     }
     if (!std.mem.eql(u8, entry.policy, rootfs_policy_exact_bytes)) return error.BadManifest;
@@ -1664,6 +1671,7 @@ fn unpackRootfsArtifactIndexed(
         .cache_hit_count = if (installed.cache_hit) 1 else 0,
         .cache_miss_count = if (installed.cache_hit) 0 else 1,
         .bytes_fetched = installed.bytes_fetched,
+        .bytes_reused = if (installed.cache_hit) rootfs.artifact.size else 0,
     };
 }
 
@@ -1693,6 +1701,7 @@ fn unpackRootfsStorageIndexed(
     const installed_index = try installRootfsCasIndexPath(allocator, options.io, cache_index_path, index_bytes, storage);
     if (installed_index.cache_hit) {
         result.cache_hit_count += 1;
+        result.bytes_reused += @intCast(index_bytes.len);
     } else {
         result.cache_miss_count += 1;
         result.bytes_fetched += installed_index.bytes_fetched;
@@ -1710,6 +1719,7 @@ fn unpackRootfsStorageIndexed(
         const installed_object = try installRootfsCasChunkPath(allocator, options.io, cache_object_path, object_data, chunk_entry.digest, expected_size);
         if (installed_object.cache_hit) {
             result.cache_hit_count += 1;
+            result.bytes_reused += @intCast(object_data.len);
         } else {
             result.cache_miss_count += 1;
             result.bytes_fetched += installed_object.bytes_fetched;
@@ -4518,6 +4528,7 @@ test "pack and pull chunked rootfs storage materializes rootfs CAS" {
     const bundle_dir = try pathZ(arena, "{s}/bundle", .{root_dir});
     const legacy_bundle_dir = try pathZ(arena, "{s}/legacy-bundle", .{root_dir});
     const out_dir = try pathZ(arena, "{s}/pulled-child", .{root_dir});
+    const out_cached_dir = try pathZ(arena, "{s}/pulled-cached-child", .{root_dir});
     const out_bad_dir = try pathZ(arena, "{s}/pulled-bad-child", .{root_dir});
     const pack_cache_root = try pathZ(arena, "{s}/pack-cache", .{root_dir});
     const pull_rootfs_cache = try pathZ(arena, "{s}/pull-rootfs-cache", .{root_dir});
@@ -4580,6 +4591,21 @@ test "pack and pull chunked rootfs storage materializes rootfs CAS" {
     try std.testing.expectEqual(@as(usize, 0), pulled.rootfs.cache.hit_count);
     try std.testing.expectEqual(preload_result.nonzero_chunks + 1, pulled.rootfs.cache.miss_count);
     try std.testing.expect(pulled.rootfs.cache.bytes_fetched > 0);
+    try std.testing.expectEqual(@as(u64, 0), pulled.rootfs.cache.bytes_reused);
+
+    const pulled_cached = try pull(arena, .{
+        .io = io,
+        .source = source_uri,
+        .out_dir = out_cached_dir,
+        .rootfs_cache_dir = pull_rootfs_cache,
+        .bundle_cache_dir = pull_bundle_cache,
+        .child_id = "000000",
+    });
+    try std.testing.expectEqual(preload_result.nonzero_chunks + 1, pulled_cached.rootfs.cache.hit_count);
+    try std.testing.expectEqual(@as(usize, 0), pulled_cached.rootfs.cache.miss_count);
+    try std.testing.expectEqual(@as(u64, 0), pulled_cached.rootfs.cache.bytes_fetched);
+    try std.testing.expectEqual(pulled.rootfs.payload_bytes, pulled_cached.rootfs.cache.bytes_reused);
+    try std.testing.expectEqual(@as(u64, @intCast(ram.len)), pulled_cached.materialization.cache.bytes_reused);
 
     const exact_cache_path = try rootfs_cache.digestPath(arena, pull_rootfs_cache, artifact.digest);
     try std.testing.expect(!try pathExistsNoSymlink(io, exact_cache_path));

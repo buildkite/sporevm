@@ -14,8 +14,9 @@ Capture a spore on one SSM-managed KVM host, pack it into a chunkpack bundle,
 stage the bundle in S3, then pull and resume it on one or more compatible KVM
 hosts. The default initrd workload exercises the low-level diskless resume path.
 Pass `--workload rootfs` to build an OCI rootfs artifact, include immutable
-rootfs bytes in the bundle, and verify destination materialization into the
-rootfs digest cache without booting the child VM.
+rootfs bytes in the bundle, and verify destination materialization without
+booting the child VM. Pass `--rootfs-storage chunked` to attach manifest-bound
+rootfs CAS storage instead of the exact ext4 artifact.
 
 The script uploads tracked HEAD plus the current tracked/staged diff to S3 so
 it can validate local changes before they are committed without copying stray
@@ -43,6 +44,9 @@ Options:
                               (default: docker.io/library/alpine:3.20)
   --rootfs-platform PLATFORM  OCI platform for --workload rootfs (default: linux/arm64)
   --rootfs-mem-mib N          guest memory for --workload rootfs (default: 2048)
+  --rootfs-storage exact|chunked
+                              rootfs bundle storage for --workload rootfs
+                              (default: exact)
   --snapshot-after-ms N       capture delay before snapshot (default: 3000)
   --resume-seconds N          seconds to let resumed VM tick (default: 5)
   --dest-repeat N             restore each destination N times (default: 1)
@@ -115,6 +119,7 @@ workload="initrd"
 rootfs_image="${SPORE_SMOKE_ROOTFS_IMAGE:-docker.io/library/alpine:3.20}"
 rootfs_platform="${SPORE_SMOKE_ROOTFS_PLATFORM:-linux/arm64}"
 rootfs_mem_mib="${SPORE_SMOKE_ROOTFS_MEM_MIB:-2048}"
+rootfs_storage="${SPORE_SMOKE_ROOTFS_STORAGE:-exact}"
 snapshot_after_ms="3000"
 resume_seconds="5"
 dest_repeat="1"
@@ -194,6 +199,11 @@ while (($#)); do
     --rootfs-mem-mib)
       need_value "$1" "${2-}"
       rootfs_mem_mib="$2"
+      shift 2
+      ;;
+    --rootfs-storage)
+      need_value "$1" "${2-}"
+      rootfs_storage="$2"
       shift 2
       ;;
     --snapshot-after-ms)
@@ -280,6 +290,13 @@ case "${workload}" in
   initrd|rootfs) ;;
   *) die "--workload must be initrd or rootfs" ;;
 esac
+case "${rootfs_storage}" in
+  exact|chunked) ;;
+  *) die "--rootfs-storage must be exact or chunked" ;;
+esac
+if [[ "${rootfs_storage}" != "exact" && "${workload}" != "rootfs" ]]; then
+  die "--rootfs-storage ${rootfs_storage} requires --workload rootfs"
+fi
 if [[ "${writable_rootfs}" == "1" && "${workload}" != "initrd" ]]; then
   die "--writable-rootfs cannot be combined with --workload ${workload}"
 fi
@@ -357,6 +374,7 @@ q_workload="$(shell_quote "${workload}")"
 q_rootfs_image="$(shell_quote "${rootfs_image}")"
 q_rootfs_platform="$(shell_quote "${rootfs_platform}")"
 q_rootfs_mem_mib="$(shell_quote "${rootfs_mem_mib}")"
+q_rootfs_storage="$(shell_quote "${rootfs_storage}")"
 q_snapshot_after_ms="$(shell_quote "${snapshot_after_ms}")"
 q_resume_seconds="$(shell_quote "${resume_seconds}")"
 q_dest_repeat="$(shell_quote "${dest_repeat}")"
@@ -384,6 +402,9 @@ cleanup_remote_workdir() {
   local quoted_command
   local ssm_command
   local parameters_json
+  if ((${#comment} > 100)); then
+    comment="${comment:0:100}"
+  fi
   q_workdir="$(shell_quote "${workdir}")"
   command="if [ -f ${q_workdir}/peer-http.pid ]; then kill \$(cat ${q_workdir}/peer-http.pid) 2>/dev/null || true; fi; rm -rf ${q_workdir}"
   quoted_command="$(shell_quote "${command}")"
@@ -475,6 +496,7 @@ workload=${q_workload}
 rootfs_image=${q_rootfs_image}
 rootfs_platform=${q_rootfs_platform}
 rootfs_mem_mib=${q_rootfs_mem_mib}
+rootfs_storage=${q_rootfs_storage}
 snapshot_after_ms=${q_snapshot_after_ms}
 source_peer_ip=${q_source_peer_ip}
 source_peer_port=${q_source_peer_port}
@@ -657,6 +679,12 @@ PY
   [[ -f "\${workdir}/spore/manifest.json" ]] || { echo "rootfs synthetic spore did not write manifest" >&2; exit 1; }
   grep -Fq '"rootfs"' "\${workdir}/spore/manifest.json" || { echo "rootfs synthetic manifest did not record rootfs" >&2; exit 1; }
   grep -Fq '"digest": "blake3:' "\${workdir}/spore/manifest.json" || { echo "rootfs synthetic manifest did not record digest" >&2; exit 1; }
+  if [[ "\${rootfs_storage}" == "chunked" ]]; then
+    SPOREVM_ROOTFS_CACHE_DIR="\${rootfs_cache}" \
+      zig-out/bin/spore rootfs cas-preload "\$(python3 -c 'import json, sys; print("blake3:" + json.load(open(sys.argv[1], encoding="utf-8"))["rootfs_blake3"])' "\${rootfs_metadata}")" \
+      --attach-spore "\${workdir}/spore" | tee "\${workdir}/rootfs-cas-preload.txt"
+    grep -Fq '"storage"' "\${workdir}/spore/manifest.json" || { echo "rootfs manifest did not attach chunked storage" >&2; exit 1; }
+  fi
 fi
 
 zig-out/bin/spore --json fork "\${workdir}/spore" --count "\${child_count}" --out "\${workdir}/spore.children" | tee "\${workdir}/fork-result.json"
@@ -684,7 +712,7 @@ bundle_key="\$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], e
 rootfs_artifact_count="\$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("rootfs_artifact_count", 0))' "\${workdir}/pack-result.json")"
 rootfs_payload_bytes="\$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("rootfs_payload_bytes", 0))' "\${workdir}/pack-result.json")"
 if [[ "\${workload}" == "rootfs" ]]; then
-  [[ "\${rootfs_artifact_count}" -gt 0 ]] || { echo "rootfs bundle did not include a rootfs artifact" >&2; exit 1; }
+  [[ "\${rootfs_artifact_count}" -gt 0 ]] || { echo "rootfs bundle did not include rootfs storage" >&2; exit 1; }
   [[ "\${rootfs_payload_bytes}" -gt 0 ]] || { echo "rootfs bundle did not include rootfs bytes" >&2; exit 1; }
 fi
 if [[ -d "\${workdir}/spore.bundle/chunkpacks" ]]; then
@@ -729,6 +757,7 @@ cat >"\${workdir}/source-result.json" <<JSON
   "writable_rootfs": \${writable_rootfs_json},
   "writable_rootfs_image": "\${resolved_writable_image}",
   "rootfs_image": "\${rootfs_image}",
+  "rootfs_storage": "\${rootfs_storage}",
   "rootfs_mem_mib": \${rootfs_mem_mib},
   "resolved_rootfs_image": "\${resolved_rootfs_image}",
   "bundle_bytes": \${bundle_bytes},
@@ -776,6 +805,7 @@ workload=${q_workload}
 rootfs_image=${q_rootfs_image}
 rootfs_platform=${q_rootfs_platform}
 rootfs_mem_mib=${q_rootfs_mem_mib}
+rootfs_storage=${q_rootfs_storage}
 source_peer_ip=${q_source_peer_ip}
 source_peer_port=${q_source_peer_port}
 writable_rootfs=${q_writable_rootfs}
@@ -871,7 +901,7 @@ assert_corrupt_rootfs_rejected() {
   cp -a "\${bundle_dir}/." "\${corrupt_dir}/"
   rootfs_file="\$(find "\${corrupt_dir}/rootfs/blake3" -type f | sort | head -1 || true)"
   if [[ -z "\${rootfs_file}" ]]; then
-    echo "rootfs workload bundle had no rootfs artifact to corrupt" >&2
+    echo "rootfs workload bundle had no rootfs payload to corrupt" >&2
     exit 1
   fi
   python3 - "\${rootfs_file}" <<'PY'
@@ -881,14 +911,14 @@ import sys
 path = pathlib.Path(sys.argv[1])
 data = bytearray(path.read_bytes())
 if not data:
-    raise SystemExit("cannot corrupt empty rootfs artifact")
+    raise SystemExit("cannot corrupt empty rootfs payload")
 data[0] ^= 0x01
 path.write_bytes(data)
 PY
   if SPOREVM_ROOTFS_CACHE_DIR="\${corrupt_rootfs_cache}" \
       zig-out/bin/spore unpack "\${corrupt_dir}" --out "\${corrupt_out}" >"\${corrupt_log}" 2>&1; then
     cat "\${corrupt_log}" >&2 || true
-    echo "corrupt rootfs artifact unexpectedly unpacked successfully" >&2
+    echo "corrupt rootfs payload unexpectedly unpacked successfully" >&2
     exit 1
   fi
   rm -rf "\${corrupt_dir}" "\${corrupt_out}" "\${corrupt_rootfs_cache}"
@@ -931,11 +961,58 @@ with open(manifest_path, "r", encoding="utf-8") as f:
 rootfs = manifest.get("rootfs")
 if not rootfs:
     raise SystemExit("materialized rootfs child has no rootfs manifest")
+
+def digest_hex(digest):
+    if not digest.startswith("blake3:"):
+        raise SystemExit(f"unexpected rootfs digest {digest}")
+    return digest.split(":", 1)[1]
+
+storage = rootfs.get("storage")
+if storage:
+    index_digest = storage["index_digest"]
+    index_hex = digest_hex(index_digest)
+    index_path = pathlib.Path(cache_root) / "cas" / "rootfs" / "blake3" / "indexes" / f"{index_hex}.json"
+    if not index_path.is_file():
+        raise SystemExit(f"rootfs CAS index missing: {index_path}")
+    with open(index_path, "r", encoding="utf-8") as f:
+        index = json.load(f)
+    if index.get("logical_size") != storage.get("logical_size"):
+        raise SystemExit("rootfs CAS index logical_size mismatch")
+    if index.get("chunk_size") != storage.get("chunk_size"):
+        raise SystemExit("rootfs CAS index chunk_size mismatch")
+    object_count = 0
+    object_bytes = 0
+    logical_size = int(storage["logical_size"])
+    chunk_size = int(storage["chunk_size"])
+    for chunk in index.get("chunks", []):
+        digest = chunk["digest"]
+        object_hex = digest_hex(digest)
+        object_path = pathlib.Path(cache_root) / "cas" / "rootfs" / "blake3" / "objects" / f"{object_hex}.chunk"
+        if not object_path.is_file():
+            raise SystemExit(f"rootfs CAS object missing: {object_path}")
+        logical_chunk = int(chunk["logical_chunk"])
+        offset = logical_chunk * chunk_size
+        expected_size = min(chunk_size, logical_size - offset)
+        if expected_size <= 0:
+            raise SystemExit(f"rootfs CAS object offset out of range: chunk {logical_chunk}")
+        actual_size = object_path.stat().st_size
+        if actual_size != expected_size:
+            raise SystemExit(f"rootfs CAS object size mismatch: expected {expected_size}, got {actual_size}")
+        object_count += 1
+        object_bytes += actual_size
+    print(json.dumps({
+        "selected_child": selected_child,
+        "iteration": int(iteration),
+        "rootfs_storage": "chunked",
+        "rootfs_index_digest": index_digest,
+        "rootfs_index_path": str(index_path),
+        "rootfs_object_count": object_count,
+        "rootfs_object_bytes": object_bytes,
+    }, indent=2))
+    sys.exit(0)
 artifact = rootfs["artifact"]
 digest = artifact["digest"]
-if not digest.startswith("blake3:"):
-    raise SystemExit(f"unexpected rootfs digest {digest}")
-hex_digest = digest.split(":", 1)[1]
+hex_digest = digest_hex(digest)
 cache_path = pathlib.Path(cache_root) / "by-digest" / "blake3" / f"{hex_digest}.ext4"
 if not cache_path.is_file():
     raise SystemExit(f"rootfs cache entry missing: {cache_path}")
@@ -946,6 +1023,7 @@ if actual_size != expected_size:
 print(json.dumps({
     "selected_child": selected_child,
     "iteration": int(iteration),
+    "rootfs_storage": "exact",
     "rootfs_digest": digest,
     "rootfs_size": expected_size,
     "cache_path": str(cache_path),
@@ -962,6 +1040,7 @@ total_peer_bytes=0
 total_download_bytes=0
 total_chunk_bytes_fetched=0
 total_rootfs_bytes_fetched=0
+total_rootfs_bytes_reused=0
 total_rootfs_cache_hits=0
 total_rootfs_cache_misses=0
 cache_hits=0
@@ -984,6 +1063,7 @@ for iteration in \$(seq 1 "\${dest_repeat}"); do
   chunk_bytes_fetched=0
   rootfs_artifact_count=0
   rootfs_bytes_fetched=0
+  rootfs_bytes_reused=0
   rootfs_cache_hits=0
   rootfs_cache_misses=0
   mkdir -p "\${iter_dir}"
@@ -1013,6 +1093,7 @@ for iteration in \$(seq 1 "\${dest_repeat}"); do
   chunk_bytes_fetched="\$(json_field "\${unpack_result}" materialization.cache.bytes_fetched)"
   rootfs_artifact_count="\$(json_field "\${unpack_result}" rootfs.artifact_count)"
   rootfs_bytes_fetched="\$(json_field "\${unpack_result}" rootfs.cache.bytes_fetched)"
+  rootfs_bytes_reused="\$(json_field "\${unpack_result}" rootfs.cache.bytes_reused)"
   rootfs_cache_hits="\$(json_field "\${unpack_result}" rootfs.cache.hit_count)"
   rootfs_cache_misses="\$(json_field "\${unpack_result}" rootfs.cache.miss_count)"
   if [[ "\${workload}" == "rootfs" ]]; then
@@ -1036,6 +1117,7 @@ for iteration in \$(seq 1 "\${dest_repeat}"); do
     [[ "\${chunk_bytes_fetched}" == "0" ]] || { echo "repeat pull fetched \${chunk_bytes_fetched} chunk bytes, expected 0" >&2; exit 1; }
     if [[ "\${rootfs_artifact_count}" -gt 0 ]]; then
       [[ "\${rootfs_bytes_fetched}" == "0" ]] || { echo "repeat pull fetched \${rootfs_bytes_fetched} rootfs bytes, expected 0" >&2; exit 1; }
+      [[ "\${rootfs_bytes_reused}" -gt 0 ]] || { echo "repeat pull did not report reused rootfs bytes" >&2; exit 1; }
       [[ "\${rootfs_cache_hits}" -gt 0 ]] || { echo "repeat pull did not report a rootfs cache hit" >&2; exit 1; }
       [[ "\${rootfs_cache_misses}" == "0" ]] || { echo "repeat pull reported \${rootfs_cache_misses} rootfs cache misses, expected 0" >&2; exit 1; }
     fi
@@ -1051,6 +1133,7 @@ for iteration in \$(seq 1 "\${dest_repeat}"); do
   total_download_bytes=\$((total_download_bytes + downloaded_bytes))
   total_chunk_bytes_fetched=\$((total_chunk_bytes_fetched + chunk_bytes_fetched))
   total_rootfs_bytes_fetched=\$((total_rootfs_bytes_fetched + rootfs_bytes_fetched))
+  total_rootfs_bytes_reused=\$((total_rootfs_bytes_reused + rootfs_bytes_reused))
   total_rootfs_cache_hits=\$((total_rootfs_cache_hits + rootfs_cache_hits))
   total_rootfs_cache_misses=\$((total_rootfs_cache_misses + rootfs_cache_misses))
   local_bundle_bytes="\$(du -sb "\${bundle_dir}" | awk '{print \$1}')"
@@ -1096,7 +1179,7 @@ for iteration in \$(seq 1 "\${dest_repeat}"); do
   if [[ -n "\${iteration_json}" ]]; then
     iteration_json="\${iteration_json},"
   fi
-  iteration_json="\${iteration_json}{\"iteration\":\${iteration},\"requested_child\":\"\${iteration_child_id}\",\"selected_child\":\"\${selected_child}\",\"cache_hit\":\${cache_hit},\"downloaded_bundle_bytes\":\${downloaded_bytes},\"origin_downloaded_bundle_bytes\":\${origin_bytes},\"peer_downloaded_bundle_bytes\":\${peer_bytes},\"chunk_bytes_fetched\":\${chunk_bytes_fetched},\"rootfs_artifact_count\":\${rootfs_artifact_count},\"rootfs_bytes_fetched\":\${rootfs_bytes_fetched},\"rootfs_cache_hits\":\${rootfs_cache_hits},\"rootfs_cache_misses\":\${rootfs_cache_misses},\"local_bundle_bytes\":\${local_bundle_bytes},\"unpacked_bundle_key\":\"\${unpack_bundle_key}\",\"unpacked_chunks\":\${unpacked_chunks},\"corrupt_bundle_rejected\":\${corrupt_rejected},\"corrupt_rootfs_rejected\":\${rootfs_corrupt_rejected}}"
+  iteration_json="\${iteration_json}{\"iteration\":\${iteration},\"requested_child\":\"\${iteration_child_id}\",\"selected_child\":\"\${selected_child}\",\"cache_hit\":\${cache_hit},\"downloaded_bundle_bytes\":\${downloaded_bytes},\"origin_downloaded_bundle_bytes\":\${origin_bytes},\"peer_downloaded_bundle_bytes\":\${peer_bytes},\"chunk_bytes_fetched\":\${chunk_bytes_fetched},\"rootfs_artifact_count\":\${rootfs_artifact_count},\"rootfs_bytes_fetched\":\${rootfs_bytes_fetched},\"rootfs_bytes_reused\":\${rootfs_bytes_reused},\"rootfs_cache_hits\":\${rootfs_cache_hits},\"rootfs_cache_misses\":\${rootfs_cache_misses},\"local_bundle_bytes\":\${local_bundle_bytes},\"unpacked_bundle_key\":\"\${unpack_bundle_key}\",\"unpacked_chunks\":\${unpacked_chunks},\"corrupt_bundle_rejected\":\${corrupt_rejected},\"corrupt_rootfs_rejected\":\${rootfs_corrupt_rejected}}"
 done
 
 cache_enabled=false
@@ -1130,6 +1213,7 @@ cat >"\${workdir}/dest-result.json" <<JSON
   "workload": "\${workload}",
   "writable_rootfs": \${writable_rootfs_json},
   "rootfs_image": "\${rootfs_image}",
+  "rootfs_storage": "\${rootfs_storage}",
   "rootfs_platform": "\${rootfs_platform}",
   "rootfs_mem_mib": \${rootfs_mem_mib},
   "upstream_peer_ip": "\${peer_ip}",
@@ -1140,6 +1224,7 @@ cat >"\${workdir}/dest-result.json" <<JSON
   "peer_downloaded_bundle_bytes": \${total_peer_bytes},
   "chunk_bytes_fetched": \${total_chunk_bytes_fetched},
   "rootfs_bytes_fetched": \${total_rootfs_bytes_fetched},
+  "rootfs_bytes_reused": \${total_rootfs_bytes_reused},
   "rootfs_cache_hits": \${total_rootfs_cache_hits},
   "rootfs_cache_misses": \${total_rootfs_cache_misses},
   "local_bundle_bytes": \${local_bundle_bytes},
@@ -1192,6 +1277,9 @@ send_remote_script() {
   local remote_invocation
   local env_prefix=""
   local ssm_command
+  if ((${#comment} > 100)); then
+    comment="${comment:0:100}"
+  fi
   remote_script_uri="${s3_base}/${script_name}.sh"
   remote_script_path="/tmp/sporevm-${script_name}-${run_id}.sh"
   remote_invocation="$(shell_quote "${remote_script_path}")"
@@ -1354,6 +1442,7 @@ bundle_bytes = int(source["bundle_bytes"])
 unique_chunk_bytes = int(source["unique_chunk_bytes"])
 workload = source.get("workload", "initrd")
 writable_rootfs = bool(source.get("writable_rootfs", False))
+rootfs_storage = source.get("rootfs_storage", "exact")
 rootfs_artifact_count = int(source.get("rootfs_artifact_count", 0))
 rootfs_payload_bytes = int(source.get("rootfs_payload_bytes", 0))
 total_destination_download_bytes = sum(int(d["downloaded_bundle_bytes"]) for d in dests)
@@ -1361,6 +1450,7 @@ total_destination_origin_bytes = sum(int(d.get("origin_downloaded_bundle_bytes",
 total_destination_peer_bytes = sum(int(d.get("peer_downloaded_bundle_bytes", 0)) for d in dests)
 total_chunk_bytes_fetched = sum(int(d.get("chunk_bytes_fetched", 0)) for d in dests)
 total_rootfs_bytes_fetched = sum(int(d.get("rootfs_bytes_fetched", 0)) for d in dests)
+total_rootfs_bytes_reused = sum(int(d.get("rootfs_bytes_reused", 0)) for d in dests)
 total_rootfs_cache_hits = sum(int(d.get("rootfs_cache_hits", 0)) for d in dests)
 total_rootfs_cache_misses = sum(int(d.get("rootfs_cache_misses", 0)) for d in dests)
 total_resume_count = sum(int(d.get("resume_count", 1)) for d in dests)
@@ -1399,8 +1489,10 @@ if workload == "rootfs":
         raise SystemExit("rootfs workload did not publish bundled rootfs bytes")
     if total_rootfs_bytes_fetched <= 0 or total_rootfs_cache_misses <= 0:
         raise SystemExit("rootfs workload did not prove cold destination rootfs fetch")
+    if total_resume_count > len(dests) and total_rootfs_bytes_reused <= 0:
+        raise SystemExit("rootfs workload did not prove warm destination rootfs reuse")
     if total_corrupt_rootfs_rejections <= 0:
-        raise SystemExit("rootfs workload did not reject a corrupt rootfs artifact")
+        raise SystemExit("rootfs workload did not reject a corrupt rootfs payload")
 elif not writable_rootfs and rootfs_artifact_count != 0:
     raise SystemExit("initrd workload unexpectedly published rootfs artifacts")
 
@@ -1415,6 +1507,7 @@ json.dump({
     "source_instance": source["instance_id"],
     "workload": workload,
     "rootfs_image": source.get("rootfs_image", ""),
+    "rootfs_storage": rootfs_storage,
     "rootfs_mem_mib": int(source.get("rootfs_mem_mib", 0)),
     "resolved_rootfs_image": source.get("resolved_rootfs_image", ""),
     "destination_count": len(dests),
@@ -1435,6 +1528,7 @@ json.dump({
     "total_destination_peer_bytes": total_destination_peer_bytes,
     "total_chunk_bytes_fetched": total_chunk_bytes_fetched,
     "total_rootfs_bytes_fetched": total_rootfs_bytes_fetched,
+    "total_rootfs_bytes_reused": total_rootfs_bytes_reused,
     "total_rootfs_cache_hits": total_rootfs_cache_hits,
     "total_rootfs_cache_misses": total_rootfs_cache_misses,
     "source_peer_egress_bytes": source_peer_egress_bytes,

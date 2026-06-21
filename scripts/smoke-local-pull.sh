@@ -154,6 +154,7 @@ for i in $(seq 0 $((count - 1))); do
   [[ "${selected_child}" == "${child_name}" ]] || die "pull selected ${selected_child}, expected ${child_name}"
   chunk_bytes_fetched="$(json_field "${pull_json}" materialization.cache.bytes_fetched)"
   rootfs_bytes_fetched="$(json_field "${pull_json}" rootfs.cache.bytes_fetched)"
+  rootfs_bytes_reused="$(json_field "${pull_json}" rootfs.cache.bytes_reused)"
   rootfs_cache_hits="$(json_field "${pull_json}" rootfs.cache.hit_count)"
   rootfs_cache_misses="$(json_field "${pull_json}" rootfs.cache.miss_count)"
   if [[ "${i}" == "0" ]]; then
@@ -166,6 +167,7 @@ for i in $(seq 0 $((count - 1))); do
     [[ "${cache_hits}" -gt 0 ]] || die "pull ${child_name} did not reuse the local chunk cache"
     [[ "${chunk_bytes_fetched}" == "0" ]] || die "pull ${child_name} fetched ${chunk_bytes_fetched} chunk bytes from the bundle"
     [[ "${rootfs_bytes_fetched}" == "0" ]] || die "pull ${child_name} fetched ${rootfs_bytes_fetched} rootfs bytes"
+    [[ "${rootfs_bytes_reused}" -gt 0 ]] || die "pull ${child_name} did not report reused rootfs bytes"
     [[ "${rootfs_cache_hits}" -gt 0 ]] || die "pull ${child_name} did not report a rootfs cache hit"
     [[ "${rootfs_cache_misses}" == "0" ]] || die "pull ${child_name} reported ${rootfs_cache_misses} rootfs cache misses"
   fi

@@ -251,9 +251,10 @@ an attached rootfs fd.
 - `spore pull s3://BUCKET/PREFIX@sha256:<bundle> --child ID --out DIR`
   downloads only that canonical file set, verifies the bundle digest, reports
   `remote.origin_bytes_read`, `remote.cache_hit`,
-  `materialization.cache.bytes_fetched`, and rootfs cache hit/fetch metrics,
-  then materializes through the same verified local content source as
-  `file://` pull, including disk layer/object checks.
+  `materialization.cache.bytes_fetched`, `materialization.cache.bytes_reused`,
+  and rootfs cache hit/fetch/reuse metrics, then materializes through the same
+  verified local content source as `file://` pull, including disk layer/object
+  checks.
 - `spore pull http://PEER:PORT/spore.bundle@sha256:<bundle> --child ID --out DIR`
   treats a peer as a static byte source, downloads only the canonical bundle
   file set, verifies the bundle digest before materialization, reports
@@ -272,16 +273,17 @@ an attached rootfs fd.
   source-peer HTTP pull support, corrupt-bundle rejection, and ten-instance
   star/tree smoke evidence.
 - `scripts/smoke-remote-bundle.sh --workload rootfs` extends the real-host
-  remote bundle smoke beyond diskless spores: the source builds exact OCI
-  rootfs bytes, packs them into the indexed bundle, destinations pull into a
-  fresh rootfs digest cache, repeated pulls prove rootfs cache reuse, corrupt
-  rootfs artifacts are rejected, and destinations verify materialization through
-  the selected child manifest and cache path.
+  remote bundle smoke beyond diskless spores: the source builds OCI rootfs
+  bytes, packs either exact ext4 storage or `--rootfs-storage chunked` CAS
+  storage into the indexed bundle, destinations pull into a fresh rootfs cache,
+  repeated pulls prove rootfs cache reuse with `rootfs.cache.bytes_reused`,
+  corrupt rootfs payloads are rejected, and destinations verify materialization
+  through the selected child manifest and cache path.
 - `scripts/validate-release-a1-kvm.sh` is the repeatable release-readiness
   wrapper for SSM-managed A1/KVM hosts. It runs a direct-S3 diskless bundle
   check with destination cache reuse, corrupt-bundle rejection, and KVM
-  networking smokes, then runs an HTTP-peer rootfs-backed bundle check with
-  destination cache reuse and corrupt rootfs rejection.
+  networking smokes, then runs chunked-rootfs CAS bundle checks over direct S3
+  and HTTP peer pulls with destination cache reuse and corrupt rootfs rejection.
 - `spore run --image`, `spore resume`, `spore fork`, and `spore fanout` support
   local immutable-rootfs fan-out.
 
@@ -399,11 +401,12 @@ introducing a distributed peer protocol.
 
 Done when pulling child 0 and child 1 from the same remote bundle on one host
 does not re-fetch shared chunkpacks or rootfs artifacts, and metrics expose
-bundle cache hits, chunk bytes fetched, rootfs bytes fetched, and origin bytes.
-The product `pull` JSON now reports those counters directly. Rootfs-backed unit
-and local pull smokes cover rootfs cache reuse; the direct-S3 real-host smoke
-can run `--dest-repeat 2 --cache-dir DIR` to pull different children on one
-destination and assert the second pull reads zero origin and chunk bytes.
+bundle cache hits, chunk bytes fetched/reused, rootfs bytes fetched/reused, and
+origin bytes. The product `pull` JSON now reports those counters directly.
+Rootfs-backed unit and local pull smokes cover rootfs cache reuse; the direct-S3
+real-host smoke can run `--dest-repeat 2 --cache-dir DIR` to pull different
+children on one destination and assert the second pull reads zero origin and
+chunk bytes while reporting reused rootfs bytes.
 
 ### Slice 6: Metadata-Only Prepared Rootfs
 
@@ -467,7 +470,8 @@ Done when local, S3, and HTTP bundle file enumeration includes rootfs storage
 indexes and chunk objects in the canonical bundle file set, bundle digest covers
 those files, and `spore pull file://... --child ID` can materialize a selected
 child into the node-local rootfs CAS cache while rejecting corrupt rootfs chunk
-objects before writing a resumable spore.
+objects before writing a resumable spore. The real-host release wrapper now runs
+chunked-rootfs bundle materialization over both direct S3 and HTTP peer pulls.
 
 ## Deferred Peer Distribution
 
@@ -517,13 +521,16 @@ cannot become restore authority.
   resume selected children, and record peer bytes separately from origin bytes.
 - Rootfs remote smoke: run `scripts/smoke-remote-bundle.sh --workload rootfs`
   against source/destination A1 hosts and confirm the output reports bundled
-  rootfs artifacts, cold destination rootfs bytes fetched, warm destination
-  rootfs cache hits with zero refetch, corrupt rootfs rejection, and selected
-  child materialization into the rootfs digest cache.
+  rootfs payloads, cold destination rootfs bytes fetched, warm destination
+  `rootfs.cache.bytes_reused` with zero refetch, corrupt rootfs rejection, and
+  selected child materialization into the exact digest cache or chunked rootfs
+  CAS cache. Add `--rootfs-storage chunked` to exercise manifest-attached
+  rootfs CAS storage.
 - Release wrapper: run `mise run validate:release-a1-kvm -- ...` or
   `scripts/validate-release-a1-kvm.sh -- ...` with SSM instance ids, bucket, and
-  source peer IP to execute the direct-S3, HTTP-peer, cache-reuse,
-  corrupt-rejection, rootfs, and KVM networking checks as one repeatable gate.
+  source peer IP to execute the direct-S3 diskless gate plus direct-S3 and
+  HTTP-peer chunked-rootfs CAS cache-reuse/corrupt-rejection gates as one
+  repeatable release check.
 - Negative remote smoke: corrupt a bundle index, chunkpack segment, child
   manifest, and rootfs artifact, and confirm every path fails before VM boot.
 
