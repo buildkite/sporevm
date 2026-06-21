@@ -164,8 +164,9 @@ materialization boundary. Use
 `SPOREVM_ROOTFS_CACHE_DIR` to choose the destination rootfs digest cache and
 `SPOREVM_BUNDLE_CACHE_DIR` to choose the node-local bundle and memory chunk
 caches used by pull. Pull JSON reports `rootfs.cache.hit_count`,
-`rootfs.cache.miss_count`, and `rootfs.cache.bytes_fetched` so repeated pulls
-can prove a warm digest cache is not refetching or reinstalling rootfs bytes.
+`rootfs.cache.miss_count`, `rootfs.cache.bytes_fetched`, and
+`rootfs.cache.bytes_reused` so repeated pulls can prove a warm digest or CAS
+cache is not refetching or reinstalling rootfs bytes.
 
 Plain `spore run --rootfs PATH` remains a local run escape hatch. Combining
 `--rootfs PATH` with `--capture` is rejected until an import/preload

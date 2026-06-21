@@ -75,10 +75,10 @@ spore run --from pulled/N -- /usr/local/bin/node -v
 ```
 
 Per-child `tti_ms` includes pull plus resume/exec. Rows also include pull metrics
-from `spore pull`, such as chunk bytes fetched, rootfs bytes fetched, and cache
-hits. The smoke, comparison, and full profiles run this sequentially by default;
-pass `--include-distribution-concurrency` to run selected staggered/burst modes
-too.
+from `spore pull`, such as chunk/rootfs bytes fetched, chunk/rootfs bytes reused,
+and cache hits. The smoke, comparison, and full profiles run this sequentially
+by default; pass `--include-distribution-concurrency` to run selected
+staggered/burst modes too.
 
 ### Writable Rootfs
 

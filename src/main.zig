@@ -806,8 +806,8 @@ fn writePullResult(writer: *Io.Writer, result: sporevm.bundle.PullResult) !void 
     try writer.print("  Bundle digest: {s}:{s}\n", .{ result.bundle_digest.algorithm, result.bundle_digest.hex });
     try writer.print("  Chunks: {d} materialized of {d}\n", .{ result.materialization.materialized_chunk_count, result.materialization.chunk_count });
     try writer.print("  Payload bytes: {d}\n", .{result.materialization.payload_bytes});
-    try writer.print("  Chunk cache: {d} hits, {d} misses\n", .{ result.materialization.cache.hit_count, result.materialization.cache.miss_count });
-    try writer.print("  Rootfs cache: {d} hits, {d} misses\n", .{ result.rootfs.cache.hit_count, result.rootfs.cache.miss_count });
+    try writer.print("  Chunk cache: {d} hits, {d} misses, {d} fetched bytes, {d} reused bytes\n", .{ result.materialization.cache.hit_count, result.materialization.cache.miss_count, result.materialization.cache.bytes_fetched, result.materialization.cache.bytes_reused });
+    try writer.print("  Rootfs cache: {d} hits, {d} misses, {d} fetched bytes, {d} reused bytes\n", .{ result.rootfs.cache.hit_count, result.rootfs.cache.miss_count, result.rootfs.cache.bytes_fetched, result.rootfs.cache.bytes_reused });
     if (result.children.selected_child) |child| try writer.print("  Selected child: {s}\n", .{child});
 }
 

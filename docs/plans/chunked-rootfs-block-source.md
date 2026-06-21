@@ -263,8 +263,8 @@ can drift from the canonical index bytes.
   cas-preload` writes a manifest-bound rootfs block index and can attach
   `rootfs.storage` to an existing spore, while product resume constructs the
   local `CasBlockSource` from `rootfs.storage` without the old experiment flag.
-  This remains node-local: missing or corrupt local index/chunk objects fail
-  closed, and S3/peer distribution of rootfs chunks remains a follow-up slice.
+  This slice remained node-local: missing or corrupt local index/chunk objects
+  failed closed, and S3/peer distribution of rootfs chunks was left for Slice 6.
 - The Slice 5 manifest-attached benchmark gate is complete on local HVF with
   `scripts/benchmark-manifest-rootfs-cas.py` / `mise run benchmark:manifest-rootfs-cas`
   (`20260621T085323Z-0865bb26`) using
@@ -290,7 +290,15 @@ can drift from the canonical index bytes.
   `mise run check` and `mise run smoke:local-pull` passed on 2026-06-21; the
   unit regression proves local pull materializes chunked rootfs CAS without
   installing the monolithic ext4 digest artifact, and rejects a corrupted
-  bundled rootfs chunk.
+  bundled rootfs chunk. The remote smoke harness supports
+  `--rootfs-storage chunked`, reports warm rootfs CAS reuse through
+  `rootfs.cache.bytes_reused`, and the A1 release wrapper now runs chunked
+  rootfs materialization over both direct S3 and HTTP peer pull. Remote A1
+  smokes `rootfs-cas-direct-s3-20260621T1105` and
+  `rootfs-cas-http-20260621T1116` proved the chunked path over direct S3 and
+  HTTP peer pulls: cold pulls installed 9,535,761 rootfs CAS bytes, warm pulls
+  reported the same bytes reused with zero refetch, and corrupt rootfs payloads
+  failed before materialization.
 
 ## Delivery Strategy
 
@@ -458,16 +466,18 @@ moving the same cost into synchronous boot reads. Report:
 
 ### Slice 6: Distribution Convergence
 
-Status: implemented for complete bundle materialization.
+Status: implemented for complete bundle materialization and remote smoke gates.
 
 Extend bundle and pull materialization so chunked rootfs objects use the same
 verified content-source machinery as RAM chunks and writable disk objects.
 
 Done when a digest-pinned pull can materialize a selected child with chunked
 rootfs base data, sealed writable disk layers, and RAM chunks from one verified
-bundle/cache story. This slice also updates `docs/plans/distribution.md` so the
-distribution contract distinguishes exact-byte rootfs artifacts from chunked
-rootfs storage descriptors and keeps both manifest-authoritative.
+bundle/cache story, and the remote A1 gate proves the chunked rootfs payload can
+materialize through both direct S3 and HTTP peer pulls. This slice also updates
+`docs/plans/distribution.md` so the distribution contract distinguishes
+exact-byte rootfs artifacts from chunked rootfs storage descriptors and keeps
+both manifest-authoritative.
 
 ## Verification
 
@@ -493,6 +503,11 @@ rootfs storage descriptors and keeps both manifest-authoritative.
   artifact is absent, open the restored rootfs through `CasBlockSource`, and
   corrupt a bundled rootfs chunk to prove pull fails closed before writing the
   destination spore.
+- Remote distribution regression: run
+  `scripts/smoke-remote-bundle.sh --workload rootfs --rootfs-storage chunked`
+  over direct S3 and HTTP peer transports, confirm cold rootfs bytes are fetched,
+  repeated pulls report `rootfs.cache.bytes_reused`, and corrupt rootfs payloads
+  fail before materialization.
 
 ## Resolved Decisions
 

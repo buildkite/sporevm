@@ -127,8 +127,9 @@ pinned, redirects and mutable URL components are rejected, and corrupt peer
 bytes fail before the local cache is marked complete. Pull results report cache
 accounting for the materialization path: `remote.origin_bytes_read` for
 object-store sources, `remote.peer_bytes_read` for HTTP(S) peer sources,
-`remote.cache_hit`, `materialization.cache.bytes_fetched`, and rootfs
-cache hit/fetch counters under `rootfs.cache`.
+`remote.cache_hit`, `materialization.cache.bytes_fetched`,
+`materialization.cache.bytes_reused`, and rootfs cache hit/fetch/reuse counters
+under `rootfs.cache`.
 
 ## Manifest v0
 

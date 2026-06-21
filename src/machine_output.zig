@@ -22,6 +22,7 @@ pub const CacheState = struct {
     hit_count: usize = 0,
     miss_count: usize = 0,
     bytes_fetched: u64 = 0,
+    bytes_reused: u64 = 0,
 };
 
 pub const ChunkMaterializationSummary = struct {

@@ -18,8 +18,10 @@ HEAD plus the current tracked/staged diff.
 Checks:
   1. Direct S3 diskless remote bundle pull with destination cache reuse,
      corrupt bundle rejection, and source-host KVM networking smokes.
-  2. HTTP peer rootfs-backed remote bundle pull with destination cache reuse,
-     rootfs artifact materialization/cache reuse, and corrupt rootfs rejection.
+  2. Direct S3 chunked-rootfs remote bundle pull with destination rootfs CAS
+     materialization/cache reuse and corrupt rootfs rejection.
+  3. HTTP peer chunked-rootfs remote bundle pull with destination rootfs CAS
+     materialization/cache reuse and corrupt rootfs rejection.
 
 Environment defaults:
   SPOREVM_REMOTE_REGION
@@ -248,7 +250,7 @@ if [[ -z "${cache_dir}" ]]; then
   cache_dir="/tmp/sporevm-release-a1-kvm-${run_id}"
 fi
 
-common_args=(
+base_args=(
   --region "${region}"
   --source-instance "${source_instance}"
   --bucket "${bucket}"
@@ -260,12 +262,22 @@ common_args=(
   --source-peer-port "${source_peer_port}"
   --ssm-timeout-seconds "${ssm_timeout_seconds}"
 )
+
+all_dest_args=()
+peer_dest_args=()
 for dest_instance in "${dest_instances[@]}"; do
-  common_args+=(--dest-instance "${dest_instance}")
+  all_dest_args+=(--dest-instance "${dest_instance}")
+  if [[ "${dest_instance}" != "${source_instance}" ]]; then
+    peer_dest_args+=(--dest-instance "${dest_instance}")
+  fi
 done
 if ((keep_remote)); then
-  common_args+=(--keep-remote)
+  base_args+=(--keep-remote)
 fi
+((${#peer_dest_args[@]} > 0)) || die "HTTP peer check requires at least one destination that is not the source instance"
+
+common_args=("${base_args[@]}" "${all_dest_args[@]}")
+http_peer_args=("${base_args[@]}" "${peer_dest_args[@]}")
 
 network_args=()
 if ((skip_network_smokes == 0)); then
@@ -286,15 +298,26 @@ run_check "direct S3 diskless bundle, cache reuse, corrupt rejection, KVM networ
   --run-id "${run_id}-direct-s3-initrd" \
   "${network_args[@]}"
 
-run_check "HTTP peer rootfs bundle, cache reuse, corrupt rootfs rejection" \
+run_check "direct S3 chunked rootfs bundle, CAS reuse, corrupt rootfs rejection" \
   "${common_args[@]}" \
   --workload rootfs \
+  --rootfs-storage chunked \
+  --rootfs-image "${rootfs_image}" \
+  --rootfs-platform "${rootfs_platform}" \
+  --rootfs-mem-mib "${rootfs_mem_mib}" \
+  --cache-dir "${cache_dir}/direct-s3-rootfs-cas" \
+  --run-id "${run_id}-direct-s3-rootfs-cas"
+
+run_check "HTTP peer chunked rootfs bundle, CAS reuse, corrupt rootfs rejection" \
+  "${http_peer_args[@]}" \
+  --workload rootfs \
+  --rootfs-storage chunked \
   --rootfs-image "${rootfs_image}" \
   --rootfs-platform "${rootfs_platform}" \
   --rootfs-mem-mib "${rootfs_mem_mib}" \
   --source-peer-ip "${source_peer_ip}" \
-  --cache-dir "${cache_dir}/http-rootfs" \
-  --run-id "${run_id}-http-rootfs"
+  --cache-dir "${cache_dir}/http-rootfs-cas" \
+  --run-id "${run_id}-http-rootfs-cas"
 
 printf '\nrelease A1/KVM validation ok: run_id=%s prefix=s3://%s/%s cache_dir=%s\n' \
   "${run_id}" "${bucket}" "${prefix}" "${cache_dir}"
