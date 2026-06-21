@@ -659,12 +659,12 @@ PY
   grep -Fq '"digest": "blake3:' "\${workdir}/spore/manifest.json" || { echo "rootfs synthetic manifest did not record digest" >&2; exit 1; }
 fi
 
-zig-out/bin/spore fork "\${workdir}/spore" --count "\${child_count}" --out "\${workdir}/spore.children" | tee "\${workdir}/fork-result.json"
+zig-out/bin/spore --json fork "\${workdir}/spore" --count "\${child_count}" --out "\${workdir}/spore.children" | tee "\${workdir}/fork-result.json"
 if [[ "\${workload}" == "rootfs" ]]; then
   SPOREVM_ROOTFS_CACHE_DIR="\${rootfs_cache}" \
-    zig-out/bin/spore pack "\${workdir}/spore" --children "\${workdir}/spore.children" --out "\${workdir}/spore.bundle" | tee "\${workdir}/pack-result.json"
+    zig-out/bin/spore --json pack "\${workdir}/spore" --children "\${workdir}/spore.children" --out "\${workdir}/spore.bundle" | tee "\${workdir}/pack-result.json"
 else
-  zig-out/bin/spore pack "\${workdir}/spore" --children "\${workdir}/spore.children" --out "\${workdir}/spore.bundle" | tee "\${workdir}/pack-result.json"
+  zig-out/bin/spore --json pack "\${workdir}/spore" --children "\${workdir}/spore.children" --out "\${workdir}/spore.bundle" | tee "\${workdir}/pack-result.json"
 fi
 
 bundle_bytes="\$(du -sb "\${workdir}/spore.bundle" | awk '{print \$1}')"
@@ -716,7 +716,7 @@ PY
     exit 1
   fi
 fi
-zig-out/bin/spore push "\${workdir}/spore.bundle" "s3://\${bucket}/\${run_prefix}/spore.bundle/" --region "\${region}" | tee "\${workdir}/push-result.json"
+zig-out/bin/spore --json push "\${workdir}/spore.bundle" "s3://\${bucket}/\${run_prefix}/spore.bundle/" --region "\${region}" | tee "\${workdir}/push-result.json"
 printf '%s\n' "\${bundle_key}" >"\${workdir}/bundle-key.txt"
 aws s3 cp "\${workdir}/bundle-key.txt" "s3://\${bucket}/\${run_prefix}/bundle-key.txt" --region "\${region}" --only-show-errors
 cat >"\${workdir}/source-result.json" <<JSON
@@ -816,7 +816,10 @@ mise exec -- zig build
 mise exec -- zig build kvm-boot
 
 json_field() {
-  python3 -c 'import json, sys; value=json.load(open(sys.argv[1], encoding="utf-8"))[sys.argv[2]]; print(str(value).lower() if isinstance(value, bool) else value)' "\$1" "\$2"
+  python3 -c 'import json, sys; value=json.load(open(sys.argv[1], encoding="utf-8"));
+for part in sys.argv[2].split("."):
+    value = value[part]
+print(str(value).lower() if isinstance(value, bool) else value)' "\$1" "\$2"
 }
 
 assert_corrupt_bundle_rejected() {
@@ -994,24 +997,24 @@ for iteration in \$(seq 1 "\${dest_repeat}"); do
     pull_source="s3://\${bucket}/\${run_prefix}/spore.bundle@sha256:\${bundle_key}"
     SPOREVM_BUNDLE_CACHE_DIR="\${pull_bundle_cache}" \
       SPOREVM_ROOTFS_CACHE_DIR="\${pull_rootfs_cache}" \
-      zig-out/bin/spore pull "\${pull_source}" --child "\${iteration_child_id}" --out "\${unpacked_dir}" --region "\${region}" | tee "\${unpack_result}"
+      zig-out/bin/spore --json pull "\${pull_source}" --child "\${iteration_child_id}" --out "\${unpacked_dir}" --region "\${region}" | tee "\${unpack_result}"
     bundle_dir="\${pull_bundle_cache}/remote/s3/sha256/\${bundle_key}/bundle"
   else
     pull_source="http://\${peer_ip}:\${source_peer_port}/spore.bundle@sha256:\${bundle_key}"
     SPOREVM_BUNDLE_CACHE_DIR="\${pull_bundle_cache}" \
       SPOREVM_ROOTFS_CACHE_DIR="\${pull_rootfs_cache}" \
-      zig-out/bin/spore pull "\${pull_source}" --child "\${iteration_child_id}" --out "\${unpacked_dir}" | tee "\${unpack_result}"
+      zig-out/bin/spore --json pull "\${pull_source}" --child "\${iteration_child_id}" --out "\${unpacked_dir}" | tee "\${unpack_result}"
     bundle_dir="\${pull_bundle_cache}/remote/http/sha256/\${bundle_key}/bundle"
   fi
-  cache_hit="\$(json_field "\${unpack_result}" remote_bundle_cache_hit)"
-  origin_bytes="\$(json_field "\${unpack_result}" origin_bytes_read)"
-  peer_bytes="\$(json_field "\${unpack_result}" peer_bytes_read)"
-  selected_child="\$(json_field "\${unpack_result}" selected_child)"
-  chunk_bytes_fetched="\$(json_field "\${unpack_result}" chunk_bytes_fetched)"
-  rootfs_artifact_count="\$(json_field "\${unpack_result}" rootfs_artifact_count)"
-  rootfs_bytes_fetched="\$(json_field "\${unpack_result}" rootfs_bytes_fetched)"
-  rootfs_cache_hits="\$(json_field "\${unpack_result}" rootfs_cache_hit_count)"
-  rootfs_cache_misses="\$(json_field "\${unpack_result}" rootfs_cache_miss_count)"
+  cache_hit="\$(json_field "\${unpack_result}" remote.cache_hit)"
+  origin_bytes="\$(json_field "\${unpack_result}" remote.origin_bytes_read)"
+  peer_bytes="\$(json_field "\${unpack_result}" remote.peer_bytes_read)"
+  selected_child="\$(json_field "\${unpack_result}" children.selected_child)"
+  chunk_bytes_fetched="\$(json_field "\${unpack_result}" materialization.cache.bytes_fetched)"
+  rootfs_artifact_count="\$(json_field "\${unpack_result}" rootfs.artifact_count)"
+  rootfs_bytes_fetched="\$(json_field "\${unpack_result}" rootfs.cache.bytes_fetched)"
+  rootfs_cache_hits="\$(json_field "\${unpack_result}" rootfs.cache.hit_count)"
+  rootfs_cache_misses="\$(json_field "\${unpack_result}" rootfs.cache.miss_count)"
   if [[ "\${workload}" == "rootfs" ]]; then
     [[ "\${rootfs_artifact_count}" -gt 0 ]] || { echo "rootfs pull did not report a rootfs artifact" >&2; exit 1; }
     if [[ "\${iteration}" == "1" ]]; then
@@ -1066,7 +1069,7 @@ for iteration in \$(seq 1 "\${dest_repeat}"); do
       rootfs_corrupt_rejected=true
     fi
   fi
-  unpack_bundle_key="\$(json_field "\${unpack_result}" bundle_digest)"
+  unpack_bundle_key="\$(json_field "\${unpack_result}" bundle_digest.hex)"
   if [[ "\${unpack_bundle_key}" != "\${bundle_key}" ]]; then
     echo "unpacked bundle digest mismatch: expected \${bundle_key}, got \${unpack_bundle_key}" >&2
     exit 1

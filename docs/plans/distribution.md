@@ -236,14 +236,15 @@ an attached rootfs fd.
   referenced disk layer/object files.
 - `spore pull s3://BUCKET/PREFIX@sha256:<bundle> --child ID --out DIR`
   downloads only that canonical file set, verifies the bundle digest, reports
-  `origin_bytes_read`, `remote_bundle_cache_hit`, `chunk_bytes_fetched`, and
-  rootfs cache hit/fetch metrics, then materializes through the same verified
-  local content source as `file://` pull, including disk layer/object checks.
+  `remote.origin_bytes_read`, `remote.cache_hit`,
+  `materialization.cache.bytes_fetched`, and rootfs cache hit/fetch metrics,
+  then materializes through the same verified local content source as
+  `file://` pull, including disk layer/object checks.
 - `spore pull http://PEER:PORT/spore.bundle@sha256:<bundle> --child ID --out DIR`
   treats a peer as a static byte source, downloads only the canonical bundle
   file set, verifies the bundle digest before materialization, reports
-  `peer_bytes_read`, and reuses the node-local remote bundle cache on repeated
-  pulls.
+  `remote.peer_bytes_read`, and reuses the node-local remote bundle cache on
+  repeated pulls.
 - `spore pack --children DIR --rootfs=metadata-only` can emit an indexed bundle
   with rootfs metadata but no rootfs bytes after verifying the source rootfs
   cache; `spore unpack` and `spore pull` accept it only with
@@ -430,9 +431,9 @@ spore pull http://10.0.0.12:20000/spore.bundle@sha256:<bundle> \
 Done when HTTP(S) pull sources require `@sha256:<bundle>`, reject mutable or
 path-ambiguous URLs, download only canonical files named by validated bundle
 metadata, verify the canonical bundle digest before writing `.complete`, report
-`peer_bytes_read`, hit the `remote/http/sha256/<bundle>` cache on repeated
-pulls, and fail closed on corrupt peer bytes. The remote bundle smoke now serves
-static bundle directories from source and relay hosts and uses product
+`remote.peer_bytes_read`, hit the `remote/http/sha256/<bundle>` cache on
+repeated pulls, and fail closed on corrupt peer bytes. The remote bundle smoke
+now serves static bundle directories from source and relay hosts and uses product
 `spore pull http://...@sha256:<bundle>` for peer star/tree paths.
 
 ## Deferred Peer Distribution

@@ -27,7 +27,10 @@ json_field() {
 import json
 import sys
 with open(sys.argv[1], "r", encoding="utf-8") as f:
-    print(json.load(f)[sys.argv[2]])
+    value = json.load(f)
+for part in sys.argv[2].split("."):
+    value = value[part]
+print(str(value).lower() if isinstance(value, bool) else value)
 PY
 }
 
@@ -139,27 +142,27 @@ fi
 grep -Fq '"rootfs"' "${capture_dir}/manifest.json" || die "capture manifest did not record rootfs metadata"
 
 "${spore_bin}" fork "${capture_dir}" --count "${count}" --out "${fork_dir}" >"${workdir}/fork.stdout" 2>"${workdir}/fork.stderr"
-SPOREVM_ROOTFS_CACHE_DIR="${pack_rootfs_cache}" "${spore_bin}" pack "${capture_dir}" --children "${fork_dir}" --out "${bundle_dir}" >"${workdir}/pack.json"
+SPOREVM_ROOTFS_CACHE_DIR="${pack_rootfs_cache}" "${spore_bin}" --json pack "${capture_dir}" --children "${fork_dir}" --out "${bundle_dir}" >"${workdir}/pack.json"
 
 for i in $(seq 0 $((count - 1))); do
   child_name="$(printf '%06d' "${i}")"
   pull_json="${workdir}/pull-${child_name}.json"
   SPOREVM_ROOTFS_CACHE_DIR="${pull_rootfs_cache}" \
     SPOREVM_BUNDLE_CACHE_DIR="${bundle_cache}" \
-    "${spore_bin}" pull "file://${bundle_dir}" --child "${i}" --out "${pulled_dir}/${child_name}" >"${pull_json}"
-  selected_child="$(json_field "${pull_json}" selected_child)"
+    "${spore_bin}" --json pull "file://${bundle_dir}" --child "${i}" --out "${pulled_dir}/${child_name}" >"${pull_json}"
+  selected_child="$(json_field "${pull_json}" children.selected_child)"
   [[ "${selected_child}" == "${child_name}" ]] || die "pull selected ${selected_child}, expected ${child_name}"
-  chunk_bytes_fetched="$(json_field "${pull_json}" chunk_bytes_fetched)"
-  rootfs_bytes_fetched="$(json_field "${pull_json}" rootfs_bytes_fetched)"
-  rootfs_cache_hits="$(json_field "${pull_json}" rootfs_cache_hit_count)"
-  rootfs_cache_misses="$(json_field "${pull_json}" rootfs_cache_miss_count)"
+  chunk_bytes_fetched="$(json_field "${pull_json}" materialization.cache.bytes_fetched)"
+  rootfs_bytes_fetched="$(json_field "${pull_json}" rootfs.cache.bytes_fetched)"
+  rootfs_cache_hits="$(json_field "${pull_json}" rootfs.cache.hit_count)"
+  rootfs_cache_misses="$(json_field "${pull_json}" rootfs.cache.miss_count)"
   if [[ "${i}" == "0" ]]; then
     [[ "${chunk_bytes_fetched}" -gt 0 ]] || die "first pull did not fetch chunk bytes"
     [[ "${rootfs_bytes_fetched}" -gt 0 ]] || die "first pull did not populate the rootfs cache"
     [[ "${rootfs_cache_misses}" -gt 0 ]] || die "first pull did not report a rootfs cache miss"
   fi
   if [[ "${i}" -gt 0 ]]; then
-    cache_hits="$(json_field "${pull_json}" cache_hit_count)"
+    cache_hits="$(json_field "${pull_json}" materialization.cache.hit_count)"
     [[ "${cache_hits}" -gt 0 ]] || die "pull ${child_name} did not reuse the local chunk cache"
     [[ "${chunk_bytes_fetched}" == "0" ]] || die "pull ${child_name} fetched ${chunk_bytes_fetched} chunk bytes from the bundle"
     [[ "${rootfs_bytes_fetched}" == "0" ]] || die "pull ${child_name} fetched ${rootfs_bytes_fetched} rootfs bytes"

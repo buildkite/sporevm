@@ -85,7 +85,7 @@ Inspect local rootfs cache usage with:
 
 ```bash
 spore system df --rootfs
-spore system df --rootfs --json
+spore --json system df --rootfs
 ```
 
 Prune rebuildable or reimportable image-rootfs cache entries with a dry run
@@ -96,11 +96,12 @@ spore system prune --dry-run
 spore system prune --force
 spore system prune --rootfs --dry-run --max-bytes 20gb
 spore system prune --rootfs --force --max-bytes 20gb
-spore system prune --dry-run --json
+spore --json system prune --dry-run
 ```
 
-These commands render human summaries by default. Add `--json` when scripts need
-stable field names and exact byte counts. Without `--older-than` or
+These commands render human summaries by default. Put global `--json` before the
+command when scripts need stable field names and exact byte counts. Without
+`--older-than` or
 `--max-bytes`, prune selects all default-prunable rootfs entries: rebuildable or
 reimportable image-rootfs files that are not hardlinked to digest-addressed
 artifacts.
@@ -145,9 +146,9 @@ s3://bucket/prefix@sha256:<bundle_digest> --child 42 --out child.spore` and
 bundled rootfs bytes through the same digest-cache path. Use
 `SPOREVM_ROOTFS_CACHE_DIR` to choose the destination rootfs digest cache and
 `SPOREVM_BUNDLE_CACHE_DIR` to choose the node-local bundle and memory chunk
-caches used by pull. Pull JSON reports `rootfs_cache_hit_count`,
-`rootfs_cache_miss_count`, and `rootfs_bytes_fetched` so repeated pulls can
-prove a warm digest cache is not refetching or reinstalling rootfs bytes.
+caches used by pull. Pull JSON reports `rootfs.cache.hit_count`,
+`rootfs.cache.miss_count`, and `rootfs.cache.bytes_fetched` so repeated pulls
+can prove a warm digest cache is not refetching or reinstalling rootfs bytes.
 
 Plain `spore run --rootfs PATH` remains a local run escape hatch. Combining
 `--rootfs PATH` with `--capture` is rejected until an import/preload

@@ -159,7 +159,7 @@ Large logical RAM is cheap only if every hot path is sparse:
 
 ### `spore ls`
 
-Default `spore ls` should become a human table. `spore ls --json` should remain
+Default `spore ls` should become a human table. `spore --json ls` should remain
 the stable machine-readable API.
 
 ```console
@@ -266,7 +266,7 @@ Done when:
 ### Slice 3: `spore ls` Human and JSON Memory Stats
 
 Extend monitor/runtime metadata with cheap memory accounting and teach
-`spore ls` to render a table by default plus full JSON under `--json`.
+`spore ls` to render a table by default plus full JSON under global `--json`.
 
 Done when:
 
@@ -365,7 +365,7 @@ Done when:
 - Unit suffixes are accepted on product commands, and `gb`/`mb` use binary VM
   units.
 - Runtime specs store both the user policy and byte-sized resolved memory.
-- `spore ls --json` is the stable machine-readable output. The default output
+- `spore --json ls` is the stable machine-readable output. The default output
   can become a human table.
 
 ## Deferred Work

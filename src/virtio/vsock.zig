@@ -80,6 +80,12 @@ pub const HostStreamOutput = enum {
 
 pub const HostStreamOutputSink = *const fn (context: ?*anyopaque, output: HostStreamOutput, bytes: []const u8) void;
 
+pub const HostStreamLifecycle = enum {
+    ready,
+};
+
+pub const HostStreamLifecycleSink = *const fn (context: ?*anyopaque, event: HostStreamLifecycle) void;
+
 pub const HostStream = struct {
     guest_port: u32,
     host_port: u32 = default_host_port,
@@ -106,6 +112,8 @@ pub const HostStream = struct {
     stderr_offset: u64 = 0,
     output_sink: ?HostStreamOutputSink = null,
     output_sink_context: ?*anyopaque = null,
+    lifecycle_sink: ?HostStreamLifecycleSink = null,
+    lifecycle_sink_context: ?*anyopaque = null,
 
     pub fn init(guest_port: u32, request: []const u8) !HostStream {
         if (request.len > max_payload) return error.RequestTooLarge;
@@ -143,6 +151,11 @@ pub const HostStream = struct {
         self.output_sink = sink;
     }
 
+    pub fn setLifecycleSink(self: *HostStream, context: ?*anyopaque, sink: HostStreamLifecycleSink) void {
+        self.lifecycle_sink_context = context;
+        self.lifecycle_sink = sink;
+    }
+
     pub fn elapsedMs(self: *const HostStream) u64 {
         const now = monotonicMs();
         if (now < self.started_at_ms) return 0;
@@ -152,6 +165,7 @@ pub const HostStream = struct {
     fn markConnected(self: *HostStream) void {
         if (self.connect_ms == null) self.connect_ms = self.elapsedMs();
         self.state = .connected;
+        if (self.lifecycle_sink) |sink| sink(self.lifecycle_sink_context, .ready);
     }
 
     fn appendOutput(self: *HostStream, data: []const u8) void {
@@ -696,6 +710,7 @@ const StreamCapture = struct {
     stderr: [64]u8 = [_]u8{0} ** 64,
     stdout_len: usize = 0,
     stderr_len: usize = 0,
+    ready_count: usize = 0,
 };
 
 fn captureSink(context: ?*anyopaque, output: HostStreamOutput, bytes: []const u8) void {
@@ -715,6 +730,13 @@ fn captureSink(context: ?*anyopaque, output: HostStreamOutput, bytes: []const u8
                 capture.stderr_len += n;
             }
         },
+    }
+}
+
+fn lifecycleSink(context: ?*anyopaque, event: HostStreamLifecycle) void {
+    const capture: *StreamCapture = @ptrCast(@alignCast(context.?));
+    switch (event) {
+        .ready => capture.ready_count += 1,
     }
 }
 
@@ -746,6 +768,7 @@ test "host stream connects, sends request, and parses streamed frames" {
     var stream = try HostStream.init(10700, request);
     var capture = StreamCapture{};
     stream.setOutputSink(&capture, captureSink);
+    stream.setLifecycleSink(&capture, lifecycleSink);
     try dev.attachHostStream(&stream);
 
     try setDesc(ram, rx_desc, 0, rx_buf_request, header_len, 2); // VIRTQ_DESC_F_WRITE
@@ -803,6 +826,7 @@ test "host stream connects, sends request, and parses streamed frames" {
     try pushAvail(ram, tx_avail, 8, 1);
     try std.testing.expect(t.write(0x050, tx_queue, ram));
     try std.testing.expectEqual(HostStreamState.connected, stream.state);
+    try std.testing.expectEqual(@as(usize, 1), capture.ready_count);
     try std.testing.expectEqual(@as(u16, 3), try ram.read(u16, rx_used + 2));
 
     const delivered = parseHeader(buf[rx_buf_payload..][0..header_len]);

@@ -7,6 +7,7 @@
 
 const builtin = @import("builtin");
 
+pub const api = @import("api.zig");
 pub const board = @import("board.zig");
 pub const block_source = @import("block_source.zig");
 pub const boot = @import("boot.zig");
@@ -27,6 +28,7 @@ pub const guestmem = @import("guestmem.zig");
 pub const lifecycle = @import("lifecycle.zig");
 pub const local_paths = @import("local_paths.zig");
 pub const memory = @import("memory.zig");
+pub const machine_output = @import("machine_output.zig");
 pub const monitor = @import("monitor.zig");
 pub const net_gateway = @import("net_gateway.zig");
 pub const platform = @import("platform.zig");
@@ -64,6 +66,7 @@ test {
     // Ensure all referenced modules' tests are discovered.
     const testing = @import("std").testing;
     testing.refAllDecls(@This());
+    testing.refAllDecls(api);
     testing.refAllDecls(block_source);
     testing.refAllDecls(bundle);
     testing.refAllDecls(capture);
@@ -76,6 +79,7 @@ test {
     testing.refAllDecls(lifecycle);
     testing.refAllDecls(local_paths);
     testing.refAllDecls(memory);
+    testing.refAllDecls(machine_output);
     testing.refAllDecls(monitor);
     testing.refAllDecls(net_gateway);
     testing.refAllDecls(platform);

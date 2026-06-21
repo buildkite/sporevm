@@ -6,6 +6,7 @@
 const std = @import("std");
 const Io = std.Io;
 const sporevm = @import("sporevm");
+const machine_output = sporevm.machine_output;
 
 pub const std_options: std.Options = .{
     .log_level = .debug,
@@ -15,10 +16,11 @@ pub const std_options: std.Options = .{
 var runtime_log_level: std.log.Level = .warn;
 
 const usage =
-    \\Usage: spore [--debug] <command>
+    \\Usage: spore [--debug] [--json] <command>
     \\
     \\Global options:
     \\  --debug             Show verbose VMM and restore logs
+    \\  --json              Emit one JSON result for supported single-result commands
     \\
     \\Commands:
     \\  system             Inspect and prune local SporeVM system state
@@ -36,8 +38,8 @@ const usage =
     \\                      Checkpoint a diskless named VM into a spore
     \\  ls                  List named VMs in the local runtime registry
     \\  version             Print the sporevm version
-    \\  host-info           Print this host's platform facts as JSON
-    \\  inspect <spore-dir> Print a spore manifest summary as JSON
+    \\  host-info           Print this host's platform facts
+    \\  inspect <spore-dir> Print a spore manifest summary
     \\  fork <spore-dir> --count N --out DIR
     \\                      Mint child spores that share parent chunks
     \\  fanout <children-dir> [--for DURATION]
@@ -48,6 +50,8 @@ const usage =
     \\                      Unpack a local spore bundle into a spore dir
     \\  push <bundle-dir> s3://BUCKET/PREFIX [--region REGION]
     \\                      Push an indexed bundle to an object store
+    \\  inspect-bundle <bundle-ref> [--child ID|--child-range START..END]
+    \\                      Inspect bundle metadata without materializing it
     \\  pull file://BUNDLE|s3://BUNDLE@sha256:DIGEST|http(s)://BUNDLE@sha256:DIGEST [--child ID] [--allow-metadata-only-rootfs] --out DIR [--region REGION]
     \\                      Pull one child into a spore dir
     \\  help                Show this help
@@ -61,11 +65,23 @@ pub fn main(init: std.process.Init) !void {
     var stdout_buffer: [1024]u8 = undefined;
     var stdout_file_writer: Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
     const stdout = &stdout_file_writer.interface;
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr_file_writer: Io.File.Writer = .init(.stderr(), init.io, &stderr_buffer);
+    const stderr = &stderr_file_writer.interface;
 
     const parsed = parseGlobalArgs(args);
     if (parsed.debug) runtime_log_level = .debug;
 
+    if (parsed.parse_error) |parse_error| {
+        const message = allocMessage(arena, "unknown global option: {s}", .{parse_error.arg});
+        exitWithCliError(arena, stderr, parsed.mode, machine_output.usageInvalidArgument(message, "GlobalArgs"), messageWithUsage(arena, message));
+    }
+
     if (parsed.help or parsed.command == null) {
+        if (parsed.command == null and parsed.mode == .json and !parsed.help) {
+            const message = "missing command";
+            exitWithCliError(arena, stderr, parsed.mode, machine_output.usageMissingArgument(message, "GlobalArgs"), message);
+        }
         try stdout.writeAll(usage);
         try stdout.flush();
         std.process.exit(if (parsed.help) 0 else 2);
@@ -73,8 +89,31 @@ pub fn main(init: std.process.Init) !void {
 
     const command = parsed.command.?;
     const command_args = parsed.command_args;
+    runCommand(init, arena, stdout, stderr, command, command_args, parsed.mode) catch |err| {
+        if (parsed.mode == .json) {
+            exitWithCliError(arena, stderr, parsed.mode, machine_output.fromZigError(err), machine_output.fromZigError(err).message);
+        }
+        return err;
+    };
+    try stdout.flush();
+}
+
+fn runCommand(
+    init: std.process.Init,
+    arena: std.mem.Allocator,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+    command: []const u8,
+    command_args: []const []const u8,
+    mode: machine_output.Mode,
+) !void {
+    if (mode == .json and !supportsJson(command)) {
+        const message = allocMessage(arena, "spore --json does not support command: {s}", .{command});
+        exitWithCliError(arena, stderr, mode, machine_output.usageInvalidArgument(message, "GlobalJson"), message);
+    }
+
     if (std.mem.eql(u8, command, "system")) {
-        try sporevm.system.run(init, command_args, stdout);
+        try sporevm.system.run(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "rootfs")) {
         try sporevm.rootfs.run(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "run")) {
@@ -94,7 +133,7 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, command, "suspend")) {
         try sporevm.lifecycle.suspendCli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "ls")) {
-        try sporevm.lifecycle.lsCli(init, command_args, stdout);
+        try sporevm.lifecycle.lsCli(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "monitor")) {
         try sporevm.monitor.cli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "netd")) {
@@ -102,42 +141,80 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, command, "version")) {
         try stdout.print("spore {s}\n", .{sporevm.version});
     } else if (std.mem.eql(u8, command, "host-info")) {
-        try printJson(arena, stdout, try sporevm.platform.hostInfo());
+        if (command_args.len != 0) {
+            if (std.mem.startsWith(u8, command_args[0], "--")) {
+                exitUnknownArgument(arena, stderr, mode, "host-info", command_args[0]);
+            }
+            exitUnexpectedArgument(arena, stderr, mode, "host-info", command_args[0]);
+        }
+        const info = try sporevm.api.hostInfo(arena, init.environ_map);
+        if (mode == .json) {
+            try machine_output.writeJson(arena, stdout, info);
+        } else {
+            try writeHostInfo(stdout, info);
+        }
     } else if (std.mem.eql(u8, command, "inspect")) {
         if (command_args.len != 1) {
-            try stdout.writeAll("usage: spore inspect <spore-dir>\n");
-            try stdout.flush();
-            std.process.exit(2);
+            exitWithCliError(arena, stderr, mode, machine_output.usageMissingArgument("usage: spore inspect <spore-dir>", "inspect"), "usage: spore inspect <spore-dir>");
         }
         const manifest = try sporevm.spore.loadManifest(arena, command_args[0]);
         defer manifest.deinit();
-        try printJson(arena, stdout, inspectSummary(manifest.value));
+        const summary = inspectSummary(manifest.value);
+        if (mode == .json) {
+            try machine_output.writeJson(arena, stdout, summary);
+        } else {
+            try writeInspectSummary(stdout, summary);
+        }
     } else if (std.mem.eql(u8, command, "fork")) {
-        const result = try forkCommand(init, arena, command_args);
-        try printJson(arena, stdout, result);
+        const result = try forkCommand(init, arena, stderr, mode, command_args);
+        if (mode == .json) {
+            try machine_output.writeJson(arena, stdout, result);
+        } else {
+            try writeForkResult(stdout, result);
+        }
     } else if (std.mem.eql(u8, command, "fanout")) {
         try sporevm.fanout.cli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "pack")) {
-        const result = try packCommand(init, arena, command_args);
-        try printJson(arena, stdout, result);
+        const result = try packCommand(init, arena, stderr, mode, command_args);
+        if (mode == .json) {
+            try machine_output.writeJson(arena, stdout, result);
+        } else {
+            try writePackResult(stdout, result);
+        }
     } else if (std.mem.eql(u8, command, "unpack")) {
-        const result = try unpackCommand(init, arena, command_args);
-        try printJson(arena, stdout, result);
+        const result = try unpackCommand(init, arena, stderr, mode, command_args);
+        if (mode == .json) {
+            try machine_output.writeJson(arena, stdout, result);
+        } else {
+            try writeUnpackResult(stdout, result);
+        }
     } else if (std.mem.eql(u8, command, "push")) {
-        const result = try pushCommand(init, arena, command_args);
-        try printJson(arena, stdout, result);
+        const result = try pushCommand(init, arena, stderr, mode, command_args);
+        if (mode == .json) {
+            try machine_output.writeJson(arena, stdout, result);
+        } else {
+            try writePushResult(stdout, result);
+        }
+    } else if (std.mem.eql(u8, command, "inspect-bundle")) {
+        const result = try inspectBundleCommand(arena, stderr, mode, command_args);
+        if (mode == .json) {
+            try machine_output.writeJson(arena, stdout, result);
+        } else {
+            try writeInspectBundleResult(stdout, result);
+        }
     } else if (std.mem.eql(u8, command, "pull")) {
-        const result = try pullCommand(init, arena, command_args);
-        try printJson(arena, stdout, result);
+        const result = try pullCommand(init, arena, stderr, mode, command_args);
+        if (mode == .json) {
+            try machine_output.writeJson(arena, stdout, result);
+        } else {
+            try writePullResult(stdout, result);
+        }
     } else if (std.mem.eql(u8, command, "help")) {
         try stdout.writeAll(usage);
     } else {
-        try stdout.print("unknown command: {s}\n\n", .{command});
-        try stdout.writeAll(usage);
-        try stdout.flush();
-        std.process.exit(2);
+        const message = allocMessage(arena, "unknown command: {s}", .{command});
+        exitWithCliError(arena, stderr, mode, machine_output.usageInvalidArgument(message, "CommandDispatch"), messageWithUsage(arena, message));
     }
-    try stdout.flush();
 }
 
 fn logFn(
@@ -153,9 +230,15 @@ fn logFn(
 
 const GlobalArgs = struct {
     debug: bool = false,
+    mode: machine_output.Mode = .human,
     help: bool = false,
     command: ?[]const u8 = null,
     command_args: []const []const u8 = &.{},
+    parse_error: ?GlobalParseError = null,
+};
+
+const GlobalParseError = struct {
+    arg: []const u8,
 };
 
 fn parseGlobalArgs(args: []const []const u8) GlobalArgs {
@@ -164,8 +247,13 @@ fn parseGlobalArgs(args: []const []const u8) GlobalArgs {
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--debug")) {
             parsed.debug = true;
+        } else if (std.mem.eql(u8, args[i], "--json")) {
+            parsed.mode = .json;
         } else if (std.mem.eql(u8, args[i], "-h") or std.mem.eql(u8, args[i], "--help")) {
             parsed.help = true;
+            return parsed;
+        } else if (std.mem.startsWith(u8, args[i], "-")) {
+            parsed.parse_error = .{ .arg = args[i] };
             return parsed;
         } else {
             parsed.command = args[i];
@@ -176,10 +264,86 @@ fn parseGlobalArgs(args: []const []const u8) GlobalArgs {
     return parsed;
 }
 
-fn printJson(allocator: std.mem.Allocator, writer: *Io.Writer, value: anytype) !void {
-    const json = try std.json.Stringify.valueAlloc(allocator, value, .{ .whitespace = .indent_2 });
-    try writer.writeAll(json);
-    try writer.writeByte('\n');
+fn supportsJson(command: []const u8) bool {
+    return std.mem.eql(u8, command, "system") or
+        std.mem.eql(u8, command, "host-info") or
+        std.mem.eql(u8, command, "inspect") or
+        std.mem.eql(u8, command, "ls") or
+        std.mem.eql(u8, command, "fork") or
+        std.mem.eql(u8, command, "pack") or
+        std.mem.eql(u8, command, "unpack") or
+        std.mem.eql(u8, command, "push") or
+        std.mem.eql(u8, command, "inspect-bundle") or
+        std.mem.eql(u8, command, "pull");
+}
+
+fn allocMessage(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) []const u8 {
+    return std.fmt.allocPrint(allocator, fmt, args) catch "CLI argument error";
+}
+
+fn messageWithUsage(allocator: std.mem.Allocator, message: []const u8) []const u8 {
+    return std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ message, usage }) catch message;
+}
+
+fn exitWithCliError(
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+    err: machine_output.CliError,
+    human_text: []const u8,
+) noreturn {
+    if (mode == .json) {
+        machine_output.writeError(allocator, stderr, err) catch {};
+    } else {
+        stderr.writeAll(human_text) catch {};
+        if (!std.mem.endsWith(u8, human_text, "\n")) stderr.writeByte('\n') catch {};
+    }
+    stderr.flush() catch {};
+    std.process.exit(err.exit_code);
+}
+
+fn exitUnknownArgument(
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+    command: []const u8,
+    arg: []const u8,
+) noreturn {
+    const message = allocMessage(allocator, "unknown {s} argument: {s}", .{ command, arg });
+    exitWithCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
+}
+
+fn exitUnexpectedArgument(
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+    command: []const u8,
+    arg: []const u8,
+) noreturn {
+    const message = allocMessage(allocator, "unexpected {s} argument: {s}", .{ command, arg });
+    exitWithCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
+}
+
+fn exitInvalidValue(
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+    command: []const u8,
+    flag: []const u8,
+    value: []const u8,
+) noreturn {
+    const message = allocMessage(allocator, "spore {s}: invalid {s}: {s}", .{ command, flag, value });
+    exitWithCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
+}
+
+fn exitUsage(
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+    command: []const u8,
+    usage_line: []const u8,
+) noreturn {
+    exitWithCliError(allocator, stderr, mode, machine_output.usageMissingArgument(usage_line, command), usage_line);
 }
 
 fn wantsNamedResume(args: []const []const u8) bool {
@@ -189,7 +353,13 @@ fn wantsNamedResume(args: []const []const u8) bool {
     return false;
 }
 
-fn forkCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []const []const u8) !sporevm.spore.ForkResult {
+fn forkCommand(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+    args: []const []const u8,
+) !sporevm.spore.ForkResult {
     var parent_dir: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
     var count: ?usize = null;
@@ -198,24 +368,23 @@ fn forkCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []con
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--count") and i + 1 < args.len) {
             i += 1;
-            count = try std.fmt.parseInt(usize, args[i], 10);
+            count = std.fmt.parseInt(usize, args[i], 10) catch {
+                exitInvalidValue(allocator, stderr, mode, "fork", "--count", args[i]);
+            };
         } else if (std.mem.eql(u8, args[i], "--out") and i + 1 < args.len) {
             i += 1;
             out_dir = args[i];
         } else if (std.mem.startsWith(u8, args[i], "--")) {
-            std.debug.print("unknown fork argument: {s}\n", .{args[i]});
-            std.process.exit(2);
+            exitUnknownArgument(allocator, stderr, mode, "fork", args[i]);
         } else if (parent_dir == null) {
             parent_dir = args[i];
         } else {
-            std.debug.print("unexpected fork argument: {s}\n", .{args[i]});
-            std.process.exit(2);
+            exitUnexpectedArgument(allocator, stderr, mode, "fork", args[i]);
         }
     }
 
     if (parent_dir == null or out_dir == null or count == null) {
-        std.debug.print("usage: spore fork <spore-dir> --count N --out DIR\n", .{});
-        std.process.exit(2);
+        exitUsage(allocator, stderr, mode, "fork", "usage: spore fork <spore-dir> --count N --out DIR");
     }
 
     return sporevm.spore.fork(allocator, .{
@@ -226,7 +395,13 @@ fn forkCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []con
     });
 }
 
-fn packCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []const []const u8) !sporevm.bundle.PackResult {
+fn packCommand(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+    args: []const []const u8,
+) !sporevm.bundle.PackResult {
     var spore_dir: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
     var children_dir: ?[]const u8 = null;
@@ -242,23 +417,25 @@ fn packCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []con
             children_dir = args[i];
         } else if (std.mem.eql(u8, args[i], "--rootfs") and i + 1 < args.len) {
             i += 1;
-            rootfs_policy = try parseRootfsBundlePolicy(args[i]);
+            rootfs_policy = parseRootfsBundlePolicy(args[i]) orelse {
+                exitInvalidValue(allocator, stderr, mode, "pack", "--rootfs", args[i]);
+            };
         } else if (std.mem.startsWith(u8, args[i], "--rootfs=")) {
-            rootfs_policy = try parseRootfsBundlePolicy(args[i]["--rootfs=".len..]);
+            const value = args[i]["--rootfs=".len..];
+            rootfs_policy = parseRootfsBundlePolicy(value) orelse {
+                exitInvalidValue(allocator, stderr, mode, "pack", "--rootfs", value);
+            };
         } else if (std.mem.startsWith(u8, args[i], "--")) {
-            std.debug.print("unknown pack argument: {s}\n", .{args[i]});
-            std.process.exit(2);
+            exitUnknownArgument(allocator, stderr, mode, "pack", args[i]);
         } else if (spore_dir == null) {
             spore_dir = args[i];
         } else {
-            std.debug.print("unexpected pack argument: {s}\n", .{args[i]});
-            std.process.exit(2);
+            exitUnexpectedArgument(allocator, stderr, mode, "pack", args[i]);
         }
     }
 
     if (spore_dir == null or out_dir == null) {
-        std.debug.print("usage: spore pack <spore-dir> [--children DIR] [--rootfs=exact|metadata-only] --out DIR\n", .{});
-        std.process.exit(2);
+        exitUsage(allocator, stderr, mode, "pack", "usage: spore pack <spore-dir> [--children DIR] [--rootfs=exact|metadata-only] --out DIR");
     }
 
     return sporevm.bundle.pack(allocator, .{
@@ -271,7 +448,13 @@ fn packCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []con
     });
 }
 
-fn unpackCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []const []const u8) !sporevm.bundle.UnpackResult {
+fn unpackCommand(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+    args: []const []const u8,
+) !sporevm.bundle.UnpackResult {
     var bundle_dir: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
     var child_id: ?[]const u8 = null;
@@ -288,19 +471,16 @@ fn unpackCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []c
         } else if (std.mem.eql(u8, args[i], "--allow-metadata-only-rootfs")) {
             allow_metadata_only_rootfs = true;
         } else if (std.mem.startsWith(u8, args[i], "--")) {
-            std.debug.print("unknown unpack argument: {s}\n", .{args[i]});
-            std.process.exit(2);
+            exitUnknownArgument(allocator, stderr, mode, "unpack", args[i]);
         } else if (bundle_dir == null) {
             bundle_dir = args[i];
         } else {
-            std.debug.print("unexpected unpack argument: {s}\n", .{args[i]});
-            std.process.exit(2);
+            exitUnexpectedArgument(allocator, stderr, mode, "unpack", args[i]);
         }
     }
 
     if (bundle_dir == null or out_dir == null) {
-        std.debug.print("usage: spore unpack <bundle-dir> [--child ID] [--allow-metadata-only-rootfs] --out DIR\n", .{});
-        std.process.exit(2);
+        exitUsage(allocator, stderr, mode, "unpack", "usage: spore unpack <bundle-dir> [--child ID] [--allow-metadata-only-rootfs] --out DIR");
     }
 
     return sporevm.bundle.unpack(allocator, .{
@@ -313,7 +493,13 @@ fn unpackCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []c
     });
 }
 
-fn pushCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []const []const u8) !sporevm.bundle.PushResult {
+fn pushCommand(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+    args: []const []const u8,
+) !sporevm.bundle.PushResult {
     var bundle_dir: ?[]const u8 = null;
     var destination: ?[]const u8 = null;
     var aws_region: ?[]const u8 = null;
@@ -324,21 +510,18 @@ fn pushCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []con
             i += 1;
             aws_region = args[i];
         } else if (std.mem.startsWith(u8, args[i], "--")) {
-            std.debug.print("unknown push argument: {s}\n", .{args[i]});
-            std.process.exit(2);
+            exitUnknownArgument(allocator, stderr, mode, "push", args[i]);
         } else if (bundle_dir == null) {
             bundle_dir = args[i];
         } else if (destination == null) {
             destination = args[i];
         } else {
-            std.debug.print("unexpected push argument: {s}\n", .{args[i]});
-            std.process.exit(2);
+            exitUnexpectedArgument(allocator, stderr, mode, "push", args[i]);
         }
     }
 
     if (bundle_dir == null or destination == null) {
-        std.debug.print("usage: spore push <bundle-dir> s3://BUCKET/PREFIX [--region REGION]\n", .{});
-        std.process.exit(2);
+        exitUsage(allocator, stderr, mode, "push", "usage: spore push <bundle-dir> s3://BUCKET/PREFIX [--region REGION]");
     }
 
     return sporevm.bundle.push(allocator, .{
@@ -349,7 +532,65 @@ fn pushCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []con
     });
 }
 
-fn pullCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []const []const u8) !sporevm.bundle.PullResult {
+fn inspectBundleCommand(
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+    args: []const []const u8,
+) !sporevm.bundle.InspectBundleResult {
+    var source: ?[]const u8 = null;
+    var child_id: ?[]const u8 = null;
+    var child_range: ?sporevm.bundle.ChildRange = null;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--child")) {
+            if (i + 1 >= args.len or std.mem.startsWith(u8, args[i + 1], "--")) {
+                exitUsage(allocator, stderr, mode, "inspect-bundle", "usage: spore inspect-bundle <bundle-ref> [--child ID|--child-range START..END]");
+            }
+            i += 1;
+            if (child_range != null) {
+                exitWithInvalidCombination(allocator, stderr, mode, "inspect-bundle", "--child", "--child-range");
+            }
+            child_id = args[i];
+        } else if (std.mem.eql(u8, args[i], "--child-range")) {
+            if (i + 1 >= args.len or std.mem.startsWith(u8, args[i + 1], "--")) {
+                exitUsage(allocator, stderr, mode, "inspect-bundle", "usage: spore inspect-bundle <bundle-ref> [--child ID|--child-range START..END]");
+            }
+            i += 1;
+            if (child_id != null) {
+                exitWithInvalidCombination(allocator, stderr, mode, "inspect-bundle", "--child", "--child-range");
+            }
+            child_range = parseChildRange(args[i]) orelse {
+                exitInvalidValue(allocator, stderr, mode, "inspect-bundle", "--child-range", args[i]);
+            };
+        } else if (std.mem.startsWith(u8, args[i], "--")) {
+            exitUnknownArgument(allocator, stderr, mode, "inspect-bundle", args[i]);
+        } else if (source == null) {
+            source = args[i];
+        } else {
+            exitUnexpectedArgument(allocator, stderr, mode, "inspect-bundle", args[i]);
+        }
+    }
+
+    if (source == null) {
+        exitUsage(allocator, stderr, mode, "inspect-bundle", "usage: spore inspect-bundle <bundle-ref> [--child ID|--child-range START..END]");
+    }
+
+    return sporevm.api.inspectBundle(allocator, .{
+        .source = source.?,
+        .child_id = child_id,
+        .child_range = child_range,
+    });
+}
+
+fn pullCommand(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+    args: []const []const u8,
+) !sporevm.bundle.PullResult {
     var source: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
     var child_id: ?[]const u8 = null;
@@ -370,46 +611,56 @@ fn pullCommand(init: std.process.Init, allocator: std.mem.Allocator, args: []con
         } else if (std.mem.eql(u8, args[i], "--allow-metadata-only-rootfs")) {
             allow_metadata_only_rootfs = true;
         } else if (std.mem.startsWith(u8, args[i], "--")) {
-            std.debug.print("unknown pull argument: {s}\n", .{args[i]});
-            std.process.exit(2);
+            exitUnknownArgument(allocator, stderr, mode, "pull", args[i]);
         } else if (source == null) {
             source = args[i];
         } else {
-            std.debug.print("unexpected pull argument: {s}\n", .{args[i]});
-            std.process.exit(2);
+            exitUnexpectedArgument(allocator, stderr, mode, "pull", args[i]);
         }
     }
 
     if (source == null or out_dir == null) {
-        std.debug.print("usage: spore pull file://BUNDLE|s3://BUNDLE@sha256:DIGEST|http(s)://BUNDLE@sha256:DIGEST [--child ID] [--allow-metadata-only-rootfs] --out DIR [--region REGION]\n", .{});
-        std.process.exit(2);
+        exitUsage(allocator, stderr, mode, "pull", "usage: spore pull file://BUNDLE|s3://BUNDLE@sha256:DIGEST|http(s)://BUNDLE@sha256:DIGEST [--child ID] [--allow-metadata-only-rootfs] --out DIR [--region REGION]");
     }
 
-    return sporevm.bundle.pull(allocator, .{
-        .io = init.io,
+    return sporevm.api.pull(init, allocator, .{
         .source = source.?,
         .out_dir = out_dir.?,
-        .rootfs_cache_dir = optionalRootfsCacheRoot(allocator, init),
-        .bundle_cache_dir = optionalBundleCacheRoot(allocator, init),
         .child_id = child_id,
         .allow_metadata_only_rootfs = allow_metadata_only_rootfs,
         .aws_region = aws_region,
     });
 }
 
-fn parseRootfsBundlePolicy(value: []const u8) !sporevm.bundle.RootfsBundlePolicy {
+fn exitWithInvalidCombination(
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+    command: []const u8,
+    first: []const u8,
+    second: []const u8,
+) noreturn {
+    const message = allocMessage(allocator, "spore {s}: cannot combine {s} and {s}", .{ command, first, second });
+    exitWithCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
+}
+
+fn parseChildRange(value: []const u8) ?sporevm.bundle.ChildRange {
+    const sep = std.mem.indexOf(u8, value, "..") orelse return null;
+    if (sep == 0 or sep + 2 >= value.len) return null;
+    const start = std.fmt.parseInt(u32, value[0..sep], 10) catch return null;
+    const end = std.fmt.parseInt(u32, value[sep + 2 ..], 10) catch return null;
+    if (start > end) return null;
+    return .{ .start = start, .end = end };
+}
+
+fn parseRootfsBundlePolicy(value: []const u8) ?sporevm.bundle.RootfsBundlePolicy {
     if (std.mem.eql(u8, value, "exact") or std.mem.eql(u8, value, "exact-bytes")) return .exact_bytes;
     if (std.mem.eql(u8, value, "metadata-only")) return .metadata_only;
-    std.debug.print("unknown rootfs bundle policy: {s}\n", .{value});
-    std.process.exit(2);
+    return null;
 }
 
 fn optionalRootfsCacheRoot(allocator: std.mem.Allocator, init: std.process.Init) ?[]const u8 {
     return sporevm.local_paths.rootfsCacheRootPath(allocator, init.environ_map) catch null;
-}
-
-fn optionalBundleCacheRoot(allocator: std.mem.Allocator, init: std.process.Init) ?[]const u8 {
-    return sporevm.local_paths.bundleCacheRootPath(allocator, init.environ_map) catch null;
 }
 
 const InspectSummary = struct {
@@ -440,6 +691,126 @@ fn inspectSummary(manifest: sporevm.spore.Manifest) InspectSummary {
     };
 }
 
+fn writeHostInfo(writer: *Io.Writer, info: sporevm.platform.HostInfo) !void {
+    try writer.writeAll("Host info\n");
+    try writer.print("  Class: {s}\n", .{info.host_class});
+    try writer.print("  Platform: {s}/{s}\n", .{ info.platform.os, info.platform.arch });
+    try writer.print("  CPU profile: {s}\n", .{info.platform.cpu_profile});
+    try writer.print("  Device model version: {d}\n", .{info.platform.device_model_version});
+    try writer.print("  Counter frequency: {d} Hz ({s})\n", .{ info.platform.counter_frequency_hz, info.platform.counter_frequency_source });
+    try writer.writeAll("  Backends:\n");
+    for (info.backends) |backend| {
+        try writer.print("    {s}: supported={s} available={s} reason={s}\n", .{
+            backend.name,
+            yesNo(backend.supported),
+            yesNo(backend.available),
+            backend.reason,
+        });
+    }
+    try writer.writeAll("  Cache roots:\n");
+    try writePathFact(writer, "kernels", info.cache_roots.kernels);
+    try writePathFact(writer, "rootfs", info.cache_roots.rootfs);
+    try writePathFact(writer, "bundles", info.cache_roots.bundles);
+    try writePathFact(writer, "runtime", info.cache_roots.runtime);
+}
+
+fn writePathFact(writer: *Io.Writer, label: []const u8, fact: sporevm.platform.PathFact) !void {
+    if (fact.path) |path| {
+        try writer.print("    {s}: {s}\n", .{ label, path });
+    } else {
+        try writer.print("    {s}: unresolved ({s})\n", .{ label, fact.source });
+    }
+}
+
+fn yesNo(value: bool) []const u8 {
+    return if (value) "yes" else "no";
+}
+
+fn writeInspectSummary(writer: *Io.Writer, summary: InspectSummary) !void {
+    try writer.writeAll("Spore manifest\n");
+    try writer.print("  Version: {d}\n", .{summary.version});
+    try writer.print("  Platform: {s}/{s}, {d} bytes RAM\n", .{ summary.platform.arch, summary.platform.cpu_profile, summary.platform.ram_size });
+    try writer.print("  Devices: {d}\n", .{summary.device_count});
+    try writer.print("  Memory chunks: {d} present of {d}\n", .{ summary.present_memory_chunk_count, summary.memory_chunk_count });
+    if (summary.memory_backing_kind) |kind| {
+        try writer.print("  Memory backing: {s}", .{kind});
+        if (summary.memory_backing_size) |size| try writer.print(", {d} bytes", .{size});
+        try writer.writeByte('\n');
+    } else {
+        try writer.writeAll("  Memory backing: none\n");
+    }
+    try writer.print("  GIC: {s}\n", .{summary.gic_kind});
+}
+
+fn writeForkResult(writer: *Io.Writer, result: sporevm.spore.ForkResult) !void {
+    try writer.writeAll("Fork complete\n");
+    try writer.print("  Parent: {s}\n", .{result.parent});
+    try writer.print("  Children: {d}\n", .{result.count});
+    try writer.print("  Output: {s}\n", .{result.out_dir});
+    try writer.print("  Generation range: {d}..{d}\n", .{ result.first_generation, result.last_generation });
+}
+
+fn writePackResult(writer: *Io.Writer, result: sporevm.bundle.PackResult) !void {
+    try writer.writeAll("Bundle packed\n");
+    try writer.print("  Source: {s}\n", .{result.source});
+    try writer.print("  Output: {s}\n", .{result.out_dir});
+    try writer.print("  Bundle digest: sha256:{s}\n", .{result.bundle_digest});
+    try writer.print("  Chunks: {d} packed of {d}\n", .{ result.packed_chunk_count, result.chunk_count });
+    try writer.print("  Payload bytes: {d}\n", .{result.payload_bytes});
+    try writer.print("  Children: {d}\n", .{result.child_count});
+    if (result.rootfs_artifact_count > 0) {
+        try writer.print("  Rootfs artifacts: {d}, {d} bytes\n", .{ result.rootfs_artifact_count, result.rootfs_payload_bytes });
+    }
+}
+
+fn writeUnpackResult(writer: *Io.Writer, result: sporevm.bundle.UnpackResult) !void {
+    try writer.writeAll("Bundle unpacked\n");
+    try writer.print("  Bundle: {s}\n", .{result.bundle});
+    try writer.print("  Output: {s}\n", .{result.out_dir});
+    try writer.print("  Bundle digest: sha256:{s}\n", .{result.bundle_digest});
+    try writer.print("  Chunks: {d} unpacked of {d}\n", .{ result.unpacked_chunk_count, result.chunk_count });
+    try writer.print("  Payload bytes: {d}\n", .{result.payload_bytes});
+    try writer.print("  Children: {d}\n", .{result.child_count});
+    if (result.selected_child) |child| try writer.print("  Selected child: {s}\n", .{child});
+}
+
+fn writePushResult(writer: *Io.Writer, result: sporevm.bundle.PushResult) !void {
+    try writer.writeAll("Bundle pushed\n");
+    try writer.print("  Source: {s}\n", .{result.source});
+    try writer.print("  Destination: {s}\n", .{result.destination});
+    try writer.print("  Store: {s}\n", .{result.store});
+    try writer.print("  Bundle digest: sha256:{s}\n", .{result.bundle_digest});
+    try writer.print("  Uploaded: {d} files, {d} bytes\n", .{ result.uploaded_file_count, result.uploaded_bytes });
+}
+
+fn writeInspectBundleResult(writer: *Io.Writer, result: sporevm.bundle.InspectBundleResult) !void {
+    try writer.writeAll("Bundle\n");
+    try writer.print("  Source: {s}\n", .{result.source});
+    try writer.print("  Bundle: {s}\n", .{result.bundle_dir});
+    try writer.print("  Bundle digest: {s}:{s}\n", .{ result.bundle_digest.algorithm, result.bundle_digest.hex });
+    try writer.print("  Indexed: {}\n", .{result.indexed});
+    try writer.print("  Chunks: {d} chunks across {d} packs, {d} bytes\n", .{ result.chunkpack.chunk_count, result.chunkpack.pack_count, result.chunkpack.payload_bytes });
+    try writer.print("  Children: {d}\n", .{result.child_count});
+    if (result.selection.selected_count > 0) {
+        try writer.print("  Selection: {s}, {d} children\n", .{ result.selection.kind, result.selection.selected_count });
+    }
+    if (result.rootfs.artifact_count > 0) {
+        try writer.print("  Rootfs artifacts: {d}, {d} exact-byte artifacts, {d} metadata-only artifacts\n", .{ result.rootfs.artifact_count, result.rootfs.exact_bytes_count, result.rootfs.metadata_only_count });
+    }
+}
+
+fn writePullResult(writer: *Io.Writer, result: sporevm.bundle.PullResult) !void {
+    try writer.writeAll("Bundle pulled\n");
+    try writer.print("  Source: {s}\n", .{result.source});
+    try writer.print("  Output: {s}\n", .{result.out_dir});
+    try writer.print("  Bundle digest: {s}:{s}\n", .{ result.bundle_digest.algorithm, result.bundle_digest.hex });
+    try writer.print("  Chunks: {d} materialized of {d}\n", .{ result.materialization.materialized_chunk_count, result.materialization.chunk_count });
+    try writer.print("  Payload bytes: {d}\n", .{result.materialization.payload_bytes});
+    try writer.print("  Chunk cache: {d} hits, {d} misses\n", .{ result.materialization.cache.hit_count, result.materialization.cache.miss_count });
+    try writer.print("  Rootfs cache: {d} hits, {d} misses\n", .{ result.rootfs.cache.hit_count, result.rootfs.cache.miss_count });
+    if (result.children.selected_child) |child| try writer.print("  Selected child: {s}\n", .{child});
+}
+
 test "usage names every command" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "--debug") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "rootfs") != null);
@@ -454,6 +825,7 @@ test "usage names every command" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "version") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "host-info") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "inspect") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "inspect-bundle") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "fork") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "fanout") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "pack") != null);
@@ -463,10 +835,21 @@ test "usage names every command" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "help") != null);
 }
 
+test "parse inspect bundle child range" {
+    const range = parseChildRange("7..42") orelse return error.BadManifest;
+    try std.testing.expectEqual(@as(u32, 7), range.start);
+    try std.testing.expectEqual(@as(u32, 42), range.end);
+    try std.testing.expect(parseChildRange("42..7") == null);
+    try std.testing.expect(parseChildRange("7.") == null);
+    try std.testing.expect(parseChildRange("7..") == null);
+    try std.testing.expect(parseChildRange("..42") == null);
+}
+
 test "rootfs bundle policy parser accepts exact and metadata-only spellings" {
-    try std.testing.expectEqual(sporevm.bundle.RootfsBundlePolicy.exact_bytes, try parseRootfsBundlePolicy("exact"));
-    try std.testing.expectEqual(sporevm.bundle.RootfsBundlePolicy.exact_bytes, try parseRootfsBundlePolicy("exact-bytes"));
-    try std.testing.expectEqual(sporevm.bundle.RootfsBundlePolicy.metadata_only, try parseRootfsBundlePolicy("metadata-only"));
+    try std.testing.expectEqual(sporevm.bundle.RootfsBundlePolicy.exact_bytes, parseRootfsBundlePolicy("exact").?);
+    try std.testing.expectEqual(sporevm.bundle.RootfsBundlePolicy.exact_bytes, parseRootfsBundlePolicy("exact-bytes").?);
+    try std.testing.expectEqual(sporevm.bundle.RootfsBundlePolicy.metadata_only, parseRootfsBundlePolicy("metadata-only").?);
+    try std.testing.expect(parseRootfsBundlePolicy("bad") == null);
 }
 
 test "resume dispatch can distinguish product and named lifecycle modes" {
@@ -475,8 +858,9 @@ test "resume dispatch can distinguish product and named lifecycle modes" {
 }
 
 test "global args parse debug before command" {
-    const parsed = parseGlobalArgs(&.{ "spore", "--debug", "run", "--", "/bin/true" });
+    const parsed = parseGlobalArgs(&.{ "spore", "--debug", "--json", "run", "--", "/bin/true" });
     try std.testing.expect(parsed.debug);
+    try std.testing.expectEqual(machine_output.Mode.json, parsed.mode);
     try std.testing.expect(!parsed.help);
     try std.testing.expectEqualStrings("run", parsed.command.?);
     try std.testing.expectEqual(@as(usize, 2), parsed.command_args.len);

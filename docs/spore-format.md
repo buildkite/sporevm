@@ -113,9 +113,10 @@ URL is not restore authority.
 HTTP(S) peer source. The peer URL is only a byte source: it must be digest
 pinned, redirects and mutable URL components are rejected, and corrupt peer
 bytes fail before the local cache is marked complete. Pull results report cache
-accounting for the materialization path: `origin_bytes_read` for object-store
-sources, `peer_bytes_read` for HTTP(S) peer sources, `remote_bundle_cache_hit`,
-`chunk_bytes_fetched`, and rootfs cache hit/fetch counters.
+accounting for the materialization path: `remote.origin_bytes_read` for
+object-store sources, `remote.peer_bytes_read` for HTTP(S) peer sources,
+`remote.cache_hit`, `materialization.cache.bytes_fetched`, and rootfs
+cache hit/fetch counters under `rootfs.cache`.
 
 ## Manifest v0
 
