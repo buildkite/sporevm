@@ -17,11 +17,12 @@ const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const spore = @import("spore.zig");
 const tar = @import("rootfs/tar.zig");
+const xattrs_mod = @import("rootfs/xattrs.zig");
 
 const Io = std.Io;
 
 const max_rootfs_layers: usize = 512;
-pub const builder_version = "sporevm-rootfs-v1";
+pub const builder_version = "sporevm-rootfs-v2";
 
 const usage =
     \\Usage: spore rootfs <command>
@@ -605,6 +606,7 @@ pub fn validateTaggedImageRef(raw_ref: []const u8) !void {
 }
 
 const OwnershipMap = ownership_mod.Map;
+const XattrMap = xattrs_mod.Map;
 
 const BuildImageSource = struct {
     ref: ImageRef,
@@ -991,13 +993,15 @@ fn materializeRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts:
     defer rootfs_dir.close(init.io);
     var owners = OwnershipMap.init(allocator);
     defer ownership_mod.deinit(allocator, &owners);
+    var xattrs = XattrMap.init(allocator);
+    defer xattrs_mod.deinit(allocator, &xattrs);
 
     if (opts.layers.len > max_rootfs_layers) return error.RootFSTooManyLayers;
 
     const layer_meta = try allocator.alloc(oci.LayerMetadata, opts.layers.len);
     for (opts.layers, 0..) |layer, i| {
         if (!oci.isSupportedLayerMediaType(layer.media_type)) return error.UnsupportedLayerMediaType;
-        try tar.applyLayer(allocator, init.io, rootfs_dir, layer.path, layer.media_type, &owners);
+        try tar.applyLayer(allocator, init.io, rootfs_dir, layer.path, layer.media_type, &owners, &xattrs);
         if (try ext4.dirContentSize(init.io, rootfs_dir) > tar.max_content_bytes) return error.RootFSArchiveTooLarge;
         layer_meta[i] = .{ .media_type = layer.media_type, .digest = layer.digest };
     }
@@ -1020,7 +1024,7 @@ fn materializeRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts:
     try ext4.createEmptyFile(init.io, opts.output, image_size);
     try ext4.runMkfs(init, allocator, opts.mkfs, rootfs_dir_path, opts.output, deterministic_ext4, inode_count);
     const debugfs_script = try std.fmt.allocPrint(allocator, "{s}/debugfs-ownership.cmds", .{opts.temp_dir});
-    try ext4.runDebugfsFinalize(init, allocator, opts.debugfs, opts.output, debugfs_script, &owners, deterministic_ext4);
+    try ext4.runDebugfsFinalize(init, allocator, opts.debugfs, opts.output, debugfs_script, &owners, &xattrs, deterministic_ext4);
 
     const rootfs_blake3 = try ext4.blake3File(init.io, opts.output);
     const rootfs_hex = try allocator.dupe(u8, &rootfs_blake3);

@@ -1,6 +1,7 @@
 const std = @import("std");
 const chunk = @import("../chunk.zig");
 const ownership = @import("ownership.zig");
+const xattrs_mod = @import("xattrs.zig");
 
 const Io = std.Io;
 const Blake3 = std.crypto.hash.Blake3;
@@ -236,6 +237,7 @@ pub fn runDebugfsFinalize(
     output: []const u8,
     script_path: []const u8,
     owners: *ownership.Map,
+    xattrs: *xattrs_mod.Map,
     determinism: Determinism,
 ) !void {
     var script: Io.Writer.Allocating = .init(allocator);
@@ -268,6 +270,7 @@ pub fn runDebugfsFinalize(
 
         try writeDebugfsPathTimestampFields(&script.writer, rel);
     }
+    try appendDebugfsXattrCommands(init.io, allocator, &script.writer, script_path, xattrs);
     try writeFileAtPath(init.io, script_path, script.written());
 
     const stderr_path = try std.fmt.allocPrint(allocator, "{s}.stderr", .{script_path});
@@ -290,6 +293,59 @@ pub fn runDebugfsFinalize(
     if (!ok) return error.DebugfsFailed;
     try checkDebugfsStderr(allocator, init.io, stderr_path);
     try normalizeSuperblockTimestamps(allocator, init.io, output, determinism.uuid_bytes);
+}
+
+const DebugfsXattrEntry = struct {
+    rel: []const u8,
+    name: []const u8,
+    value: []const u8,
+};
+
+fn appendDebugfsXattrCommands(
+    io: Io,
+    allocator: std.mem.Allocator,
+    writer: *Io.Writer,
+    script_path: []const u8,
+    xattrs: *xattrs_mod.Map,
+) !void {
+    var entries = std.ArrayList(DebugfsXattrEntry).empty;
+    defer entries.deinit(allocator);
+
+    var it = xattrs.iterator();
+    while (it.next()) |entry| {
+        for (entry.value_ptr.attrs) |attr| {
+            try entries.append(allocator, .{
+                .rel = entry.key_ptr.*,
+                .name = attr.name,
+                .value = attr.value,
+            });
+        }
+    }
+    std.mem.sort(DebugfsXattrEntry, entries.items, {}, lessDebugfsXattrEntry);
+
+    const values_dir = try std.fmt.allocPrint(allocator, "{s}.xattrs", .{script_path});
+    defer allocator.free(values_dir);
+    if (entries.items.len != 0) try Io.Dir.cwd().createDirPath(io, values_dir);
+
+    for (entries.items, 0..) |entry, i| {
+        const value_path = try std.fmt.allocPrint(allocator, "{s}/xattr-{d}.bin", .{ values_dir, i });
+        defer allocator.free(value_path);
+        try writeFileAtPath(io, value_path, entry.value);
+
+        try writer.writeAll("ea_set -f ");
+        try writeDebugfsQuotedHostPath(writer, value_path);
+        try writer.writeAll(" -r ");
+        try writeDebugfsPath(writer, entry.rel);
+        try writer.writeByte(' ');
+        try writeDebugfsAttrName(writer, entry.name);
+        try writer.writeByte('\n');
+    }
+}
+
+fn lessDebugfsXattrEntry(_: void, a: DebugfsXattrEntry, b: DebugfsXattrEntry) bool {
+    const path_order = std.mem.order(u8, a.rel, b.rel);
+    if (path_order != .eq) return path_order == .lt;
+    return std.mem.order(u8, a.name, b.name) == .lt;
 }
 
 pub fn blake3File(io: Io, path: []const u8) ![chunk.ChunkId.hex_len]u8 {
@@ -469,6 +525,22 @@ fn writeDebugfsPath(writer: *Io.Writer, rel: []const u8) !void {
     try writer.writeByte('"');
 }
 
+fn writeDebugfsQuotedHostPath(writer: *Io.Writer, path: []const u8) !void {
+    try writer.writeByte('"');
+    for (path) |c| {
+        switch (c) {
+            0, '\n', '\r', '"', '\\' => return error.UnsupportedDebugfsPath,
+            else => try writer.writeByte(c),
+        }
+    }
+    try writer.writeByte('"');
+}
+
+fn writeDebugfsAttrName(writer: *Io.Writer, name: []const u8) !void {
+    if (!std.mem.eql(u8, name, xattrs_mod.security_capability_name)) return error.UnsupportedTarXattr;
+    try writer.writeAll(name);
+}
+
 fn writeDebugfsInodeTimestampFields(writer: *Io.Writer, inode: usize) !void {
     const fields = [_][]const u8{ "atime", "ctime", "mtime", "crtime", "atime_extra", "ctime_extra", "mtime_extra", "crtime_extra" };
     for (fields) |field| {
@@ -589,6 +661,33 @@ test "debugfs path writer rejects paths debugfs cannot address safely" {
 
     try std.testing.expectError(error.UnsupportedDebugfsPath, writeDebugfsPath(&script.writer, "quote\"name"));
     try std.testing.expectError(error.UnsupportedDebugfsPath, writeDebugfsPath(&script.writer, "back\\slash"));
+}
+
+test "debugfs xattr commands are deterministic and binary-backed" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const script_path = "zig-cache/test-debugfs-xattrs.cmds";
+    const values_dir = script_path ++ ".xattrs";
+    defer Io.Dir.cwd().deleteFile(io, script_path) catch {};
+    defer Io.Dir.cwd().deleteTree(io, values_dir) catch {};
+
+    var cap = [_]u8{ 1, 0, 0, 2 } ++ [_]u8{0} ** 16;
+    const attrs = [_]xattrs_mod.Attribute{.{ .name = xattrs_mod.security_capability_name, .value = &cap }};
+    var xattrs = xattrs_mod.Map.init(allocator);
+    defer xattrs_mod.deinit(allocator, &xattrs);
+    try xattrs_mod.record(allocator, &xattrs, "usr/bin/ping", &attrs);
+
+    var script: Io.Writer.Allocating = .init(allocator);
+    defer script.deinit();
+    try appendDebugfsXattrCommands(io, allocator, &script.writer, script_path, &xattrs);
+
+    try std.testing.expectEqualStrings(
+        "ea_set -f \"zig-cache/test-debugfs-xattrs.cmds.xattrs/xattr-0.bin\" -r \"/usr/bin/ping\" security.capability\n",
+        script.written(),
+    );
+    const value = try Io.Dir.cwd().readFileAlloc(io, values_dir ++ "/xattr-0.bin", allocator, .limited(64));
+    defer allocator.free(value);
+    try std.testing.expectEqualSlices(u8, &cap, value);
 }
 
 test "superblock timestamp normalization ignores matching file data" {
