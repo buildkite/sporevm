@@ -1,9 +1,9 @@
 ---
 status: active
-last_reviewed: 2026-06-21
+last_reviewed: 2026-06-22
 spec_refs:
   - docs/plans/foundation.md
-  - docs/plans/immutable-rootfs-resume.md
+  - docs/filesystem.md
   - docs/spore-format.md
   - SECURITY.md
   - src/bundle.zig
@@ -12,7 +12,7 @@ spec_refs:
   - src/spore.zig
 related_plans:
   - docs/plans/foundation.md
-  - docs/plans/immutable-rootfs-resume.md
+  - docs/filesystem.md
 ---
 
 # Pull-Based Distribution Plan
@@ -158,7 +158,7 @@ selected manifest records a `cow-block-v0` root disk chain. They stay separate
 from memory chunkpacks and rootfs artifacts; the manifest layer refs and object
 digests remain restore authority.
 
-Rootfs inclusion is the default artifact policy:
+Rootfs inclusion follows the selected manifest:
 
 - If any selected manifest records an immutable fd-backed rootfs artifact,
   `spore pack` verifies the source digest-cache ext4 by BLAKE3 and size, then
@@ -171,9 +171,10 @@ Rootfs inclusion is the default artifact policy:
   against the manifest descriptor, copies it to
   `rootfs/blake3/indexes/<hex>.json`, and copies each referenced nonzero chunk
   object to `rootfs/blake3/objects/<hex>.chunk` once by digest.
-- The default rootfs artifact policy is exact bytes. `spore pack --children ...
-  --rootfs=metadata-only` is an explicit opt-out for indexed bundles whose
-  destinations already have the verified rootfs cache entry.
+- Exact fd-backed rootfs artifacts remain the default only for manifests without
+  `rootfs.storage`. `spore pack --children ... --rootfs=metadata-only` is an
+  explicit opt-out for indexed exact-rootfs bundles whose destinations already
+  have the verified rootfs cache entry.
 - `spore unpack` and `spore pull` install bundled rootfs artifacts into the
   node-local digest cache by default, verifying digest and size before writing a
   resumable spore.
@@ -550,7 +551,9 @@ cannot become restore authority.
   verifies artifacts on the selected host.
 - `pack`/`unpack` are local bundle operations. `push`/`pull` are remote store
   operations. `resume` executes a materialized spore.
-- Rootfs-backed bundles include exact immutable rootfs bytes by default.
+- Rootfs-backed bundles follow the manifest: chunked storage carries rootfs CAS
+  indexes/objects, while fd-backed exact-rootfs manifests carry immutable ext4
+  bytes by default.
 - Metadata-only rootfs bundles require an explicit opt-out and must be marked in
   bundle metadata; materialized unpack and pull accept them only with an
   explicit prepared-cache flag and a verified destination cache hit.

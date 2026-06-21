@@ -1,5 +1,8 @@
 # Rootfs Images
 
+For the durable root disk, rootfs CAS, writable layer, bundle, cache, and
+verification contract, see [Filesystem And Root Disk Contract](filesystem.md).
+
 `spore rootfs build` materializes an OCI image into a deterministic ext4 rootfs
 image, installs that image into the local digest cache, and writes chunked
 rootfs CAS objects plus a `rootfs_storage` descriptor into the metadata sidecar.
@@ -76,10 +79,10 @@ and writes the deterministic ext4 output under the resolved image cache key.
 
 Local refs use the `local/<name>:<tag>` form and are host-local mutable pointers
 only. The imported rootfs metadata records a digest-pinned local resolved
-identity, `local/<name>@sha256:<manifest>`, while captured spores continue to
-restore by the ext4 BLAKE3 artifact digest and size. `spore run --image
-local/...` resolves from the local ref cache and does not fall back to a network
-registry.
+identity, `local/<name>@sha256:<manifest>`. Captured image-created spores record
+the ext4 BLAKE3 artifact digest and size plus manifest-attached
+`rootfs.storage` when available. `spore run --image local/...` resolves from the
+local ref cache and does not fall back to a network registry.
 
 Set `SPOREVM_ROOTFS_CACHE_DIR` to choose the cache directory; otherwise SporeVM
 uses the platform cache directory. Cache setup messages are shown only with
@@ -117,11 +120,12 @@ command when scripts need stable field names and exact byte counts. Without
 reimportable image-rootfs files that are not hardlinked to digest-addressed
 artifacts.
 
-`spore system prune --rootfs` does not delete digest-addressed rootfs artifacts
-by default because those bytes can be required by existing captured spores and
-metadata-only bundles. Add `--include-digest-artifacts` only when you are
-comfortable making affected spores fail closed until their exact rootfs bytes
-are restored.
+`spore system df --rootfs` also reports rootfs CAS index and object bytes.
+`spore system prune --rootfs` does not delete digest-addressed exact artifacts
+or rootfs CAS files by default because those bytes can be required by existing
+captured spores and metadata-only bundles. Add `--include-digest-artifacts`
+only when you are comfortable making affected spores fail closed until their
+exact rootfs bytes or rootfs CAS bytes are restored.
 
 When `spore run --image ... --capture SPORE` captures a VM, the spore manifest
 records an immutable rootfs artifact: the ext4 content BLAKE3 digest, size,
@@ -175,7 +179,7 @@ s3://bucket/prefix@sha256:<bundle_digest> --child 42 --out child.spore` and
 --out child.spore`, first verify the remote bundle identity, then install any
 bundled exact rootfs bytes or chunked rootfs CAS bytes through the same verified
 materialization boundary. Use
-`SPOREVM_ROOTFS_CACHE_DIR` to choose the destination rootfs digest cache and
+`SPOREVM_ROOTFS_CACHE_DIR` to choose the destination rootfs cache and
 `SPOREVM_BUNDLE_CACHE_DIR` to choose the node-local bundle and memory chunk
 caches used by pull. Pull JSON reports `rootfs.cache.hit_count`,
 `rootfs.cache.miss_count`, `rootfs.cache.bytes_fetched`, and
