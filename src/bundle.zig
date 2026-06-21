@@ -7,6 +7,7 @@
 //! CAS directory.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const block_source = @import("block_source.zig");
 const chunklib = @import("chunk.zig");
 const cow_disk = @import("cow_disk.zig");
@@ -2825,6 +2826,7 @@ fn readFileAll(allocator: std.mem.Allocator, path: [:0]const u8, max: usize) Err
 
 fn readFileAllNoSymlink(allocator: std.mem.Allocator, path: []const u8, max: usize) Error![]u8 {
     const path_z = try pathZ(allocator, "{s}", .{path});
+    defer allocator.free(path_z);
     const fd = std.c.open(path_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
     if (fd < 0) return error.BadChunk;
     defer _ = std.c.close(fd);
@@ -2842,11 +2844,24 @@ fn readFileAllNoSymlink(allocator: std.mem.Allocator, path: []const u8, max: usi
 }
 
 fn fstatRegularSize(fd: std.c.fd_t) Error!usize {
-    var stat: std.c.Stat = undefined;
-    if (std.c.fstat(fd, &stat) != 0) return error.IoFailed;
-    if (!std.c.S.ISREG(stat.mode)) return error.BadChunk;
-    if (stat.size < 0) return error.IoFailed;
-    return std.math.cast(usize, stat.size) orelse error.BadChunk;
+    if (comptime builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var statx_buf: linux.Statx = undefined;
+        const rc = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{
+            .TYPE = true,
+            .MODE = true,
+            .SIZE = true,
+        }, &statx_buf);
+        if (linux.errno(rc) != .SUCCESS) return error.IoFailed;
+        if (!linux.S.ISREG(statx_buf.mode)) return error.BadChunk;
+        return std.math.cast(usize, statx_buf.size) orelse error.BadChunk;
+    } else {
+        var stat: std.c.Stat = undefined;
+        if (std.c.fstat(fd, &stat) != 0) return error.IoFailed;
+        if (!std.c.S.ISREG(stat.mode)) return error.BadChunk;
+        if (stat.size < 0) return error.IoFailed;
+        return std.math.cast(usize, stat.size) orelse error.BadChunk;
+    }
 }
 
 fn readVerifiedRootfsStorageIndexPath(
