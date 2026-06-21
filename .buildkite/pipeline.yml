@@ -45,7 +45,28 @@ steps:
         buildkite-agent artifact upload "zig-cache/sporevm-benchmarks/*/logs/*" || true
         buildkite-agent artifact upload "zig-cache/sporevm-benchmarks/*/rootfs-cache/*.json" || true
       }
-      trap upload_benchmark_artifacts EXIT
+      annotate_benchmark_results() {
+        local status="$1"
+        local summary="zig-cache/sporevm-benchmarks/latest-summary.json"
+        [[ -f "${summary}" ]] || return 0
+
+        local annotation="zig-cache/sporevm-benchmarks/buildkite-annotation.md"
+        scripts/annotate-sporevm-benchmarks.py "${summary}" > "${annotation}" || return 0
+
+        local style="success"
+        if [[ "${status}" != "0" ]]; then
+          style="warning"
+        fi
+        buildkite-agent annotate --style "${style}" --context "sporevm-benchmarks" --priority 7 < "${annotation}" || true
+        buildkite-agent artifact upload "${annotation}" || true
+      }
+      finish_benchmark_step() {
+        local status="$?"
+        upload_benchmark_artifacts
+        annotate_benchmark_results "${status}"
+        exit "${status}"
+      }
+      trap finish_benchmark_step EXIT
 
       mise install
       mise run build

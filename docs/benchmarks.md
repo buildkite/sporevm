@@ -173,4 +173,5 @@ If `SPOREVM_BENCHMARK_BASELINE` points to a summary JSON available in the job
 workspace, the step compares the new `latest-summary.json` against that
 baseline. Baselines should come from the same profile unless the comparator is
 run by hand with a narrower `--only` list. Regardless of comparison result, the
-step uploads benchmark JSON, logs, and rootfs metadata as artifacts.
+step uploads benchmark JSON, logs, and rootfs metadata as artifacts and publishes
+a Buildkite annotation summarizing the latest benchmark run.
