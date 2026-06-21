@@ -7,6 +7,7 @@
 const std = @import("std");
 const oci = @import("oci.zig");
 const ownership_mod = @import("ownership.zig");
+const xattrs_mod = @import("xattrs.zig");
 
 const Io = std.Io;
 
@@ -16,6 +17,7 @@ const max_pax_header_bytes: u64 = 1 << 20;
 
 const Ownership = ownership_mod.Ownership;
 const OwnershipMap = ownership_mod.Map;
+const XattrMap = xattrs_mod.Map;
 
 pub fn applyLayer(
     allocator: std.mem.Allocator,
@@ -24,13 +26,14 @@ pub fn applyLayer(
     layer_path: []const u8,
     media_type: []const u8,
     ownership: *OwnershipMap,
+    xattrs: *XattrMap,
 ) !void {
     if (oci.isGzipLayerMediaType(media_type)) {
-        try applyGzipLayer(allocator, io, root, layer_path, ownership);
+        try applyGzipLayer(allocator, io, root, layer_path, ownership, xattrs);
         return;
     }
     if (oci.isPlainTarLayerMediaType(media_type)) {
-        try applyTarFileLayer(allocator, io, root, layer_path, ownership);
+        try applyTarFileLayer(allocator, io, root, layer_path, ownership, xattrs);
         return;
     }
     return error.UnsupportedLayerMediaType;
@@ -42,6 +45,7 @@ fn applyGzipLayer(
     root: Io.Dir,
     layer_path: []const u8,
     ownership: *OwnershipMap,
+    xattrs: *XattrMap,
 ) !void {
     var file = try Io.Dir.cwd().openFile(io, layer_path, .{});
     defer file.close(io);
@@ -49,7 +53,7 @@ fn applyGzipLayer(
     var file_reader: Io.File.Reader = .initStreaming(file, io, &file_buf);
     var decompress_buf: [std.compress.flate.max_window_len]u8 = undefined;
     var decompress: std.compress.flate.Decompress = .init(&file_reader.interface, .gzip, &decompress_buf);
-    applyTarLayer(allocator, io, root, &decompress.reader, ownership) catch |err| switch (err) {
+    applyTarLayerWithXattrs(allocator, io, root, &decompress.reader, ownership, xattrs) catch |err| switch (err) {
         error.ReadFailed => return decompress.err orelse err,
         else => |e| return e,
     };
@@ -61,17 +65,20 @@ fn applyTarFileLayer(
     root: Io.Dir,
     layer_path: []const u8,
     ownership: *OwnershipMap,
+    xattrs: *XattrMap,
 ) !void {
     var file = try Io.Dir.cwd().openFile(io, layer_path, .{});
     defer file.close(io);
     var file_buf: [64 * 1024]u8 = undefined;
     var file_reader: Io.File.Reader = .initStreaming(file, io, &file_buf);
-    try applyTarLayer(allocator, io, root, &file_reader.interface, ownership);
+    try applyTarLayerWithXattrs(allocator, io, root, &file_reader.interface, ownership, xattrs);
 }
 
 const LayerLimits = struct {
     content_bytes: u64 = 0,
     entries: u64 = 0,
+    xattrs: u64 = 0,
+    xattr_value_bytes: u64 = 0,
 };
 
 const CreatedPathMap = std.StringHashMap(void);
@@ -82,10 +89,13 @@ const PendingPax = struct {
     uid: ?u32 = null,
     gid: ?u32 = null,
     size: ?u64 = null,
+    xattrs: std.ArrayList(xattrs_mod.Attribute) = .empty,
 
     fn clear(self: *PendingPax, allocator: std.mem.Allocator) void {
         if (self.path) |p| allocator.free(p);
         if (self.linkpath) |p| allocator.free(p);
+        for (self.xattrs.items) |attr| allocator.free(attr.value);
+        self.xattrs.deinit(allocator);
         self.* = .{};
     }
 };
@@ -96,6 +106,19 @@ fn applyTarLayer(
     root: Io.Dir,
     reader: *Io.Reader,
     ownership: *OwnershipMap,
+) !void {
+    var xattrs = XattrMap.init(allocator);
+    defer xattrs_mod.deinit(allocator, &xattrs);
+    try applyTarLayerWithXattrs(allocator, io, root, reader, ownership, &xattrs);
+}
+
+fn applyTarLayerWithXattrs(
+    allocator: std.mem.Allocator,
+    io: Io,
+    root: Io.Dir,
+    reader: *Io.Reader,
+    ownership: *OwnershipMap,
+    xattrs: *XattrMap,
 ) !void {
     var limits: LayerLimits = .{};
     var long_name: ?[]u8 = null;
@@ -174,7 +197,11 @@ fn applyTarLayer(
         defer allocator.free(rel);
         const entry_ownership = try tarOwnership(&header, pax, global_pax);
 
-        if (try applyWhiteout(allocator, io, root, ownership, &created, rel)) {
+        if (std.mem.startsWith(u8, baseName(rel), ".wh.") and pax.xattrs.items.len != 0) {
+            try discardTarPayload(reader, payload_size);
+            return error.UnsupportedTarXattr;
+        }
+        if (try applyWhiteoutWithXattrs(allocator, io, root, ownership, xattrs, &created, rel)) {
             try discardTarPayload(reader, payload_size);
             continue;
         }
@@ -182,19 +209,25 @@ fn applyTarLayer(
         switch (kind) {
             0, '0' => {
                 try addContentBytes(&limits, payload_size);
+                try xattrs_mod.removeSubtree(allocator, xattrs, rel);
                 try writeRegularFile(allocator, io, root, ownership, &created, rel, reader, payload_size, try tarMode(&header));
                 try ownership_mod.record(allocator, ownership, rel, entry_ownership);
+                try recordEntryXattrs(allocator, xattrs, &limits, rel, pax.xattrs.items);
                 try recordCreatedPath(allocator, &created, rel);
             },
             '5' => {
                 try discardTarPayload(reader, payload_size);
+                if (pax.xattrs.items.len != 0) return error.UnsupportedTarXattr;
+                xattrs_mod.clearPath(allocator, xattrs, rel);
                 try writeDirectory(allocator, io, root, ownership, &created, rel, try tarMode(&header));
                 try ownership_mod.record(allocator, ownership, rel, entry_ownership);
                 try recordCreatedPath(allocator, &created, rel);
             },
             '2' => {
                 try discardTarPayload(reader, payload_size);
+                if (pax.xattrs.items.len != 0) return error.UnsupportedTarXattr;
                 const raw_link = if (pax.linkpath) |p| p else if (long_link) |p| p else tarLinkName(&header);
+                try xattrs_mod.removeSubtree(allocator, xattrs, rel);
                 try writeSymlink(allocator, io, root, ownership, &created, rel, raw_link);
                 try ownership_mod.record(allocator, ownership, rel, entry_ownership);
                 try recordCreatedPath(allocator, &created, rel);
@@ -202,12 +235,15 @@ fn applyTarLayer(
             '1' => {
                 try discardTarPayload(reader, payload_size);
                 const raw_link = if (pax.linkpath) |p| p else if (long_link) |p| p else tarLinkName(&header);
+                try xattrs_mod.removeSubtree(allocator, xattrs, rel);
                 try createHardlinkTarget(allocator, io, root, ownership, &created, rel, raw_link);
                 try recordHardlinkOwnership(allocator, io, root, ownership, rel, entry_ownership);
+                try recordHardlinkXattrs(allocator, io, root, xattrs, &limits, rel, pax.xattrs.items);
                 try recordCreatedPath(allocator, &created, rel);
             },
             else => {
                 try discardTarPayload(reader, payload_size);
+                if (pax.xattrs.items.len != 0) return error.UnsupportedTarXattr;
                 return error.UnsupportedTarEntryType;
             },
         }
@@ -217,6 +253,30 @@ fn applyTarLayer(
 fn addContentBytes(limits: *LayerLimits, size: u64) !void {
     if (size > max_content_bytes - limits.content_bytes) return error.RootFSArchiveTooLarge;
     limits.content_bytes += size;
+}
+
+fn addXattrBytes(limits: *LayerLimits, attrs: []const xattrs_mod.Attribute) !void {
+    if (attrs.len == 0) return;
+    if (limits.xattrs > xattrs_mod.max_layer_xattrs - attrs.len) return error.RootFSTooManyXattrs;
+    limits.xattrs += attrs.len;
+    for (attrs) |attr| {
+        if (limits.xattr_value_bytes > xattrs_mod.max_layer_value_bytes - attr.value.len) {
+            return error.RootFSXattrsTooLarge;
+        }
+        limits.xattr_value_bytes += attr.value.len;
+    }
+}
+
+fn recordEntryXattrs(
+    allocator: std.mem.Allocator,
+    xattrs: *XattrMap,
+    limits: *LayerLimits,
+    rel: []const u8,
+    attrs: []const xattrs_mod.Attribute,
+) !void {
+    if (attrs.len == 0) return;
+    try addXattrBytes(limits, attrs);
+    try xattrs_mod.record(allocator, xattrs, rel, attrs);
 }
 
 fn readTarHeader(reader: *Io.Reader, header: *[512]u8) !bool {
@@ -339,6 +399,47 @@ fn recordHardlinkOwnership(
     try ownership_mod.record(allocator, ownership, rel, owner);
 }
 
+fn recordHardlinkXattrs(
+    allocator: std.mem.Allocator,
+    io: Io,
+    root: Io.Dir,
+    xattrs: *XattrMap,
+    limits: *LayerLimits,
+    rel: []const u8,
+    attrs: []const xattrs_mod.Attribute,
+) !void {
+    const linked = try root.statFile(io, rel, .{ .follow_symlinks = false });
+    if (attrs.len != 0) {
+        try addXattrBytes(limits, attrs);
+        var it = xattrs.iterator();
+        while (it.next()) |entry| {
+            const stat = root.statFile(io, entry.key_ptr.*, .{ .follow_symlinks = false }) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => |e| return e,
+            };
+            if (stat.kind == .file and stat.inode == linked.inode) {
+                const cloned = try xattrs_mod.cloneAttributes(allocator, attrs);
+                xattrs_mod.freeAttributes(allocator, entry.value_ptr.attrs);
+                entry.value_ptr.* = .{ .attrs = cloned };
+            }
+        }
+        try xattrs_mod.record(allocator, xattrs, rel, attrs);
+        return;
+    }
+
+    var it = xattrs.iterator();
+    while (it.next()) |entry| {
+        const stat = root.statFile(io, entry.key_ptr.*, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => |e| return e,
+        };
+        if (stat.kind == .file and stat.inode == linked.inode) {
+            try xattrs_mod.record(allocator, xattrs, rel, entry.value_ptr.attrs);
+            return;
+        }
+    }
+}
+
 const IncomingEntryKind = enum {
     directory,
     non_directory,
@@ -371,12 +472,26 @@ fn applyWhiteout(
     created: *CreatedPathMap,
     rel: []const u8,
 ) !bool {
+    var xattrs = XattrMap.init(allocator);
+    defer xattrs_mod.deinit(allocator, &xattrs);
+    return applyWhiteoutWithXattrs(allocator, io, root, ownership, &xattrs, created, rel);
+}
+
+fn applyWhiteoutWithXattrs(
+    allocator: std.mem.Allocator,
+    io: Io,
+    root: Io.Dir,
+    ownership: *OwnershipMap,
+    xattrs: *XattrMap,
+    created: *CreatedPathMap,
+    rel: []const u8,
+) !bool {
     const base = baseName(rel);
     if (!std.mem.startsWith(u8, base, ".wh.")) return false;
     const parent = parentPath(rel);
     if (std.mem.eql(u8, base, ".wh..wh..opq")) {
         try ensureNoSymlinkPath(allocator, io, root, parent, true);
-        try deleteLowerChildrenAt(allocator, io, root, ownership, created, parent);
+        try deleteLowerChildrenAt(allocator, io, root, ownership, xattrs, created, parent);
         return true;
     }
     const target_base = base[".wh.".len..];
@@ -394,12 +509,13 @@ fn applyWhiteout(
             else => |e| return e,
         };
         if (stat.kind == .directory) {
-            try deleteLowerChildrenAt(allocator, io, root, ownership, created, target);
+            try deleteLowerChildrenAt(allocator, io, root, ownership, xattrs, created, target);
         }
         return true;
     }
     try root.deleteTree(io, target);
     try ownership_mod.removeSubtree(allocator, ownership, target);
+    try xattrs_mod.removeSubtree(allocator, xattrs, target);
     try removeCreatedSubtree(allocator, created, target);
     return true;
 }
@@ -409,11 +525,12 @@ fn deleteLowerChildrenAt(
     io: Io,
     root: Io.Dir,
     ownership: *OwnershipMap,
+    xattrs: *XattrMap,
     created: *CreatedPathMap,
     rel: []const u8,
 ) !void {
     if (rel.len == 0) {
-        try deleteLowerChildren(allocator, io, root, ownership, created, "");
+        try deleteLowerChildren(allocator, io, root, ownership, xattrs, created, "");
         return;
     }
     var dir = root.openDir(io, rel, .{
@@ -425,7 +542,7 @@ fn deleteLowerChildrenAt(
         else => |e| return e,
     };
     defer dir.close(io);
-    try deleteLowerChildren(allocator, io, dir, ownership, created, rel);
+    try deleteLowerChildren(allocator, io, dir, ownership, xattrs, created, rel);
 }
 
 fn deleteLowerChildren(
@@ -433,6 +550,7 @@ fn deleteLowerChildren(
     io: Io,
     root: Io.Dir,
     ownership: *OwnershipMap,
+    xattrs: *XattrMap,
     created: *CreatedPathMap,
     prefix: []const u8,
 ) !void {
@@ -454,13 +572,14 @@ fn deleteLowerChildren(
                 .follow_symlinks = false,
             });
             defer child.close(io);
-            try deleteLowerChildren(allocator, io, child, ownership, created, rel);
+            try deleteLowerChildren(allocator, io, child, ownership, xattrs, created, rel);
             continue;
         }
         if (created.contains(rel)) continue;
 
         try root.deleteTree(io, name);
         try ownership_mod.removeSubtree(allocator, ownership, rel);
+        try xattrs_mod.removeSubtree(allocator, xattrs, rel);
     }
 }
 
@@ -732,7 +851,7 @@ fn readPaxHeader(allocator: std.mem.Allocator, reader: *Io.Reader, size: u64, ou
             } else if (std.mem.eql(u8, key, "size")) {
                 out.size = try parsePaxSize(value);
             } else if (isPaxXattrKey(key)) {
-                return error.UnsupportedTarXattr;
+                try addPaxXattr(allocator, out, key, value);
             } else if (isPaxSparseKey(key)) {
                 return error.UnsupportedTarSparse;
             }
@@ -743,11 +862,29 @@ fn readPaxHeader(allocator: std.mem.Allocator, reader: *Io.Reader, size: u64, ou
 
 fn validateGlobalPax(pax: PendingPax) !void {
     if (pax.path != null or pax.linkpath != null or pax.size != null) return error.UnsupportedGlobalPaxRecord;
+    if (pax.xattrs.items.len != 0) return error.UnsupportedTarXattr;
 }
 
 fn isPaxXattrKey(key: []const u8) bool {
     return std.mem.startsWith(u8, key, "SCHILY.xattr.") or
         std.mem.startsWith(u8, key, "LIBARCHIVE.xattr.");
+}
+
+fn addPaxXattr(allocator: std.mem.Allocator, out: *PendingPax, key: []const u8, value: []const u8) !void {
+    if (!std.mem.eql(u8, key, "SCHILY.xattr." ++ xattrs_mod.security_capability_name)) {
+        return error.UnsupportedTarXattr;
+    }
+    try xattrs_mod.validateSecurityCapability(value);
+    if (out.xattrs.items.len >= xattrs_mod.max_per_entry) return error.TarTooManyXattrs;
+    for (out.xattrs.items) |attr| {
+        if (std.mem.eql(u8, attr.name, xattrs_mod.security_capability_name)) return error.DuplicateTarXattr;
+    }
+    const copied = try allocator.dupe(u8, value);
+    errdefer allocator.free(copied);
+    try out.xattrs.append(allocator, .{
+        .name = xattrs_mod.security_capability_name,
+        .value = copied,
+    });
 }
 
 fn isPaxSparseKey(key: []const u8) bool {
@@ -872,6 +1009,38 @@ fn makeTarHeader(header: []u8, name: []const u8, kind: u8, size: u64) void {
     writeTarOctal(header[148..156], sum);
 }
 
+fn writePaxRecord(dst: []u8, key: []const u8, value: []const u8) usize {
+    var digits: usize = 1;
+    while (true) {
+        const total = digits + 1 + key.len + 1 + value.len + 1;
+        const next_digits = decimalDigits(total);
+        if (next_digits == digits) {
+            const prefix = std.fmt.bufPrint(dst[0 .. digits + 1], "{d} ", .{total}) catch unreachable;
+            std.debug.assert(prefix.len == digits + 1);
+            var index = prefix.len;
+            @memcpy(dst[index .. index + key.len], key);
+            index += key.len;
+            dst[index] = '=';
+            index += 1;
+            @memcpy(dst[index .. index + value.len], value);
+            index += value.len;
+            dst[index] = '\n';
+            return total;
+        }
+        digits = next_digits;
+    }
+}
+
+fn decimalDigits(value: usize) usize {
+    var remaining = value;
+    var digits: usize = 1;
+    while (remaining >= 10) {
+        remaining /= 10;
+        digits += 1;
+    }
+    return digits;
+}
+
 fn writeTarOctal(field: []u8, value: u64) void {
     @memset(field, 0);
     var remaining = value;
@@ -912,8 +1081,10 @@ test "plain tar layer media type extracts without gzip" {
     defer tmp.cleanup();
     var ownership = OwnershipMap.init(allocator);
     defer ownership_mod.deinit(allocator, &ownership);
+    var xattrs = XattrMap.init(allocator);
+    defer xattrs_mod.deinit(allocator, &xattrs);
 
-    try applyLayer(allocator, io, tmp.dir, layer_path, "application/vnd.oci.image.layer.v1.tar", &ownership);
+    try applyLayer(allocator, io, tmp.dir, layer_path, "application/vnd.oci.image.layer.v1.tar", &ownership, &xattrs);
     const bytes = try tmp.dir.readFileAlloc(io, "file", allocator, .limited(16));
     defer allocator.free(bytes);
     try std.testing.expectEqualStrings("hello", bytes);
@@ -930,12 +1101,18 @@ test "whiteout removes lower-layer path" {
     try root.writeFile(io, .{ .sub_path = "etc/old", .data = "old" });
     var ownership = OwnershipMap.init(allocator);
     defer ownership_mod.deinit(allocator, &ownership);
+    var xattrs = XattrMap.init(allocator);
+    defer xattrs_mod.deinit(allocator, &xattrs);
     var created = CreatedPathMap.init(allocator);
     defer deinitCreatedPaths(allocator, &created);
     try ownership_mod.record(allocator, &ownership, "etc/old", .{ .uid = 1, .gid = 2 });
-    try std.testing.expect(try applyWhiteout(allocator, io, root, &ownership, &created, "etc/.wh.old"));
+    var cap = [_]u8{ 1, 0, 0, 2 } ++ [_]u8{0} ** 16;
+    const attrs = [_]xattrs_mod.Attribute{.{ .name = xattrs_mod.security_capability_name, .value = &cap }};
+    try xattrs_mod.record(allocator, &xattrs, "etc/old", &attrs);
+    try std.testing.expect(try applyWhiteoutWithXattrs(allocator, io, root, &ownership, &xattrs, &created, "etc/.wh.old"));
     try std.testing.expectError(error.FileNotFound, root.statFile(io, "etc/old", .{}));
     try std.testing.expect(!ownership.contains("etc/old"));
+    try std.testing.expect(!xattrs.contains("etc/old"));
 }
 
 test "whiteout ignores already absent target" {
@@ -1408,6 +1585,59 @@ test "pax xattr records fail closed" {
     defer pax.clear(allocator);
 
     try std.testing.expectError(error.UnsupportedTarXattr, readPaxHeader(allocator, &reader, record.len, &pax));
+}
+
+test "pax security capability xattr records are retained" {
+    const allocator = std.testing.allocator;
+    const cap = [_]u8{ 1, 0, 0, 2 } ++ [_]u8{0} ** 16;
+    var block = [_]u8{0} ** 512;
+    const len = writePaxRecord(&block, "SCHILY.xattr.security.capability", &cap);
+    var reader: Io.Reader = .fixed(&block);
+    var pax: PendingPax = .{};
+    defer pax.clear(allocator);
+
+    try readPaxHeader(allocator, &reader, len, &pax);
+    try std.testing.expectEqual(@as(usize, 1), pax.xattrs.items.len);
+    try std.testing.expectEqualStrings(xattrs_mod.security_capability_name, pax.xattrs.items[0].name);
+    try std.testing.expectEqualSlices(u8, &cap, pax.xattrs.items[0].value);
+}
+
+test "global pax xattrs fail closed" {
+    const allocator = std.testing.allocator;
+    const cap = [_]u8{ 1, 0, 0, 2 } ++ [_]u8{0} ** 16;
+    var block = [_]u8{0} ** 1024;
+    const len = writePaxRecord(block[512..], "SCHILY.xattr.security.capability", &cap);
+    makeTarHeader(block[0..512], "global-pax", 'g', len);
+    var reader: Io.Reader = .fixed(&block);
+    var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
+    defer tmp.cleanup();
+    var ownership = OwnershipMap.init(allocator);
+    defer ownership_mod.deinit(allocator, &ownership);
+
+    try std.testing.expectError(error.UnsupportedTarXattr, applyTarLayer(allocator, std.testing.io, tmp.dir, &reader, &ownership));
+}
+
+test "tar layer records file security capability xattrs" {
+    const allocator = std.testing.allocator;
+    const cap = [_]u8{ 1, 0, 0, 2 } ++ [_]u8{0} ** 16;
+    var block = [_]u8{0} ** 3072;
+    const len = writePaxRecord(block[512..], "SCHILY.xattr.security.capability", &cap);
+    makeTarHeader(block[0..512], "pax", 'x', len);
+    makeTarHeader(block[1024..1536], "bin/ping", '0', 4);
+    @memcpy(block[1536..1540], "ping");
+    var reader: Io.Reader = .fixed(&block);
+    var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
+    defer tmp.cleanup();
+    var ownership = OwnershipMap.init(allocator);
+    defer ownership_mod.deinit(allocator, &ownership);
+    var xattrs = XattrMap.init(allocator);
+    defer xattrs_mod.deinit(allocator, &xattrs);
+
+    try applyTarLayerWithXattrs(allocator, std.testing.io, tmp.dir, &reader, &ownership, &xattrs);
+    const entry = xattrs.get("bin/ping").?;
+    try std.testing.expectEqual(@as(usize, 1), entry.attrs.len);
+    try std.testing.expectEqualStrings(xattrs_mod.security_capability_name, entry.attrs[0].name);
+    try std.testing.expectEqualSlices(u8, &cap, entry.attrs[0].value);
 }
 
 test "pax sparse records fail closed" {

@@ -2563,7 +2563,7 @@ test "run image cache metadata matches resolved image identity" {
         .sub_path = metadata_path,
         .data =
         \\{
-        \\  "builder_version": "sporevm-rootfs-v1",
+        \\  "builder_version": "sporevm-rootfs-v2",
         \\  "resolved_image_ref": "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         \\  "image_manifest_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         \\  "platform": {"os": "linux", "arch": "arm64"}
@@ -2645,7 +2645,7 @@ test "run image ref cache maps tag to verified rootfs path" {
         .sub_path = metadata_path,
         .data =
         \\{
-        \\  "builder_version": "sporevm-rootfs-v1",
+        \\  "builder_version": "sporevm-rootfs-v2",
         \\  "resolved_image_ref": "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         \\  "image_manifest_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         \\  "platform": {"os": "linux", "arch": "arm64"}
@@ -2685,7 +2685,7 @@ test "run image ref cache treats mismatched records and missing rootfs as misses
         \\  "version": 1,
         \\  "requested_ref": "docker.io/library/alpine:other",
         \\  "platform": "linux/arm64",
-        \\  "builder_version": "sporevm-rootfs-v1",
+        \\  "builder_version": "sporevm-rootfs-v2",
         \\  "resolved_image_ref": "{s}",
         \\  "image_manifest_digest": "{s}",
         \\  "rootfs_cache_key": "{s}",
@@ -2700,7 +2700,7 @@ test "run image ref cache treats mismatched records and missing rootfs as misses
         \\  "version": 1,
         \\  "requested_ref": "docker.io/library/alpine:3.20",
         \\  "platform": "linux/arm64",
-        \\  "builder_version": "sporevm-rootfs-v1",
+        \\  "builder_version": "sporevm-rootfs-v2",
         \\  "resolved_image_ref": "docker.io/library/alpine:not-a-digest",
         \\  "image_manifest_digest": "{s}",
         \\  "rootfs_cache_key": "{s}",
