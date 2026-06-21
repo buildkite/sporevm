@@ -62,7 +62,9 @@ cold when addressed through its original tag.
 - No Docker daemon integration.
 - No hidden indefinite registry freshness guarantee.
 - No tag-based rootfs cache keys.
-- No OCI Entrypoint, Cmd, User, Env, or Workdir semantics in this slice.
+- No OCI Entrypoint, Cmd, or User semantics in this slice. `spore run --image`
+  later consumes cached image `Env` and `WorkingDir` metadata for the exec
+  request.
 - No registry auth redesign.
 - No garbage collection policy in the first slice. A later slice added explicit
   `spore system df` and `spore system prune --rootfs` commands.

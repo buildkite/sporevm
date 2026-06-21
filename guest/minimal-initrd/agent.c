@@ -31,7 +31,10 @@
 
 #define MAX_ARGC 16
 #define MAX_ARG_LEN 256
-#define MAX_REQUEST 2048
+#define MAX_ENVC 64
+#define MAX_ENV_LEN 256
+#define MAX_WORKDIR_LEN 256
+#define MAX_REQUEST 8192
 #define MAX_FRAME_PAYLOAD 4096
 #define REPLAY_CAP 65536
 #define SESSION_ID "default"
@@ -786,6 +789,53 @@ static int parse_argv(const char *req, char storage[MAX_ARGC][MAX_ARG_LEN], char
   }
 }
 
+static const char *find_field_value(const char *req, const char *name) {
+  char key[64];
+  snprintf(key, sizeof(key), "\"%s\"", name);
+  size_t key_len = strlen(key);
+  const char *p = req;
+  while ((p = strstr(p, key)) != NULL) {
+    const char *value = skip_ws(p + key_len);
+    if (*value == ':') return skip_ws(value + 1);
+    p += key_len;
+  }
+  return NULL;
+}
+
+static int parse_env(const char *req, char storage[MAX_ENVC][MAX_ENV_LEN], char *envp[MAX_ENVC + 1]) {
+  const char *p = find_field_value(req, "env");
+  if (p == NULL) {
+    envp[0] = NULL;
+    return 0;
+  }
+  if (*p != '[') return -1;
+  p++;
+
+  int envc = 0;
+  for (;;) {
+    p = skip_ws(p);
+    if (*p == ']') {
+      envp[envc] = NULL;
+      return envc;
+    }
+    if (envc >= MAX_ENVC) return -1;
+    if (parse_json_string(&p, storage[envc], MAX_ENV_LEN) != 0) return -1;
+    envp[envc] = storage[envc];
+    envc++;
+
+    p = skip_ws(p);
+    if (*p == ',') {
+      p++;
+      continue;
+    }
+    if (*p == ']') {
+      envp[envc] = NULL;
+      return envc;
+    }
+    return -1;
+  }
+}
+
 enum request_kind {
   REQUEST_START,
   REQUEST_ATTACH,
@@ -800,27 +850,20 @@ struct run_request {
   char generation_params[GEN_PARAMS_MAX];
   char arg_storage[MAX_ARGC][MAX_ARG_LEN];
   char *argv[MAX_ARGC + 1];
+  char env_storage[MAX_ENVC][MAX_ENV_LEN];
+  char *envp[MAX_ENVC + 1];
+  char working_dir[MAX_WORKDIR_LEN];
 };
 
 static int parse_string_field(const char *req, const char *name, char *out, size_t cap) {
-  char key[64];
-  snprintf(key, sizeof(key), "\"%s\"", name);
-  const char *p = strstr(req, key);
+  const char *p = find_field_value(req, name);
   if (p == NULL) return 0;
-  p = strchr(p, ':');
-  if (p == NULL) return -1;
-  p = skip_ws(p + 1);
   return parse_json_string(&p, out, cap) == 0 ? 1 : -1;
 }
 
 static int parse_u64_field(const char *req, const char *name, uint64_t *out) {
-  char key[64];
-  snprintf(key, sizeof(key), "\"%s\"", name);
-  const char *p = strstr(req, key);
+  const char *p = find_field_value(req, name);
   if (p == NULL) return 0;
-  p = strchr(p, ':');
-  if (p == NULL) return -1;
-  p = skip_ws(p + 1);
   errno = 0;
   char *end = NULL;
   unsigned long long value = strtoull(p, &end, 10);
@@ -872,6 +915,10 @@ static int parse_request(const char *req, struct run_request *out) {
     if (params_rc <= 0) return -1;
   } else if (out->kind == REQUEST_START) {
     if (parse_argv(req, out->arg_storage, out->argv) <= 0) return -1;
+    if (parse_env(req, out->env_storage, out->envp) < 0) return -1;
+    int working_dir_rc = parse_string_field(req, "working_dir", out->working_dir, sizeof(out->working_dir));
+    if (working_dir_rc < 0) return -1;
+    if (working_dir_rc == 0) out->working_dir[0] = '\0';
   }
   return 0;
 }
@@ -881,7 +928,7 @@ static int send_error_exit(int fd, int code, const char *message) {
   return send_exit_frame(fd, code);
 }
 
-static int start_session(struct session *session, const char *session_id, char *const argv[], int use_rootfs) {
+static int start_session(struct session *session, const char *session_id, char *const argv[], char *const envp[], const char *working_dir, int use_rootfs) {
   t_command_start = now_ms();
   int stdout_pipe[2];
   int stderr_pipe[2];
@@ -914,10 +961,11 @@ static int start_session(struct session *session, const char *session_id, char *
     close(stderr_pipe[1]);
     if (use_rootfs) {
       if (chroot("/mnt/rootfs") != 0) _exit(126);
-      if (chdir("/") != 0) _exit(126);
     }
+    const char *cwd = working_dir[0] != '\0' ? working_dir : "/";
+    if (chdir(cwd) != 0) _exit(126);
     char *const empty_env[] = { NULL };
-    execve(argv[0], argv, empty_env);
+    execve(argv[0], argv, envp[0] != NULL ? envp : empty_env);
     _exit(127);
   }
   close(stdout_pipe[1]);
@@ -1134,7 +1182,7 @@ static void accept_request(int listener, struct session *session, struct client 
       close_client(client);
       return;
     }
-    int rc = start_session(session, request.session_id, request.argv, use_rootfs);
+    int rc = start_session(session, request.session_id, request.argv, request.envp, request.working_dir, use_rootfs);
     if (rc != 0) {
       (void)send_error_exit(client->fd, rc, "spore run: exec setup failed\n");
       close_client(client);

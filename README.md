@@ -306,9 +306,9 @@ For local Docker buildx output without a registry push, import an OCI layout
 with `spore rootfs import-oci ... --ref local/name:tag`, then run with
 `spore run --image local/name:tag`.
 
-`--image` still runs the explicit argv after `--`. It does not apply OCI
-Entrypoint, Cmd, User, Env, or Workdir yet. Set `SPOREVM_ROOTFS_CACHE_DIR` to
-override the cache directory.
+`--image` still runs the explicit argv after `--`. It applies OCI image `Env`
+and `WorkingDir` when present, but does not apply OCI Entrypoint, Cmd, or User.
+Set `SPOREVM_ROOTFS_CACHE_DIR` to override the cache directory.
 
 On default macOS APFS, SporeVM uses managed case-sensitive staging for OCI
 rootfs materialization; the final rootfs cache remains ordinary ext4/json files.
