@@ -43,6 +43,10 @@ read-only rootfs execution path:
 spore run --image docker.io/library/alpine:3.20 -- /bin/echo hi
 ```
 
+`--image` runs the explicit argv after `--`, with OCI image `Env` and
+`WorkingDir` applied when present. It does not apply OCI Entrypoint, Cmd, or
+User.
+
 The rootfs cache key includes the resolved digest-pinned image ref, target
 platform, and rootfs builder version. Mutable tag inputs also get a small local
 ref record, so a warm `spore run --image docker.io/library/alpine:3.20` can go

@@ -90,8 +90,9 @@ spore run --image docker.io/library/alpine:3.20 -- /bin/echo hi
 ```
 
 `--image` remains explicit. `spore run docker.io/library/alpine:3.20 ...` is not
-an image shorthand, and SporeVM does not apply OCI Entrypoint, Cmd, User, Env, or
-Workdir semantics in this bridge.
+an image shorthand. SporeVM applies OCI image `Env` and `WorkingDir` when they
+are present; it does not apply OCI Entrypoint, Cmd, or User semantics in this
+bridge.
 
 Capture a running workload on exit or on a host signal:
 
@@ -162,7 +163,7 @@ mint child spores with `spore fork`, then resume them individually or through
 
 ## What Stayed Out
 
-- OCI Entrypoint, Cmd, User, Env, Workdir, workspace, secret, and network policy.
+- OCI Entrypoint, Cmd, User, workspace, secret, and network policy.
 - Writable cached rootfs or persisted disk mutation.
 - Bundle-aware initial workload input. Bundles distribute spores, not first-run
   images.

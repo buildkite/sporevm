@@ -33,7 +33,10 @@ const max_kernel_config_asset_size = 2 * 1024 * 1024;
 const managed_kernel_download_attempts = 3;
 const max_guest_argc = 16;
 const max_guest_arg_len = 255;
-const max_guest_request_len = 2047;
+const max_guest_envc = 64;
+const max_guest_env_len = 255;
+const max_guest_working_dir_len = 255;
+const max_guest_request_len = 8191;
 const max_guest_port = 65535;
 const default_run_initrd_name = "minimal-exec-initrd.cpio";
 const default_kernel_repository = "buildkite/cleanroom-kernels";
@@ -89,6 +92,8 @@ pub const Options = struct {
     disk: ?spore.Disk = null,
     resume_dir: ?[]const u8 = null,
     command: []const []const u8,
+    guest_env: []const []const u8 = &.{},
+    guest_working_dir: ?[]const u8 = null,
     memory: memory_config.Config = .{},
     vcpus: u32 = 1,
     guest_port: u32 = 10700,
@@ -626,6 +631,8 @@ fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parse
     const kernel_path = parsed.shared.kernel_path orelse try resolveDefaultKernelPath(init, allocator);
     const initrd_path = parsed.shared.initrd_path orelse try resolveDefaultInitrdPath(init, allocator);
     var opts = parsed.shared.completeWithAssets(parsed.backend, kernel_path, initrd_path, rootfs.path, rootfs.rootfs, parsed.command, true);
+    opts.guest_env = rootfs.guest_env;
+    opts.guest_working_dir = rootfs.guest_working_dir;
     opts.capture_path = parsed.capture_path;
     opts.capture_trigger = parsed.capture_trigger;
     opts.continue_after_capture = parsed.continue_after_capture;
@@ -746,6 +753,8 @@ const RootfsInputOptions = struct {
 const ResolvedRootfsInput = struct {
     path: ?[]const u8,
     rootfs: ?spore.Rootfs = null,
+    guest_env: []const []const u8 = &.{},
+    guest_working_dir: ?[]const u8 = null,
 };
 
 pub fn resolveRootfsInput(
@@ -835,7 +844,13 @@ fn resolvedImageRootfsInput(
     rootfs_path: []const u8,
     record_artifact: bool,
 ) !ResolvedRootfsInput {
-    if (!record_artifact) return .{ .path = rootfs_path };
+    const metadata_path = try cachedImageRootfsMetadataPath(allocator, cache_root, resolved);
+    const run_config = try readCachedImageRunConfig(init.io, allocator, metadata_path);
+    if (!record_artifact) return .{
+        .path = rootfs_path,
+        .guest_env = run_config.env,
+        .guest_working_dir = run_config.working_dir,
+    };
     const artifact = try cacheRootfsByDigest(init, allocator, cache_root, rootfs_path);
     const rootfs_device = spore.RootfsDevice{ .mmio_slot = 1 };
     const storage = try ensureImageRootfsStorage(init, allocator, cache_root, resolved, artifact, rootfs_device, "run");
@@ -855,7 +870,58 @@ fn resolvedImageRootfsInput(
                 .builder_version = rootfs_mod.builder_version,
             },
         },
+        .guest_env = run_config.env,
+        .guest_working_dir = run_config.working_dir,
     };
+}
+
+const ImageRunConfig = struct {
+    env: []const []const u8 = &.{},
+    working_dir: ?[]const u8 = null,
+};
+
+const CachedImageRunMetadata = struct {
+    config: ?CachedImageConfig = null,
+};
+
+const CachedImageConfig = struct {
+    config: ?CachedRuntimeConfig = null,
+};
+
+const CachedRuntimeConfig = struct {
+    Env: ?[][]const u8 = null,
+    WorkingDir: ?[]const u8 = null,
+};
+
+fn readCachedImageRunConfig(io: Io, allocator: std.mem.Allocator, metadata_path: []const u8) !ImageRunConfig {
+    const metadata = Io.Dir.cwd().readFileAlloc(io, metadata_path, allocator, .limited(max_rootfs_metadata_bytes)) catch |err| switch (err) {
+        error.FileNotFound, error.StreamTooLong => return .{},
+        else => |e| return e,
+    };
+    defer allocator.free(metadata);
+    var parsed = std.json.parseFromSlice(CachedImageRunMetadata, allocator, metadata, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch return .{};
+    defer parsed.deinit();
+
+    const image_config = parsed.value.config orelse return .{};
+    const runtime = image_config.config orelse return .{};
+    const env = if (runtime.Env) |entries| try cloneStringList(allocator, entries) else &.{};
+    const working_dir = if (runtime.WorkingDir) |dir|
+        if (dir.len == 0) null else try allocator.dupe(u8, dir)
+    else
+        null;
+    return .{ .env = env, .working_dir = working_dir };
+}
+
+fn cloneStringList(allocator: std.mem.Allocator, entries: []const []const u8) ![]const []const u8 {
+    if (entries.len == 0) return &.{};
+    const cloned = try allocator.alloc([]const u8, entries.len);
+    for (entries, 0..) |entry, i| {
+        cloned[i] = try allocator.dupe(u8, entry);
+    }
+    return cloned;
 }
 
 fn ensureImageRootfsStorage(
@@ -2120,24 +2186,44 @@ pub fn execRequest(allocator: std.mem.Allocator, argv: []const []const u8) ![]co
 }
 
 fn execRequestForRun(init: std.process.Init, allocator: std.mem.Allocator, opts: Options) ![]const u8 {
-    if (opts.resume_dir == null) return execRequest(allocator, opts.command);
+    if (opts.resume_dir == null) return execRequestWithSessionOptions(allocator, opts.command, "default", .{
+        .env = opts.guest_env,
+        .working_dir = opts.guest_working_dir,
+    });
 
     const now = Io.Clock.real.now(init.io).nanoseconds;
     var nonce_bytes: [8]u8 = undefined;
     init.io.random(&nonce_bytes);
     const nonce = std.mem.readInt(u64, &nonce_bytes, .little);
     const session_id = try std.fmt.allocPrint(allocator, "run-{x}-{x}", .{ now, nonce });
-    return execRequestWithSession(allocator, opts.command, session_id);
+    return execRequestWithSessionOptions(allocator, opts.command, session_id, .{});
 }
 
 pub fn execRequestWithSession(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8) ![]const u8 {
+    return execRequestWithSessionOptions(allocator, argv, session_id, .{});
+}
+
+const GuestExecOptions = struct {
+    env: []const []const u8 = &.{},
+    working_dir: ?[]const u8 = null,
+};
+
+fn execRequestWithSessionOptions(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, options: GuestExecOptions) ![]const u8 {
     try validateGuestArgv(argv);
+    try validateGuestExecOptions(options);
     const payload = struct {
         type: []const u8 = "start",
         session_id: []const u8,
         argv: []const []const u8,
+        env: []const []const u8,
+        working_dir: []const u8,
         closed_env: bool = true,
-    }{ .session_id = session_id, .argv = argv };
+    }{
+        .session_id = session_id,
+        .argv = argv,
+        .env = options.env,
+        .working_dir = options.working_dir orelse "",
+    };
     const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(json);
     if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
@@ -2309,6 +2395,16 @@ fn validateGuestArgv(argv: []const []const u8) !void {
     }
 }
 
+fn validateGuestExecOptions(options: GuestExecOptions) !void {
+    if (options.env.len > max_guest_envc) return error.RunEnvCountUnsupported;
+    for (options.env) |entry| {
+        if (entry.len > max_guest_env_len) return error.RunEnvTooLong;
+    }
+    if (options.working_dir) |dir| {
+        if (dir.len == 0 or dir.len > max_guest_working_dir_len) return error.RunWorkingDirUnsupported;
+    }
+}
+
 fn parseSharedOption(shared: *SharedOptions, args: []const []const u8, i: *usize) !bool {
     const name = args[i.*];
     if (std.mem.eql(u8, name, "--kernel")) {
@@ -2346,13 +2442,76 @@ fn takeValue(args: []const []const u8, i: *usize, name: []const u8) []const u8 {
 test "run request encodes argv" {
     const request = try execRequest(std.testing.allocator, &.{ "/bin/echo", "hello world" });
     defer std.testing.allocator.free(request);
-    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"default\",\"argv\":[\"/bin/echo\",\"hello world\"],\"closed_env\":true}\n", request);
+    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"default\",\"argv\":[\"/bin/echo\",\"hello world\"],\"env\":[],\"working_dir\":\"\",\"closed_env\":true}\n", request);
 }
 
 test "run request can encode explicit session id" {
     const request = try execRequestWithSession(std.testing.allocator, &.{"/bin/true"}, "lifecycle-42");
     defer std.testing.allocator.free(request);
-    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"lifecycle-42\",\"argv\":[\"/bin/true\"],\"closed_env\":true}\n", request);
+    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"lifecycle-42\",\"argv\":[\"/bin/true\"],\"env\":[],\"working_dir\":\"\",\"closed_env\":true}\n", request);
+}
+
+test "run request encodes image env and working directory" {
+    const request = try execRequestWithSessionOptions(std.testing.allocator, &.{ "/bin/sh", "-lc", "env && pwd" }, "default", .{
+        .env = &.{ "GEM_HOME=/usr/local/bundle", "RUBYOPT=--yjit" },
+        .working_dir = "/app",
+    });
+    defer std.testing.allocator.free(request);
+    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"default\",\"argv\":[\"/bin/sh\",\"-lc\",\"env && pwd\"],\"env\":[\"GEM_HOME=/usr/local/bundle\",\"RUBYOPT=--yjit\"],\"working_dir\":\"/app\",\"closed_env\":true}\n", request);
+}
+
+test "image rootfs metadata supplies run env and working directory" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-run-image-config";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, cache_root);
+
+    const resolved = rootfs_mod.ResolvedImage{
+        .ref = "local/buildkite-spore@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .manifest_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .platform = .{},
+    };
+    const metadata_path = try cachedImageRootfsMetadataPath(arena, cache_root, resolved);
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = metadata_path,
+        .data =
+        \\{
+        \\  "config": {
+        \\    "architecture": "arm64",
+        \\    "os": "linux",
+        \\    "config": {
+        \\      "Env": ["GEM_HOME=/usr/local/bundle", "BUNDLE_APP_CONFIG=/usr/local/bundle"],
+        \\      "WorkingDir": "/app"
+        \\    }
+        \\  }
+        \\}
+        ,
+    });
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var process_arena = std.heap.ArenaAllocator.init(allocator);
+    defer process_arena.deinit();
+    const init = std.process.Init{
+        .minimal = undefined,
+        .arena = &process_arena,
+        .gpa = allocator,
+        .io = io,
+        .environ_map = &env,
+        .preopens = .empty,
+    };
+
+    const input = try resolvedImageRootfsInput(init, arena, cache_root, "local/buildkite-spore:ci", resolved, tmp ++ "/rootfs.ext4", false);
+    try std.testing.expectEqual(@as(usize, 2), input.guest_env.len);
+    try std.testing.expectEqualStrings("GEM_HOME=/usr/local/bundle", input.guest_env[0]);
+    try std.testing.expectEqualStrings("BUNDLE_APP_CONFIG=/usr/local/bundle", input.guest_env[1]);
+    try std.testing.expectEqualStrings("/app", input.guest_working_dir.?);
 }
 
 test "generation request encodes params json as a string" {
@@ -2439,10 +2598,10 @@ test "run request rejects guest argv length overflow" {
 }
 
 test "run request rejects encoded line overflow" {
-    var arg = [_]u8{'a'} ** 240;
-    var argv: [10][]const u8 = undefined;
-    for (&argv) |*slot| slot.* = arg[0..];
-    try std.testing.expectError(error.RunRequestTooLarge, execRequest(std.testing.allocator, &argv));
+    var env_entry = [_]u8{'A'} ** max_guest_env_len;
+    var env: [max_guest_envc][]const u8 = undefined;
+    for (&env) |*slot| slot.* = env_entry[0..];
+    try std.testing.expectError(error.RunRequestTooLarge, execRequestWithSessionOptions(std.testing.allocator, &.{"/bin/true"}, "default", .{ .env = &env }));
 }
 
 fn testDiskGuardManifest(with_disk: bool) spore.Manifest {
