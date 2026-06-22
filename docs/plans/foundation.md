@@ -82,6 +82,7 @@ spore run --image ruby-demo --capture ruby-counter.spore --capture-on USR1 -- ru
 spore fork ruby-counter.spore --count 10000 --out forks/
 spore fanout forks/ --parallel --for 20s
 
+export SPOREVM_EXPERIMENTAL_MONITOR=1
 spore create bench-1 --image docker.io/library/node:22-alpine
 spore exec bench-1 -- /bin/sh -lc 'node -v'
 spore suspend bench-1 --out bench-1.spore
@@ -115,7 +116,7 @@ contract.
 | Slice 1: KVM boot | Complete for the foundation target | Continue using KVM hardware smokes for regressions. |
 | Slice 2: HVF boot | Complete for the foundation target | Continue using Apple Silicon smokes for regressions. |
 | Product run bridge | Landed | See `docs/plans/run-bridge.md`; future OCI/writable policy is out of this plan. |
-| Named lifecycle | Local HVF landed; KVM create/exec/ls/rm parity landed | Speed work including local image ref caching, KVM suspend/resume evidence, and disk-backed lifecycle resume; see `docs/plans/lifecycle-monitor.md`. |
+| Named lifecycle | Experimental behind `SPOREVM_EXPERIMENTAL_MONITOR=1`; local HVF landed; KVM create/exec/ls/rm parity landed | Real monitor jailing before stable lifecycle support; speed work including local image ref caching, KVM suspend/resume evidence, and disk-backed lifecycle resume; see `docs/plans/lifecycle-monitor.md`. |
 | Slice 3: same-backend suspend/restore | Complete for KVM and HVF | Keep writable disk product smoke coverage as regression evidence. |
 | Slice 4: fork and generation protocol | Complete for correctness | `/run/sporevm` is the live metadata contract; keep fan-out identity smokes as regression coverage. |
 | Slice 5: same-host RAM and lazy restore | Complete for primary KVM/HVF proofs | Product monitor wiring, readahead, KVM pager hardening, larger macOS scale runs. |
@@ -317,7 +318,8 @@ SporeVM is an isolation boundary written in Zig. The defensive posture is:
 - fail-closed platform and artifact checks;
 - fuzz targets with new attacker-influenced parsers;
 - ReleaseSafe shipping builds;
-- monitor jailing before public release.
+- monitor lifecycle disabled by default until Linux seccomp and macOS sandbox
+  jailing land.
 
 `SECURITY.md` is the attack-surface inventory and must be updated in the same
 change that widens parsing, device, manifest, rootfs, bundle, or control-socket
@@ -354,8 +356,9 @@ inputs.
 - Local `spore pull file://...` fully materializes a selected child before
   product resume; remote and lazy pull sources must keep the same verified
   content-source boundary.
-- `spore run` is one-shot; named lifecycle uses `create`/`exec`/`rm`/`ls` plus
-  monitor-backed suspend/resume.
+- `spore run` is one-shot; experimental named lifecycle uses
+  `create`/`exec`/`rm`/`ls` plus monitor-backed suspend/resume only when
+  `SPOREVM_EXPERIMENTAL_MONITOR=1`.
 - Product capture is `spore run --capture`, not a separate capture verb.
 - Same-host fan-out must use explicit RAM-backing transfer and private mappings
   before claiming high-concurrency memory efficiency.

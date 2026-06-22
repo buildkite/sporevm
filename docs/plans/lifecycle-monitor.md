@@ -22,10 +22,11 @@ related_plans:
 
 ## Summary
 
-Local named-VM lifecycle has landed for HVF and KVM create/exec/ls/rm. SporeVM
-can create a named VM, keep it alive in one per-VM monitor process, execute
-multiple commands over the guest agent, and list/remove it through a private
-runtime registry. Local HVF also has diskless lifecycle suspend/resume evidence.
+Local named-VM lifecycle has landed behind `SPOREVM_EXPERIMENTAL_MONITOR=1` for
+HVF and KVM create/exec/ls/rm. SporeVM can create a named VM, keep it alive in
+one per-VM monitor process, execute multiple commands over the guest agent, and
+list/remove it through a private runtime registry. Local HVF also has diskless
+lifecycle suspend/resume evidence.
 
 The active work is no longer the CLI shape. It is speed and parity:
 tag-resolution caching, rootfs-path benchmark isolation, exec timing breakdowns,
@@ -34,6 +35,7 @@ KVM suspend/resume evidence, and disk-backed lifecycle suspend/resume.
 ## Landed Product Contract
 
 ```console
+export SPOREVM_EXPERIMENTAL_MONITOR=1
 spore create bench-1 --image docker.io/library/alpine:3.20
 spore exec bench-1 -- /bin/echo hi
 spore exec bench-1 -- /bin/sh -lc 'cat /proc/sys/kernel/random/boot_id'
@@ -41,11 +43,13 @@ spore rm bench-1
 ```
 
 `spore run` remains the one-shot convenience command. Named lifecycle commands
-are for workflows that need one live guest identity across multiple commands.
+are experimental and opt-in because the monitor is not jailed in the default
+1.0 surface.
 
 Future suspend/resume extends the same named-VM model:
 
 ```console
+export SPOREVM_EXPERIMENTAL_MONITOR=1
 spore suspend bench-1 --out bench-1.spore
 spore resume bench-1.spore --name bench-2
 ```
@@ -62,9 +66,10 @@ policy, secrets, egress, mounts, workspace semantics, and scheduling.
 
 ## Current State
 
-- `spore create`, `spore exec`, `spore rm`, and `spore ls` use a private runtime
-  registry under `SPOREVM_RUNTIME_DIR`, `$XDG_RUNTIME_DIR/sporevm`, or a private
-  temp fallback.
+- `spore create`, `spore exec`, `spore rm`, `spore ls`, `spore monitor`, and
+  named `spore resume` require `SPOREVM_EXPERIMENTAL_MONITOR=1`.
+- They use a private runtime registry under `SPOREVM_RUNTIME_DIR`,
+  `$XDG_RUNTIME_DIR/sporevm`, or a private temp fallback.
 - VM names are explicit and restricted to a conservative path-safe set.
 - One per-VM monitor owns the hypervisor VM, vCPU loop, virtio state, rootfs fd,
   console log, vsock state, and newline-delimited JSON control socket.

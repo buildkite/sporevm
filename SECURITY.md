@@ -37,7 +37,7 @@ fuzz targets from the slice that introduces it:
 | `spore run` exit frames | guest vsock stream | bounded host buffer; exit/timing string parser is unit and fuzz covered; malformed frames fail the run |
 | OCI manifest, OCI layout, and layer decode | registry, local OCI layout | rootfs builder only, outside the monitor process; mutable tags are resolved into digest-pinned refs before build materialization, local refs resolve to digest-pinned local identities, blobs are verified, layout tar extraction and layer tar application are path-safe, PAX xattr handling is bounded and limited to deliberately supported capability records, and JSON/tar fuzz targets cover parser inputs |
 | Generation device inputs | guest | MMIO register surface and fork/resume params schema are fuzz/unit covered |
-| Control socket JSON | local consumers | local-only lifecycle monitor protocol is implemented for HVF and KVM; malformed requests fail closed and the socket is protected by private runtime-directory permissions |
+| Control socket JSON | local consumers | local-only lifecycle monitor protocol is implemented for HVF and KVM but disabled from the default 1.0 CLI surface unless `SPOREVM_EXPERIMENTAL_MONITOR=1` is set; malformed requests fail closed and the socket is protected by private runtime-directory permissions |
 
 ## Structural Rules
 
@@ -48,9 +48,9 @@ fuzz targets from the slice that introduces it:
   parsed. A malicious peer can deny service, never inject state.
 - **Fail closed.** Unknown manifest versions, unsatisfiable platform
   contracts, and unverifiable chunks are errors, never degraded behavior.
-- **The monitor process is jailed** before the first release: seccomp
-  allowlist on Linux, sandbox profile and minimal entitlements on macOS.
-  Jail profiles are tested by attempting denied operations.
+- **The unjailed monitor is not in the default 1.0 surface.** Named lifecycle
+  commands require `SPOREVM_EXPERIMENTAL_MONITOR=1` until the monitor has a
+  Linux seccomp allowlist and macOS sandbox profile with denied-operation tests.
 - **The device model stays minimal.** Every device addition expands both the
   attack surface and the portability contract, and requires editing
   docs/plans/foundation.md.
