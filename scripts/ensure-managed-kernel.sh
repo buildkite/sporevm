@@ -17,7 +17,7 @@ Kinds:
 
 Environment:
   SPOREVM_KERNEL_IMAGE       explicit local Image path; skips download
-  SPOREVM_KERNEL_RELEASE     cleanroom-kernels release tag (default: v0.5.1)
+  SPOREVM_KERNEL_RELEASE     cleanroom-kernels release tag (default: v0.5.2)
   SPOREVM_KERNEL_VERSION     Linux version in the asset name (default: 6.1.155)
   SPOREVM_KERNEL_REPOSITORY  GitHub repo (default: buildkite/cleanroom-kernels)
   SPOREVM_KERNEL_CACHE_DIR   cache directory override
@@ -61,6 +61,8 @@ sha256_file() {
 required_run_config_symbols=(
   CONFIG_CGROUPS
   CONFIG_FILE_LOCKING
+  CONFIG_HW_RANDOM
+  CONFIG_HW_RANDOM_VIRTIO
   CONFIG_SHMEM
   CONFIG_TMPFS
   CONFIG_FSNOTIFY
@@ -146,7 +148,7 @@ if [[ -n "${SPOREVM_KERNEL_IMAGE:-}" ]]; then
   exit 0
 fi
 
-release="${SPOREVM_KERNEL_RELEASE:-v0.5.1}"
+release="${SPOREVM_KERNEL_RELEASE:-v0.5.2}"
 linux_version="${SPOREVM_KERNEL_VERSION:-6.1.155}"
 repo="${SPOREVM_KERNEL_REPOSITORY:-buildkite/cleanroom-kernels}"
 
