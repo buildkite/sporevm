@@ -56,6 +56,7 @@
 #define REG_IRQ_STATUS 0x010U
 #define REG_IRQ_ACK 0x014U
 #define REG_GENERATION 0x018U
+#define NSEC_PER_SEC 1000000000ULL
 
 struct sockaddr_vm {
   sa_family_t svm_family;
@@ -115,6 +116,16 @@ static int64_t now_ms(void) {
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
   }
   return 0;
+}
+
+static void apply_resume_clock(uint64_t unix_ns) {
+  if (unix_ns == 0) return;
+  struct timespec ts;
+  ts.tv_sec = (time_t)(unix_ns / NSEC_PER_SEC);
+  ts.tv_nsec = (long)(unix_ns % NSEC_PER_SEC);
+  if (clock_settime(CLOCK_REALTIME, &ts) != 0) {
+    dprintf(2, "spore generation: clock_settime failed errno=%d\n", errno);
+  }
 }
 
 static void mount_proc(void) {
@@ -578,6 +589,10 @@ static void apply_generation_identity(const char *params) {
   if (parse_string_field(params, "hostname", hostname, sizeof(hostname)) > 0 && hostname[0] != '\0') {
     (void)sethostname(hostname, strlen(hostname));
   }
+  uint64_t resume_time_unix_ns = 0;
+  if (parse_u64_field(params, "resume_time_unix_ns", &resume_time_unix_ns) > 0) {
+    apply_resume_clock(resume_time_unix_ns);
+  }
 }
 
 static void poll_generation(struct generation_monitor *monitor, const char *root) {
@@ -850,6 +865,7 @@ struct run_request {
   char session_id[64];
   uint64_t stdout_offset;
   uint64_t stderr_offset;
+  uint64_t resume_time_unix_ns;
   char generation_params[GEN_PARAMS_MAX];
   char arg_storage[MAX_ARGC][MAX_ARG_LEN];
   char *argv[MAX_ARGC + 1];
@@ -912,6 +928,10 @@ static int parse_request(const char *req, struct run_request *out) {
   int stderr_rc = parse_u64_field(req, "stderr_offset", &offset);
   if (stderr_rc < 0) return -1;
   if (stderr_rc > 0) out->stderr_offset = offset;
+  uint64_t resume_time_unix_ns = 0;
+  int resume_time_rc = parse_u64_field(req, "resume_time_unix_ns", &resume_time_unix_ns);
+  if (resume_time_rc < 0) return -1;
+  if (resume_time_rc > 0) out->resume_time_unix_ns = resume_time_unix_ns;
 
   if (out->kind == REQUEST_GENERATION) {
     int params_rc = parse_string_field(req, "params_json", out->generation_params, sizeof(out->generation_params));
@@ -1247,6 +1267,7 @@ static void accept_request(int listener, struct session *session, struct client 
       close_client(client);
       return;
     }
+    apply_resume_clock(request.resume_time_unix_ns);
     int rc = start_session(session, request.session_id, request.argv, request.envp, request.working_dir, use_rootfs, file_stdio);
     if (rc != 0) {
       (void)send_error_exit(client->fd, rc, "spore run: exec setup failed\n");

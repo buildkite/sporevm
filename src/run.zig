@@ -1898,9 +1898,11 @@ pub fn execRequest(allocator: std.mem.Allocator, argv: []const []const u8) ![]co
 }
 
 fn execRequestForRun(init: std.process.Init, allocator: std.mem.Allocator, opts: Options) ![]const u8 {
+    const resume_time_unix_ns: u64 = @intCast(Io.Clock.real.now(init.io).nanoseconds);
     if (opts.resume_dir == null) return execRequestWithSessionOptions(allocator, opts.command, "default", .{
         .env = opts.guest_env,
         .working_dir = opts.guest_working_dir,
+        .resume_time_unix_ns = resume_time_unix_ns,
     });
 
     const now = Io.Clock.real.now(init.io).nanoseconds;
@@ -1908,7 +1910,9 @@ fn execRequestForRun(init: std.process.Init, allocator: std.mem.Allocator, opts:
     init.io.random(&nonce_bytes);
     const nonce = std.mem.readInt(u64, &nonce_bytes, .little);
     const session_id = try std.fmt.allocPrint(allocator, "run-{x}-{x}", .{ now, nonce });
-    return execRequestWithSessionOptions(allocator, opts.command, session_id, .{});
+    return execRequestWithSessionOptions(allocator, opts.command, session_id, .{
+        .resume_time_unix_ns = resume_time_unix_ns,
+    });
 }
 
 pub fn execRequestWithSession(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8) ![]const u8 {
@@ -1918,6 +1922,7 @@ pub fn execRequestWithSession(allocator: std.mem.Allocator, argv: []const []cons
 const GuestExecOptions = struct {
     env: []const []const u8 = &.{},
     working_dir: ?[]const u8 = null,
+    resume_time_unix_ns: u64 = 0,
 };
 
 fn execRequestWithSessionOptions(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, options: GuestExecOptions) ![]const u8 {
@@ -1926,12 +1931,14 @@ fn execRequestWithSessionOptions(allocator: std.mem.Allocator, argv: []const []c
     const payload = struct {
         type: []const u8 = "start",
         session_id: []const u8,
+        resume_time_unix_ns: u64,
         argv: []const []const u8,
         env: []const []const u8,
         working_dir: []const u8,
         closed_env: bool = true,
     }{
         .session_id = session_id,
+        .resume_time_unix_ns = options.resume_time_unix_ns,
         .argv = argv,
         .env = options.env,
         .working_dir = options.working_dir orelse "",
@@ -2154,22 +2161,23 @@ fn takeValue(args: []const []const u8, i: *usize, name: []const u8) []const u8 {
 test "run request encodes argv" {
     const request = try execRequest(std.testing.allocator, &.{ "/bin/echo", "hello world" });
     defer std.testing.allocator.free(request);
-    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"default\",\"argv\":[\"/bin/echo\",\"hello world\"],\"env\":[],\"working_dir\":\"\",\"closed_env\":true}\n", request);
+    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"default\",\"resume_time_unix_ns\":0,\"argv\":[\"/bin/echo\",\"hello world\"],\"env\":[],\"working_dir\":\"\",\"closed_env\":true}\n", request);
 }
 
 test "run request can encode explicit session id" {
     const request = try execRequestWithSession(std.testing.allocator, &.{"/bin/true"}, "lifecycle-42");
     defer std.testing.allocator.free(request);
-    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"lifecycle-42\",\"argv\":[\"/bin/true\"],\"env\":[],\"working_dir\":\"\",\"closed_env\":true}\n", request);
+    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"lifecycle-42\",\"resume_time_unix_ns\":0,\"argv\":[\"/bin/true\"],\"env\":[],\"working_dir\":\"\",\"closed_env\":true}\n", request);
 }
 
 test "run request encodes image env and working directory" {
     const request = try execRequestWithSessionOptions(std.testing.allocator, &.{ "/bin/sh", "-lc", "env && pwd" }, "default", .{
         .env = &.{ "GEM_HOME=/usr/local/bundle", "RUBYOPT=--yjit" },
         .working_dir = "/app",
+        .resume_time_unix_ns = 123,
     });
     defer std.testing.allocator.free(request);
-    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"default\",\"argv\":[\"/bin/sh\",\"-lc\",\"env && pwd\"],\"env\":[\"GEM_HOME=/usr/local/bundle\",\"RUBYOPT=--yjit\"],\"working_dir\":\"/app\",\"closed_env\":true}\n", request);
+    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"default\",\"resume_time_unix_ns\":123,\"argv\":[\"/bin/sh\",\"-lc\",\"env && pwd\"],\"env\":[\"GEM_HOME=/usr/local/bundle\",\"RUBYOPT=--yjit\"],\"working_dir\":\"/app\",\"closed_env\":true}\n", request);
 }
 
 test "image rootfs metadata supplies run env and working directory" {
