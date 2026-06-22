@@ -239,9 +239,9 @@ under `rootfs.cache`.
 - Multi-vCPU machine state.
 - Kernel identity in the platform contract (pinned-build enforcement).
 - Durable disk/device identity fixup beyond the current diskless helper. The
-  fork-aware smoke initrd consumes generation params for hostname, machine-id,
-  MAC, entropy, and clock fixups, but the product guest-agent contract for
-  disk-backed workloads is not final.
+  product initrd consumes generation params for hostname and applies
+  host-provided start/resume time to the guest clock, but machine-id, MAC,
+  entropy, and other disk-backed workload fixups are not final.
 - Cross-frequency architected timer restore: v0 records and enforces the
   counter frequency, but cannot translate a running Linux guest between
   different `CNTFRQ_EL0` domains.
