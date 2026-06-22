@@ -40,11 +40,13 @@ const max_guest_request_len = 8191;
 const max_guest_port = 65535;
 const default_run_initrd_name = "minimal-exec-initrd.cpio";
 const default_kernel_repository = "buildkite/cleanroom-kernels";
-const default_kernel_release = "v0.5.1";
+const default_kernel_release = "v0.5.2";
 const default_kernel_version = "6.1.155";
 const managed_run_kernel_required_config_symbols = [_][]const u8{
     "CONFIG_CGROUPS",
     "CONFIG_FILE_LOCKING",
+    "CONFIG_HW_RANDOM",
+    "CONFIG_HW_RANDOM_VIRTIO",
     "CONFIG_SHMEM",
     "CONFIG_TMPFS",
     "CONFIG_FSNOTIFY",
@@ -1181,7 +1183,7 @@ fn resolveManagedRunKernelPath(init: std.process.Init, allocator: std.mem.Alloca
     if (try missingManagedRunKernelConfigSymbolFromPath(init.io, allocator, temp_config)) |missing| {
         defer allocator.free(missing);
         failRunSetup(
-            "spore run: managed run kernel config {s}@{s}:{s} is missing {s}; use cleanroom-kernels v0.5.1 or newer, pass --kernel, or set SPOREVM_KERNEL_RELEASE to a fixed release",
+            "spore run: managed run kernel config {s}@{s}:{s} is missing {s}; use cleanroom-kernels v0.5.2 or newer, pass --kernel, or set SPOREVM_KERNEL_RELEASE to a fixed release",
             .{ opts.repository, opts.release, config_asset, missing },
         );
     }
@@ -2862,6 +2864,8 @@ test "managed kernel cache hit trusts read-only image with checksum sidecar" {
         .sub_path = config_path,
         .data = "CONFIG_FILE_LOCKING=y\n" ++
             "CONFIG_CGROUPS=y\n" ++
+            "CONFIG_HW_RANDOM=y\n" ++
+            "CONFIG_HW_RANDOM_VIRTIO=y\n" ++
             "CONFIG_SHMEM=y\n" ++
             "CONFIG_TMPFS=y\n" ++
             "CONFIG_FSNOTIFY=y\n" ++
@@ -2887,12 +2891,14 @@ test "managed kernel cache hit trusts read-only image with checksum sidecar" {
     try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, bad_sha_path, config_path));
 }
 
-test "managed run kernel config requires Docker runtime symbols" {
+test "managed run kernel config requires Docker runtime and entropy symbols" {
     const allocator = std.testing.allocator;
     const good_config =
         "# CONFIG_DEVMEM is not set\n" ++
         "CONFIG_FILE_LOCKING=y\n" ++
         "CONFIG_CGROUPS=y\n" ++
+        "CONFIG_HW_RANDOM=y\n" ++
+        "CONFIG_HW_RANDOM_VIRTIO=y\n" ++
         "CONFIG_SHMEM=y\n" ++
         "CONFIG_TMPFS=y\n" ++
         "CONFIG_FSNOTIFY=y\n" ++
@@ -2909,6 +2915,8 @@ test "managed run kernel config requires Docker runtime symbols" {
     const missing_file_locking =
         "# CONFIG_FILE_LOCKING is not set\n" ++
         "CONFIG_CGROUPS=y\n" ++
+        "CONFIG_HW_RANDOM=y\n" ++
+        "CONFIG_HW_RANDOM_VIRTIO=y\n" ++
         "CONFIG_SHMEM=y\n" ++
         "CONFIG_TMPFS=y\n" ++
         "CONFIG_FSNOTIFY=y\n" ++
