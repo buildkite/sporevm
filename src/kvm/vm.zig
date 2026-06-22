@@ -153,7 +153,8 @@ const HotplugMapping = struct {
                 .memory_size = 0,
                 .userspace_addr = 0,
             };
-            _ = kvm.ioctl(self.vm_fd, kvm.KVM_SET_USER_MEMORY_REGION, @intFromPtr(&region), "KVM_SET_USER_MEMORY_REGION");
+            _ = kvm.ioctl(self.vm_fd, kvm.KVM_SET_USER_MEMORY_REGION, @intFromPtr(&region), "KVM_SET_USER_MEMORY_REGION") catch |err|
+                std.log.warn("failed to unmap virtio-mem hotplug region: {}", .{err});
         }
         std.posix.munmap(self.bytes);
     }
