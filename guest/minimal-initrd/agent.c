@@ -44,6 +44,8 @@
 #define SPORE_NET_GATEWAY_IP "100.96.0.1"
 #define SPORE_NET_NETMASK "255.255.255.252"
 #define SPORE_NET_RESOLV_CONF "nameserver 100.96.0.1\n"
+#define FILE_STDOUT_PATH "/tmp/spore-run.stdout"
+#define FILE_STDERR_PATH "/tmp/spore-run.stderr"
 #define GEN_BASE 0x0c001000ULL
 #define GEN_WINDOW_SIZE 0x1000U
 #define GEN_MAGIC 0x4e475053U
@@ -87,6 +89,7 @@ struct session {
   int stderr_fd;
   int stdout_open;
   int stderr_open;
+  int file_stdio;
   int exit_code;
   uint64_t stdout_offset;
   uint64_t stderr_offset;
@@ -928,33 +931,85 @@ static int send_error_exit(int fd, int code, const char *message) {
   return send_exit_frame(fd, code);
 }
 
-static int start_session(struct session *session, const char *session_id, char *const argv[], char *const envp[], const char *working_dir, int use_rootfs) {
+static void pump_session_file(struct session *session, struct client *client, int is_stdout) {
+  int fd = is_stdout ? session->stdout_fd : session->stderr_fd;
+  if (fd < 0) return;
+  unsigned char buf[MAX_FRAME_PAYLOAD];
+  const char *name = is_stdout ? "stdout" : "stderr";
+  uint64_t *offset = is_stdout ? &session->stdout_offset : &session->stderr_offset;
+  uint64_t *client_offset = is_stdout ? &client->stdout_offset : &client->stderr_offset;
+  for (;;) {
+    ssize_t n = read(fd, buf, sizeof(buf));
+    if (n > 0) {
+      uint64_t frame_offset = *offset;
+      mirror_console(is_stdout, buf, (size_t)n);
+      *offset += (uint64_t)n;
+      if (client->fd >= 0) (void)send_client_output(client, name, client_offset, frame_offset, buf, (size_t)n);
+      continue;
+    }
+    if (n == 0) return;
+    if (errno == EINTR) continue;
+    return;
+  }
+}
+
+static void close_file_stdio(struct session *session) {
+  if (session->stdout_fd >= 0) {
+    close(session->stdout_fd);
+    session->stdout_fd = -1;
+  }
+  if (session->stderr_fd >= 0) {
+    close(session->stderr_fd);
+    session->stderr_fd = -1;
+  }
+  session->stdout_open = 0;
+  session->stderr_open = 0;
+  unlink(FILE_STDOUT_PATH);
+  unlink(FILE_STDERR_PATH);
+}
+
+static int start_session(struct session *session, const char *session_id, char *const argv[], char *const envp[], const char *working_dir, int use_rootfs, int file_stdio) {
   t_command_start = now_ms();
   int stdout_pipe[2];
   int stderr_pipe[2];
-  if (pipe2(stdout_pipe, O_CLOEXEC) != 0) {
-    t_command_exit = now_ms();
-    return 127;
-  }
-  if (pipe2(stderr_pipe, O_CLOEXEC) != 0) {
-    close(stdout_pipe[0]);
-    close(stdout_pipe[1]);
-    t_command_exit = now_ms();
-    return 127;
-  }
-  if (set_nonblock(stdout_pipe[0]) != 0 || set_nonblock(stderr_pipe[0]) != 0) {
-    close(stdout_pipe[0]);
-    close(stdout_pipe[1]);
-    close(stderr_pipe[0]);
-    close(stderr_pipe[1]);
-    t_command_exit = now_ms();
-    return 127;
+  if (file_stdio) {
+    stdout_pipe[1] = open(FILE_STDOUT_PATH, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC | O_NOFOLLOW, 0600);
+    stderr_pipe[1] = open(FILE_STDERR_PATH, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC | O_NOFOLLOW, 0600);
+    stdout_pipe[0] = open(FILE_STDOUT_PATH, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    stderr_pipe[0] = open(FILE_STDERR_PATH, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (stdout_pipe[0] < 0 || stderr_pipe[0] < 0 || stdout_pipe[1] < 0 || stderr_pipe[1] < 0) {
+      if (stdout_pipe[0] >= 0) close(stdout_pipe[0]);
+      if (stderr_pipe[0] >= 0) close(stderr_pipe[0]);
+      if (stdout_pipe[1] >= 0) close(stdout_pipe[1]);
+      if (stderr_pipe[1] >= 0) close(stderr_pipe[1]);
+      t_command_exit = now_ms();
+      return 127;
+    }
+  } else {
+    if (pipe2(stdout_pipe, O_CLOEXEC) != 0) {
+      t_command_exit = now_ms();
+      return 127;
+    }
+    if (pipe2(stderr_pipe, O_CLOEXEC) != 0) {
+      close(stdout_pipe[0]);
+      close(stdout_pipe[1]);
+      t_command_exit = now_ms();
+      return 127;
+    }
+    if (set_nonblock(stdout_pipe[0]) != 0 || set_nonblock(stderr_pipe[0]) != 0) {
+      close(stdout_pipe[0]);
+      close(stdout_pipe[1]);
+      close(stderr_pipe[0]);
+      close(stderr_pipe[1]);
+      t_command_exit = now_ms();
+      return 127;
+    }
   }
 
   pid_t pid = fork();
   if (pid == 0) {
-    close(stdout_pipe[0]);
-    close(stderr_pipe[0]);
+    if (stdout_pipe[0] >= 0) close(stdout_pipe[0]);
+    if (stderr_pipe[0] >= 0) close(stderr_pipe[0]);
     if (dup2(stdout_pipe[1], STDOUT_FILENO) < 0) _exit(127);
     if (dup2(stderr_pipe[1], STDERR_FILENO) < 0) _exit(127);
     close(stdout_pipe[1]);
@@ -971,8 +1026,8 @@ static int start_session(struct session *session, const char *session_id, char *
   close(stdout_pipe[1]);
   close(stderr_pipe[1]);
   if (pid < 0) {
-    close(stdout_pipe[0]);
-    close(stderr_pipe[0]);
+    if (stdout_pipe[0] >= 0) close(stdout_pipe[0]);
+    if (stderr_pipe[0] >= 0) close(stderr_pipe[0]);
     t_command_exit = now_ms();
     return 127;
   }
@@ -985,6 +1040,7 @@ static int start_session(struct session *session, const char *session_id, char *
   session->stderr_fd = stderr_pipe[0];
   session->stdout_open = 1;
   session->stderr_open = 1;
+  session->file_stdio = file_stdio;
   return 0;
 }
 
@@ -1090,17 +1146,23 @@ static void poll_session_exit(struct session *session, struct client *client) {
    * Do not wait indefinitely for pipe EOF after the direct command exits;
    * inherited fds from daemonized children must not block the run result.
    */
-  pump_session_stream(session, client, 1);
-  pump_session_stream(session, client, 0);
-  if (session->stdout_open) {
-    close(session->stdout_fd);
-    session->stdout_fd = -1;
-    session->stdout_open = 0;
-  }
-  if (session->stderr_open) {
-    close(session->stderr_fd);
-    session->stderr_fd = -1;
-    session->stderr_open = 0;
+  if (session->file_stdio) {
+    pump_session_file(session, client, 1);
+    pump_session_file(session, client, 0);
+    close_file_stdio(session);
+  } else {
+    pump_session_stream(session, client, 1);
+    pump_session_stream(session, client, 0);
+    if (session->stdout_open) {
+      close(session->stdout_fd);
+      session->stdout_fd = -1;
+      session->stdout_open = 0;
+    }
+    if (session->stderr_open) {
+      close(session->stderr_fd);
+      session->stderr_fd = -1;
+      session->stderr_open = 0;
+    }
   }
 }
 
@@ -1160,6 +1222,7 @@ static void accept_request(int listener, struct session *session, struct client 
   }
 
   if (request.kind == REQUEST_START) {
+    int file_stdio = 0;
     if (session->started) {
       if (strcmp(request.session_id, session->session_id) == 0) {
         (void)attach_client(session, client, request.stdout_offset, request.stderr_offset);
@@ -1170,6 +1233,8 @@ static void accept_request(int listener, struct session *session, struct client 
         close_client(client);
         return;
       }
+      // ponytail: completed-base resumes lose pipe wakeups under ReleaseSafe; keep the file fallback resumed-only.
+      file_stdio = 1;
       reset_session(session);
     }
     if (use_rootfs && !rootfs_ready) {
@@ -1182,7 +1247,7 @@ static void accept_request(int listener, struct session *session, struct client 
       close_client(client);
       return;
     }
-    int rc = start_session(session, request.session_id, request.argv, request.envp, request.working_dir, use_rootfs);
+    int rc = start_session(session, request.session_id, request.argv, request.envp, request.working_dir, use_rootfs, file_stdio);
     if (rc != 0) {
       (void)send_error_exit(client->fd, rc, "spore run: exec setup failed\n");
       close_client(client);
@@ -1274,13 +1339,13 @@ int main(void) {
       fds[nfds].revents = 0;
       roles[nfds++] = 1;
     }
-    if (session.stdout_open) {
+    if (session.stdout_open && !session.file_stdio) {
       fds[nfds].fd = session.stdout_fd;
       fds[nfds].events = POLLIN | POLLHUP | POLLERR;
       fds[nfds].revents = 0;
       roles[nfds++] = 2;
     }
-    if (session.stderr_open) {
+    if (session.stderr_open && !session.file_stdio) {
       fds[nfds].fd = session.stderr_fd;
       fds[nfds].events = POLLIN | POLLHUP | POLLERR;
       fds[nfds].revents = 0;
@@ -1304,6 +1369,10 @@ int main(void) {
           pump_session_stream(&session, &client, 0);
         }
       }
+    }
+    if (session.file_stdio && !session.exited) {
+      pump_session_file(&session, &client, 1);
+      pump_session_file(&session, &client, 0);
     }
     poll_session_exit(&session, &client);
     maybe_send_session_exit(&session, &client);
