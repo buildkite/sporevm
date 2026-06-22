@@ -127,6 +127,21 @@ The suite emits a `memory_economics` row for the base spore. It records:
 This is intentionally separate from TTI. TTI answers "how fast is it
 interactive?" Memory economics answers "what did that logical VM state cost?"
 
+### Memory Throughput
+
+Use the standalone memory-throughput probe when the question is guest copy speed
+rather than startup time:
+
+```console
+scripts/benchmark-memory-throughput.py --iterations 5
+```
+
+It runs the same Node `Buffer.copy` workload natively and through one-shot
+`spore run`. Each row records the guest-reported copy time and the host wall
+time separately, so lifecycle overhead is visible instead of blended into the
+throughput number. Add `--environments native,spore_run,spore_exec` when the
+local monitor lifecycle path is the thing being measured.
+
 ## Modes
 
 - `sequential`: one child at a time.
