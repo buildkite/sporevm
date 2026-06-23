@@ -43,8 +43,9 @@ spore rm bench-1
 ```
 
 `spore run` remains the one-shot convenience command. Named lifecycle commands
-are experimental and opt-in because the monitor is not jailed in the default
-1.0 surface.
+are experimental and opt-in. Monitor processes deny child process execution
+through an embedded macOS sandbox profile or Linux seccomp filter; broader jail
+policy remains follow-up work before stable lifecycle support.
 
 Future suspend/resume extends the same named-VM model:
 
@@ -68,6 +69,9 @@ policy, secrets, egress, mounts, workspace semantics, and scheduling.
 
 - `spore create`, `spore exec`, `spore rm`, `spore ls`, `spore monitor`, and
   named `spore resume` require `SPOREVM_EXPERIMENTAL_MONITOR=1`.
+- Monitor processes deny child process execution through an embedded macOS
+  sandbox profile or Linux seccomp filter. `mise run smoke:monitor-jail` covers
+  the denied-operation path.
 - They use a private runtime registry under `SPOREVM_RUNTIME_DIR`,
   `$XDG_RUNTIME_DIR/sporevm`, or a private temp fallback.
 - VM names are explicit and restricted to a conservative path-safe set.

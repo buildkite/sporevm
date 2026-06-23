@@ -30,6 +30,7 @@ pub const local_paths = @import("local_paths.zig");
 pub const memory = @import("memory.zig");
 pub const machine_output = @import("machine_output.zig");
 pub const monitor = @import("monitor.zig");
+pub const monitor_jail = @import("monitor_jail.zig");
 pub const net_gateway = @import("net_gateway.zig");
 pub const platform = @import("platform.zig");
 const dirty_ram = @import("dirty_ram.zig");
@@ -82,6 +83,7 @@ test {
     testing.refAllDecls(memory);
     testing.refAllDecls(machine_output);
     testing.refAllDecls(monitor);
+    testing.refAllDecls(monitor_jail);
     testing.refAllDecls(net_gateway);
     testing.refAllDecls(platform);
     testing.refAllDecls(dirty_ram);

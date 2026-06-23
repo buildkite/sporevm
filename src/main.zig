@@ -58,7 +58,7 @@ const usage =
     \\
 ;
 
-const experimental_monitor_env = "SPOREVM_EXPERIMENTAL_MONITOR";
+const experimental_monitor_env = sporevm.monitor_jail.experimental_monitor_env;
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();

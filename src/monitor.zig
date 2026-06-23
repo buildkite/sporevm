@@ -6,6 +6,7 @@ const net = std.Io.net;
 
 const lifecycle = @import("lifecycle.zig");
 const memory_config = @import("memory.zig");
+const monitor_jail = @import("monitor_jail.zig");
 const run = @import("run.zig");
 const vsock = @import("virtio/vsock.zig");
 
@@ -71,6 +72,12 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     }
 
     const allocator = init.arena.allocator();
+    try monitor_jail.applyForMonitor(init.environ_map);
+    if (monitor_jail.wantsSmoke(init.environ_map)) {
+        try monitor_jail.smokeDeniedExec(init.io);
+        return;
+    }
+
     const opts = try parseMonitorArgs(args);
     const parsed_ms = lifecycle.monotonicMs();
     if (!lifecycle.monitorBackendSupported(opts.backend.name())) {
