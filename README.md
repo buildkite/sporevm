@@ -139,14 +139,15 @@ capture, fork divergence, bundle pack/unpack, and `run --from`.
 must be available in `PATH`.
 
 Releases are tag driven. `mise run release` runs the local checks, computes the
-next semantic version from conventional commits with `svu`, verifies
-`src/root.zig` matches that version, and pushes the tag. The Buildkite tag build
-builds Linux ARM64 and macOS ARM64 archives in platform-specific jobs, then a
-publish job downloads those artifacts, writes `checksums.txt`, and uploads the
-GitHub prerelease assets. The pipeline must build tags and provide
-`SPOREVM_GITHUB_RELEASE_TOKEN` to the release job. Pre-1.0 releases are
-published as GitHub prereleases. Use `mise run release:snapshot` to build the
-release archives locally without publishing.
+next semantic version from conventional commits with `svu` unless
+`SPOREVM_RELEASE_VERSION=vX.Y.Z` is set, verifies `src/root.zig` matches that
+version, and pushes the tag. The Buildkite tag build builds Linux ARM64 and
+macOS ARM64 archives in platform-specific jobs, then a publish job downloads
+those artifacts, writes `checksums.txt`, and uploads the GitHub release assets.
+The pipeline must build tags and provide `SPOREVM_GITHUB_RELEASE_TOKEN` to the
+release job. Pre-1.0 releases are published as GitHub prereleases; 1.0 and
+later releases are published as latest releases. Use `mise run release:snapshot`
+to build the release archives locally without publishing.
 
 Repeatable benchmark runs live in [docs/benchmarks.md](docs/benchmarks.md).
 `mise run benchmark:ci` writes short cold/warm TTI JSONL, a summary JSON, and

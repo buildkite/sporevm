@@ -62,7 +62,7 @@ pub const virtio = struct {
     pub const vsock = @import("virtio/vsock.zig");
 };
 
-pub const version = "0.2.0";
+pub const version = "1.0.0";
 
 test {
     // Ensure all referenced modules' tests are discovered.

@@ -16,8 +16,12 @@ require_command svu
 
 [[ -z "$(git status --porcelain)" ]] || die "working tree must be clean before tagging"
 
-NEXT="$(svu next)"
 CURRENT="$(svu current)"
+NEXT="${SPOREVM_RELEASE_VERSION:-}"
+if [[ -z "${NEXT}" ]]; then
+  NEXT="$(svu next)"
+fi
+[[ "${NEXT}" == v* ]] || die "SPOREVM_RELEASE_VERSION must include the v prefix, got: ${NEXT}"
 if [[ "${NEXT}" == "${CURRENT}" ]]; then
   die "no version bump detected (current: ${CURRENT}); use conventional commits such as feat: or fix:"
 fi
