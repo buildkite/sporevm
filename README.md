@@ -76,10 +76,11 @@ Current `main` can:
   HVF and KVM;
 - suspend a diskless named VM and resume it under a new name on local HVF.
 
-Named lifecycle monitor mode supports local HVF and Linux/aarch64 KVM for
-create, exec, list, and remove. Disk-backed lifecycle suspend/resume remains
-follow-up work. The backend smoke harnesses still exercise lower-level capture
-paths directly.
+Named lifecycle monitor mode is experimental and requires
+`SPOREVM_EXPERIMENTAL_MONITOR=1`. It supports local HVF and Linux/aarch64 KVM
+for create, exec, list, and remove. Disk-backed lifecycle suspend/resume
+remains follow-up work. The backend smoke harnesses still exercise lower-level
+capture paths directly.
 
 Current active work after the v0.1.0 baseline is concentrated in disk
 performance guardrails, disk-backed named lifecycle suspend/resume, and
@@ -197,10 +198,11 @@ protocol can reconnect to or multiplex active commands.
 Keep one named VM alive and run more than one command in it:
 
 ```bash
-SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo zig-out/bin/spore create bench-1
-SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo zig-out/bin/spore exec bench-1 -- /bin/writeout
-SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo zig-out/bin/spore exec bench-1 -- /bin/true
-SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo zig-out/bin/spore rm bench-1
+export SPOREVM_EXPERIMENTAL_MONITOR=1 SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo
+zig-out/bin/spore create bench-1
+zig-out/bin/spore exec bench-1 -- /bin/writeout
+zig-out/bin/spore exec bench-1 -- /bin/true
+zig-out/bin/spore rm bench-1
 ```
 
 The lifecycle registry lives under `SPOREVM_RUNTIME_DIR`, then
@@ -211,12 +213,13 @@ restricted to a conservative path-safe set. `spore create --image` and
 Checkpoint a diskless named VM and resume it under a new name:
 
 ```bash
-SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo zig-out/bin/spore create snap-1
-SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo zig-out/bin/spore exec snap-1 -- /bin/true
-SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo zig-out/bin/spore suspend snap-1 --out /tmp/snap.spore
-SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo zig-out/bin/spore resume /tmp/snap.spore --name snap-2
-SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo zig-out/bin/spore exec snap-2 -- /bin/writeout
-SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo zig-out/bin/spore rm snap-2
+export SPOREVM_EXPERIMENTAL_MONITOR=1 SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo
+zig-out/bin/spore create snap-1
+zig-out/bin/spore exec snap-1 -- /bin/true
+zig-out/bin/spore suspend snap-1 --out /tmp/snap.spore
+zig-out/bin/spore resume /tmp/snap.spore --name snap-2
+zig-out/bin/spore exec snap-2 -- /bin/writeout
+zig-out/bin/spore rm snap-2
 ```
 
 Capture a run on command exit or on a host signal:
