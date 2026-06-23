@@ -1,31 +1,70 @@
-# SporeVM
+# 🍄 SporeVM
 
-SporeVM is an aarch64 virtual machine monitor for forkable Linux microVM
-checkpoints. A spore is a sealed VM checkpoint: normalized machine state,
+SporeVM is a small aarch64 virtual machine monitor for forkable Linux microVM
+checkpoints.
+
+That sounds like another VMM, which is not really the point. The point is that
+CI keeps paying to build the same warm machine over and over: boot Linux, start
+services, install dependencies, load application code, migrate databases, fill
+caches, run one shard, throw the machine away. SporeVM is a bet that the warm
+machine should become a build artifact.
+
+A spore is that artifact: a sealed VM checkpoint with normalized machine state,
 device state, verified memory chunks, optional rootfs state, and a platform
-contract that fails closed when a host cannot restore it.
+contract that fails closed when a host cannot restore it honestly.
 
-The 1.0 surface is aimed at warm CI and agent fan-out:
+The useful shape is:
 
 1. Start a runtime once.
-2. Capture it at a useful point.
-3. Fork cheap child spores.
-4. Resume the children on compatible aarch64 hosts without copying all RAM for
+2. Warm it up until the expensive boring work is done.
+3. Capture it at a clean point.
+4. Fork cheap child spores.
+5. Resume the children on compatible aarch64 hosts without copying all RAM for
    every child.
 
-SporeVM targets the useful arm64 overlap:
+The interesting bit is not "can boot Linux". Plenty of things can boot Linux.
+The interesting bit is making VM state inspectable, content-addressed,
+forkable, and honest enough to move around.
 
-- KVM on Linux/aarch64.
-- Hypervisor.framework on Apple Silicon macOS.
+## What is different
 
-Both backends expose the same small guest-visible board: fixed RAM layout,
-interrupt wiring, boot contract, virtio-mmio console, blk, net, vsock, rng, and
-the SporeVM generation device. Cross-backend restore is diagnostic. The product
-path is same-host-class capture, fork, distribution, and resume.
+- **The spore is the product.** It is not a giant opaque memory dump. It is a
+  small, versioned checkpoint with a manifest, verified chunks, rootfs identity,
+  and enough platform contract to say "yes, this host can restore it" or fail
+  before pretending.
+- **The fake computer is intentionally boring.** SporeVM targets the useful
+  arm64 overlap: KVM on Linux/aarch64 and Hypervisor.framework on Apple Silicon
+  macOS. Both expose the same fixed guest-visible board: RAM layout, interrupt
+  wiring, boot contract, virtio-mmio console, blk, net, vsock, rng, and the
+  SporeVM generation device.
+- **Fork is mostly paperwork.** Children point at the same verified chunks. On
+  same-host paths, trusted RAM backing can be mapped privately so reads share
+  pages and writes diverge. Many children should not mean many copies of mostly
+  identical RAM.
+- **Forked guests are told they forked.** The generation device gives the guest
+  a small hook for new identity, entropy, clock, hostname, and shard fixups.
+  Without that, cloned machines become very expensive flakiness generators.
+- **CI is the proving workload.** The scheduler still owns placement, secrets,
+  network policy, and artifact upload. SporeVM is the machine-state primitive:
+  warm once, fork many, run the shards.
+
+SporeVM 1.0 expects spores to resume on the same backend and compatible host
+class they were captured for: KVM/aarch64 to KVM/aarch64, or Apple Silicon HVF
+to Apple Silicon HVF. The repo still keeps KVM/HVF restore checks because they
+catch backend-specific state leaking into the spore format, but users should
+not plan distribution around moving one running machine between those
+hypervisors.
 
 ## Install
 
-Download the Linux ARM64 or macOS ARM64 archive from
+If you use [mise](https://mise.jdx.dev), install it globally:
+
+```bash
+mise use -g github:buildkite/sporevm@latest
+spore version
+```
+
+Or download the Linux ARM64 or macOS ARM64 archive from
 [GitHub releases](https://github.com/buildkite/sporevm/releases/latest):
 
 ```bash
@@ -241,7 +280,10 @@ suspend/resume and jail policy mature.
 Known limits:
 
 - Hosts and guests are aarch64 only.
-- Cross-backend restore is diagnostic, not the product path.
+- Resume is for compatible host classes: KVM/aarch64 spores resume on
+  KVM/aarch64, and Apple Silicon HVF spores resume on Apple Silicon HVF. KVM
+  to HVF restore checks exist to catch bad state serialization, not as a 1.0
+  user contract.
 - General block-device state is out of scope. Rootfs-bound writable state is
   represented as sealed disk layers.
 - Named lifecycle monitor commands are available on supported HVF/KVM backends.
