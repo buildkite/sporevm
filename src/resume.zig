@@ -140,8 +140,9 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
         .command_name = "resume",
     });
     defer runtime_disk.deinit();
-    const attach_request = try resumeAttachRequest(allocator, parsed.value);
-    var identity_stream: ?vsock.HostStream = try vsock.HostStream.init(default_resume_guest_port, attach_request);
+    const attach = try prepareResumeAttach(allocator, parsed.value);
+    defer attach.deinit(allocator);
+    var identity_stream: ?vsock.HostStream = try vsock.HostStream.init(default_resume_guest_port, attach.request);
     if (identity_stream) |*stream| {
         stream.host_port = resume_attach_host_port;
         if (opts.event_writer) |writer| {
@@ -171,6 +172,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .console_sink = if (opts.event_writer == null) consoleSink else discardConsoleSink,
                 .disk_backend = runtime_disk.backend(),
                 .resume_dir = opts.spore_dir,
+                .resume_generation = attach.generation_state,
                 .ram_backing_fd = local_backing.fd,
                 .network = network,
                 .exec_probe = identity_probe,
@@ -188,6 +190,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .console_sink = if (opts.event_writer == null) consoleSink else discardConsoleSink,
                 .disk_backend = runtime_disk.backend(),
                 .resume_dir = opts.spore_dir,
+                .resume_generation = attach.generation_state,
                 .ram_backing_fd = local_backing.fd,
                 .network = network,
                 .exec_probe = identity_probe,
@@ -275,10 +278,22 @@ fn resultFromResumeStream(backend: Backend, ram_size: u64, identity_stream: ?vso
     };
 }
 
-fn resumeAttachRequest(allocator: std.mem.Allocator, manifest: spore.Manifest) ![]const u8 {
+const PreparedResumeAttach = struct {
+    request: []const u8,
+    generation_state: generation.State,
+
+    fn deinit(self: PreparedResumeAttach, allocator: std.mem.Allocator) void {
+        allocator.free(self.request);
+        allocator.free(self.generation_state.params_b64);
+    }
+};
+
+fn prepareResumeAttach(allocator: std.mem.Allocator, manifest: spore.Manifest) !PreparedResumeAttach {
     var gen_dev = generation.Device{};
     try gen_dev.restore(allocator, manifest.generation);
     try spore.refreshResumeParams(allocator, &gen_dev);
+    const generation_state = try gen_dev.capture(allocator);
+    errdefer allocator.free(generation_state.params_b64);
 
     var params_end = gen_dev.params.len;
     while (params_end > 0 and gen_dev.params[params_end - 1] == 0) : (params_end -= 1) {}
@@ -291,7 +306,10 @@ fn resumeAttachRequest(allocator: std.mem.Allocator, manifest: spore.Manifest) !
         }{};
         const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
         defer allocator.free(json);
-        return try std.fmt.allocPrint(allocator, "{s}\n", .{json});
+        return .{
+            .request = try std.fmt.allocPrint(allocator, "{s}\n", .{json}),
+            .generation_state = generation_state,
+        };
     }
 
     const payload = struct {
@@ -305,7 +323,10 @@ fn resumeAttachRequest(allocator: std.mem.Allocator, manifest: spore.Manifest) !
     };
     const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(json);
-    return try std.fmt.allocPrint(allocator, "{s}\n", .{json});
+    return .{
+        .request = try std.fmt.allocPrint(allocator, "{s}\n", .{json}),
+        .generation_state = generation_state,
+    };
 }
 
 fn resolveBackend(backend: Backend) !Backend {
@@ -366,9 +387,10 @@ test "resume cli parser accepts jsonl events" {
 test "resume attach request omits empty generation params" {
     const allocator = std.testing.allocator;
     const manifest = testDiskGuardManifest(&.{}, false);
-    const request = try resumeAttachRequest(allocator, manifest);
-    defer allocator.free(request);
-    try std.testing.expectEqualStrings("{\"type\":\"attach\",\"session_id\":\"default\",\"stdout_offset\":0,\"stderr_offset\":0}\n", request);
+    const attach = try prepareResumeAttach(allocator, manifest);
+    defer attach.deinit(allocator);
+    try std.testing.expectEqualStrings("{\"type\":\"attach\",\"session_id\":\"default\",\"stdout_offset\":0,\"stderr_offset\":0}\n", attach.request);
+    try std.testing.expectEqualStrings("", attach.generation_state.params_b64);
 }
 
 test "resume attach request carries refreshed generation params" {
@@ -382,14 +404,30 @@ test "resume attach request carries refreshed generation params" {
     manifest.generation = try gen_dev.capture(allocator);
     defer allocator.free(manifest.generation.params_b64);
 
-    const request = try resumeAttachRequest(allocator, manifest);
-    defer allocator.free(request);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"type\":\"attach\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"params_json\":\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\\\"parallel_index\\\":0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\\\"parallel_count\\\":2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\\\"resume_time_unix_ns\\\":") != null);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\\\"resume_entropy_seed\\\":") != null);
+    const attach = try prepareResumeAttach(allocator, manifest);
+    defer attach.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, attach.request, "\"type\":\"attach\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attach.request, "\"params_json\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attach.request, "\\\"parallel_index\\\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attach.request, "\\\"parallel_count\\\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attach.request, "\\\"resume_time_unix_ns\\\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attach.request, "\\\"resume_entropy_seed\\\":") != null);
+
+    var restored = generation.Device{};
+    try restored.restore(allocator, attach.generation_state);
+    var params_end = restored.params.len;
+    while (params_end > 0 and restored.params[params_end - 1] == 0) : (params_end -= 1) {}
+    try std.testing.expect(std.mem.indexOf(u8, restored.params[0..params_end], "\"resume_time_unix_ns\":") != null);
+
+    const AttachPayload = struct {
+        params_json: []const u8,
+    };
+    const parsed = try std.json.parseFromSlice(AttachPayload, allocator, attach.request, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(restored.params[0..params_end], parsed.value.params_json);
 }
 
 test "resume memory defaults to manifest ram size" {

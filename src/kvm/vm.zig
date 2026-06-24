@@ -48,6 +48,8 @@ pub const Config = struct {
     network_manifest: ?spore.Network = null,
     /// Resume from a spore directory instead of booting the kernel.
     resume_dir: ?[]const u8 = null,
+    /// Optional pre-refreshed generation state for product resume attach.
+    resume_generation: ?generation.State = null,
     /// Proof-validated or harness-supplied same-host RAM backing fd. The fd
     /// must refer to the manifest's optional RAM backing and is mapped
     /// MAP_PRIVATE; imported or unproven spores must leave this null so RAM is
@@ -265,8 +267,8 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         }
         const state_start = try monotonicMs();
         try applyTransports(transports, m.devices);
-        try gen_dev.restore(allocator, m.generation);
-        try spore.refreshResumeParams(allocator, &gen_dev);
+        try gen_dev.restore(allocator, config.resume_generation orelse m.generation);
+        if (config.resume_generation == null) try spore.refreshResumeParams(allocator, &gen_dev);
         try snapshot.applyMachine(allocator, vm_fd, @intCast(gic_dev.fd), vcpu_fd, m.machine);
         try raiseGenerationIrqIfPending(vm_fd, &gen_dev);
         if (restore_stats) |*stats| stats.state_ms = (try monotonicMs()) - state_start;
