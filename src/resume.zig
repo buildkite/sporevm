@@ -10,6 +10,7 @@ const kvm = if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)
 else
     struct {};
 const net_gateway = @import("net_gateway.zig");
+const generation = @import("generation.zig");
 const run_mod = @import("run.zig");
 const spore = @import("spore.zig");
 const virtio_blk = @import("virtio/blk.zig");
@@ -21,7 +22,6 @@ const default_resume_guest_port: u32 = 10700;
 const resume_attach_host_port: u32 = 49153;
 const resume_attach_timeout_ms: u64 = 30_000;
 const hvf_resume_attach_rx_delay_ms: u64 = 25;
-const resume_attach_request = "{\"type\":\"attach\",\"session_id\":\"default\",\"stdout_offset\":0,\"stderr_offset\":0}\n";
 
 pub const Options = struct {
     backend: Backend = .auto,
@@ -140,7 +140,9 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
         .command_name = "resume",
     });
     defer runtime_disk.deinit();
-    var identity_stream: ?vsock.HostStream = try vsock.HostStream.init(default_resume_guest_port, resume_attach_request);
+    const attach = try prepareResumeAttach(allocator, parsed.value);
+    defer attach.deinit(allocator);
+    var identity_stream: ?vsock.HostStream = try vsock.HostStream.init(default_resume_guest_port, attach.request);
     if (identity_stream) |*stream| {
         stream.host_port = resume_attach_host_port;
         if (opts.event_writer) |writer| {
@@ -170,6 +172,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .console_sink = if (opts.event_writer == null) consoleSink else discardConsoleSink,
                 .disk_backend = runtime_disk.backend(),
                 .resume_dir = opts.spore_dir,
+                .resume_generation = attach.generation_state,
                 .ram_backing_fd = local_backing.fd,
                 .network = network,
                 .exec_probe = identity_probe,
@@ -187,6 +190,7 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
                 .console_sink = if (opts.event_writer == null) consoleSink else discardConsoleSink,
                 .disk_backend = runtime_disk.backend(),
                 .resume_dir = opts.spore_dir,
+                .resume_generation = attach.generation_state,
                 .ram_backing_fd = local_backing.fd,
                 .network = network,
                 .exec_probe = identity_probe,
@@ -274,6 +278,57 @@ fn resultFromResumeStream(backend: Backend, ram_size: u64, identity_stream: ?vso
     };
 }
 
+const PreparedResumeAttach = struct {
+    request: []const u8,
+    generation_state: generation.State,
+
+    fn deinit(self: PreparedResumeAttach, allocator: std.mem.Allocator) void {
+        allocator.free(self.request);
+        allocator.free(self.generation_state.params_b64);
+    }
+};
+
+fn prepareResumeAttach(allocator: std.mem.Allocator, manifest: spore.Manifest) !PreparedResumeAttach {
+    var gen_dev = generation.Device{};
+    try gen_dev.restore(allocator, manifest.generation);
+    try spore.refreshResumeParams(allocator, &gen_dev);
+    const generation_state = try gen_dev.capture(allocator);
+    errdefer allocator.free(generation_state.params_b64);
+
+    var params_end = gen_dev.params.len;
+    while (params_end > 0 and gen_dev.params[params_end - 1] == 0) : (params_end -= 1) {}
+    if (params_end == 0) {
+        const payload = struct {
+            type: []const u8 = "attach",
+            session_id: []const u8 = "default",
+            stdout_offset: u64 = 0,
+            stderr_offset: u64 = 0,
+        }{};
+        const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+        defer allocator.free(json);
+        return .{
+            .request = try std.fmt.allocPrint(allocator, "{s}\n", .{json}),
+            .generation_state = generation_state,
+        };
+    }
+
+    const payload = struct {
+        type: []const u8 = "attach",
+        session_id: []const u8 = "default",
+        stdout_offset: u64 = 0,
+        stderr_offset: u64 = 0,
+        params_json: []const u8,
+    }{
+        .params_json = gen_dev.params[0..params_end],
+    };
+    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+    defer allocator.free(json);
+    return .{
+        .request = try std.fmt.allocPrint(allocator, "{s}\n", .{json}),
+        .generation_state = generation_state,
+    };
+}
+
 fn resolveBackend(backend: Backend) !Backend {
     if (backend != .auto) return backend;
     if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64) return .hvf;
@@ -327,6 +382,52 @@ test "resume cli parser accepts jsonl events" {
     const opts = try parseCliArgs(&.{ "--events=jsonl", "child.spore" });
     try std.testing.expectEqual(run_mod.EventMode.jsonl, opts.event_mode);
     try std.testing.expectEqualStrings("child.spore", opts.spore_dir);
+}
+
+test "resume attach request omits empty generation params" {
+    const allocator = std.testing.allocator;
+    const manifest = testDiskGuardManifest(&.{}, false);
+    const attach = try prepareResumeAttach(allocator, manifest);
+    defer attach.deinit(allocator);
+    try std.testing.expectEqualStrings("{\"type\":\"attach\",\"session_id\":\"default\",\"stdout_offset\":0,\"stderr_offset\":0}\n", attach.request);
+    try std.testing.expectEqualStrings("", attach.generation_state.params_b64);
+}
+
+test "resume attach request carries refreshed generation params" {
+    const allocator = std.testing.allocator;
+    var manifest = testDiskGuardManifest(&.{}, false);
+    var gen_dev = generation.Device{};
+    const stable_params =
+        \\{"schema_version":0,"parent_generation":1,"generation":2,"fork_index":0,"fork_count":2,"parallel_index":0,"parallel_count":2,"fork_batch_id":"0123456789abcdef0123456789abcdef","vm_id":"spore-0123456789abcdef0123456789abcdef","hostname":"spore-01234567-000000","mac_seed":"0123456789abcdef0123456789abcdef","mac_address":"02:00:00:00:00:01"}
+    ;
+    try std.testing.expect(try gen_dev.setResume(2, stable_params));
+    manifest.generation = try gen_dev.capture(allocator);
+    defer allocator.free(manifest.generation.params_b64);
+
+    const attach = try prepareResumeAttach(allocator, manifest);
+    defer attach.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, attach.request, "\"type\":\"attach\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attach.request, "\"params_json\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attach.request, "\\\"parallel_index\\\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attach.request, "\\\"parallel_count\\\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attach.request, "\\\"resume_time_unix_ns\\\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attach.request, "\\\"resume_entropy_seed\\\":") != null);
+
+    var restored = generation.Device{};
+    try restored.restore(allocator, attach.generation_state);
+    var params_end = restored.params.len;
+    while (params_end > 0 and restored.params[params_end - 1] == 0) : (params_end -= 1) {}
+    try std.testing.expect(std.mem.indexOf(u8, restored.params[0..params_end], "\"resume_time_unix_ns\":") != null);
+
+    const AttachPayload = struct {
+        params_json: []const u8,
+    };
+    const parsed = try std.json.parseFromSlice(AttachPayload, allocator, attach.request, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(restored.params[0..params_end], parsed.value.params_json);
 }
 
 test "resume memory defaults to manifest ram size" {
