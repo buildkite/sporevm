@@ -111,6 +111,11 @@ initrd. On first use it downloads the managed kernel, verifies it, checks the
 release kernel config for required runtime features, then caches it under the
 platform cache directory.
 
+Omitted `--memory` means `auto`: fresh managed runs boot with a 512MiB base so
+tiny commands avoid the full 16GiB startup cost, then expose the rest of the
+16GiB contract through virtio-mem once the guest is ready. Explicit memory,
+custom boot assets, capture, and resume keep fixed-RAM semantics.
+
 Override boot assets when needed:
 
 ```bash
