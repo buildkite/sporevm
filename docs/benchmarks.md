@@ -207,6 +207,20 @@ Keep separate histories for different hardware classes or profiles. A `ci`
 profile on a busy shared runner and a `full` profile on fixed A1 hardware answer
 different questions.
 
+Buildkite publishes the website projection to:
+
+```text
+s3://sporevm-benchmarks/site/data.json
+s3://sporevm-benchmarks/site/data.js
+```
+
+Only successful `main` benchmark builds update those files. The publisher merges
+the macOS and Linux ARM64 per-build exports, canonicalizes run IDs by
+build/commit/platform, and keeps the chart series split by runner queue so the
+website can show `main` progress without mixing hardware classes.
+The writer role needs `GetObject` for those exported per-build files and
+`PutObject` for `site/data.json` and `site/data.js`.
+
 ## Buildkite
 
 The main Buildkite pipeline triggers the dedicated `sporevm-benchmarks` pipeline
@@ -235,6 +249,9 @@ That dedicated pipeline also uploads durable benchmark data to:
 s3://sporevm-benchmarks/builds/${BUILDKITE_BUILD_NUMBER}/${BUILDKITE_COMMIT}/macos/
 s3://sporevm-benchmarks/builds/${BUILDKITE_BUILD_NUMBER}/${BUILDKITE_COMMIT}/linux-arm64/
 ```
+
+After both benchmark jobs finish on `main`, a serialized publish step rebuilds
+and uploads the stable website files under `s3://sporevm-benchmarks/site/`.
 
 If `SPOREVM_BENCHMARK_BASELINE` points to a summary JSON available in the job
 workspace, the step compares the new `latest-summary.json` against that
