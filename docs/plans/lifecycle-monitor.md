@@ -96,6 +96,11 @@ policy, secrets, egress, mounts, workspace semantics, and scheduling.
   identity for image-created VMs. Explicit `spore create --rootfs PATH` VMs still
   fail closed on suspend because they do not carry portable immutable-rootfs
   identity.
+- `spore create --net [--allow-cidr CIDR] [--allow-host HOST]` reuses the
+  existing virtio-net -> `spore-netd` path. The monitor owns the helper
+  lifetime, records requested policy in checkpoints, and named resume starts a
+  fresh helper under that policy. Live TCP flows and learned DNS answers are not
+  checkpointed.
 
 ## Runtime Directory
 
@@ -177,6 +182,8 @@ immutable-rootfs identity.
 - No stdin streaming, TTY, or interactive terminal in the first monitor version.
 - No multi-vCPU lifecycle support until the underlying run path supports it.
 - No writable cached OCI rootfs.
+- No inbound ports, broad UDP forwarding, L7 policy, or live network-flow
+  checkpointing for named lifecycle networking.
 
 ## Verification
 

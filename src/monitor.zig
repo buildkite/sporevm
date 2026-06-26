@@ -7,6 +7,7 @@ const net = std.Io.net;
 const lifecycle = @import("lifecycle.zig");
 const memory_config = @import("memory.zig");
 const monitor_jail = @import("monitor_jail.zig");
+const net_gateway = @import("net_gateway.zig");
 const run = @import("run.zig");
 const vsock = @import("virtio/vsock.zig");
 
@@ -27,6 +28,9 @@ const monitor_usage =
     \\  --rootfs rootfs.ext4    Resolved rootfs image path
     \\  --image REF             Original OCI image ref for metadata
     \\  --resume DIR            Resume from a spore directory
+    \\  --net                   Experimental SporeVM-managed networking
+    \\  --allow-cidr CIDR       With --net, restrict public egress to this CIDR
+    \\  --allow-host HOST       With --net, restrict public egress to DNS A answers for this host
     \\  --memory VALUE          Guest memory: auto, 512mb, 2gb, ... (default: auto = 16GiB)
     \\  --guest-port N          Guest vsock listen port (default: 10700)
     \\  --timeout-ms N          Exec timeout in milliseconds (default: 30000)
@@ -43,6 +47,8 @@ const MonitorOptions = struct {
     rootfs_path: ?[]const u8 = null,
     image_ref: ?[]const u8 = null,
     resume_dir: ?[]const u8 = null,
+    network: run.NetworkMode = .disabled,
+    network_policy: run.NetworkPolicy = .{},
     memory: memory_config.Config = .{},
     vcpus: u32 = 1,
     guest_port: u32 = 10700,
@@ -72,8 +78,8 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     }
 
     const allocator = init.arena.allocator();
-    try monitor_jail.applyForMonitor(init.environ_map);
     if (monitor_jail.wantsSmoke(init.environ_map)) {
+        try monitor_jail.applyForMonitor(init.environ_map);
         try monitor_jail.smokeDeniedExec(init.io);
         return;
     }
@@ -92,6 +98,15 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         std.debug.print("spore monitor: direct --resume with --rootfs is not supported; use lifecycle metadata for disk-backed named resume\n", .{});
         std.process.exit(2);
     }
+    const full_args = try init.minimal.args.toSlice(allocator);
+    var gateway: net_gateway.Process = undefined;
+    var gateway_active = false;
+    if (opts.network == .spore) {
+        try gateway.start(init.io, allocator, full_args[0], false, opts.network_policy);
+        gateway_active = true;
+    }
+    defer if (gateway_active) gateway.deinit();
+    try monitor_jail.applyForMonitor(init.environ_map);
     const paths = try lifecycle.pathsFor(allocator, init.environ_map, opts.name);
     const paths_ms = lifecycle.monotonicMs();
     var existing_spec = lifecycle.readSpec(allocator, init.io, paths) catch |err| switch (err) {
@@ -119,6 +134,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         .rootfs_path = opts.rootfs_path,
         .rootfs = spec_rootfs,
         .disk = spec_disk,
+        .network = run.manifestNetworkFromOptions(opts.network, &opts.network_policy),
         .image_ref = opts.image_ref,
         .resume_dir = opts.resume_dir,
         .memory = opts.memory,
@@ -164,6 +180,10 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         .guest_port = opts.guest_port,
         .timeout_ms = opts.timeout_ms,
         .console_log_path = opts.console_log_path,
+        .network = opts.network,
+        .network_policy = opts.network_policy,
+        .network_runtime = if (gateway_active) gateway.runtime() else null,
+        .spore_executable = full_args[0],
     }, server.control());
     if (result) |monitor_result| {
         switch (monitor_result.exit) {
@@ -598,6 +618,20 @@ fn parseMonitorArgs(args: []const []const u8) !MonitorOptions {
             opts.image_ref = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--resume")) {
             opts.resume_dir = takeValue(args, &i, args[i]);
+        } else if (std.mem.eql(u8, args[i], "--net")) {
+            opts.network = .spore;
+        } else if (std.mem.eql(u8, args[i], "--allow-cidr")) {
+            const raw = takeValue(args, &i, args[i]);
+            opts.network_policy.addAllowCidr(raw) catch |err| {
+                std.debug.print("spore monitor: invalid --allow-cidr {s}: {s}\n", .{ raw, @errorName(err) });
+                std.process.exit(2);
+            };
+        } else if (std.mem.eql(u8, args[i], "--allow-host")) {
+            const raw = takeValue(args, &i, args[i]);
+            opts.network_policy.addAllowHost(raw) catch |err| {
+                std.debug.print("spore monitor: invalid --allow-host {s}: {s}\n", .{ raw, @errorName(err) });
+                std.process.exit(2);
+            };
         } else if (std.mem.eql(u8, args[i], "--memory")) {
             opts.memory = memory_config.parseCliOrExit("spore monitor", takeValue(args, &i, args[i]));
         } else if (std.mem.eql(u8, args[i], "--memory-mib")) {
@@ -614,6 +648,10 @@ fn parseMonitorArgs(args: []const []const u8) !MonitorOptions {
             std.debug.print("unknown monitor argument: {s}\n\n{s}", .{ args[i], monitor_usage });
             std.process.exit(2);
         }
+    }
+    if (opts.network == .disabled and opts.network_policy.hasRules()) {
+        std.debug.print("spore monitor: --allow-cidr and --allow-host require --net\n", .{});
+        std.process.exit(2);
     }
     return opts;
 }
@@ -647,4 +685,21 @@ fn parsePositive(comptime T: type, name: []const u8, raw: []const u8) !T {
 fn currentPid() i64 {
     if (comptime @import("builtin").os.tag == .windows) return 1;
     return @intCast(std.c.getpid());
+}
+
+test "monitor parser accepts network allow policy" {
+    const opts = try parseMonitorArgs(&.{
+        "bench-1",
+        "--net",
+        "--allow-cidr",
+        "93.184.216.34/32",
+        "--allow-host",
+        "example.com",
+    });
+
+    try std.testing.expectEqual(run.NetworkMode.spore, opts.network);
+    try std.testing.expectEqual(@as(usize, 1), opts.network_policy.allow_cidr_count);
+    try std.testing.expectEqualStrings("93.184.216.34/32", opts.network_policy.allow_cidrs[0]);
+    try std.testing.expectEqual(@as(usize, 1), opts.network_policy.allow_host_count);
+    try std.testing.expectEqualStrings("example.com", opts.network_policy.allow_hosts[0]);
 }

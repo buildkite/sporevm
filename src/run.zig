@@ -116,6 +116,7 @@ pub const Options = struct {
     continue_after_capture: bool = false,
     network: NetworkMode = .disabled,
     network_policy: spore_net_policy.Config = .{},
+    network_runtime: ?virtio_net.Runtime = null,
     events: ?EventSink = null,
     spore_executable: []const u8 = "spore",
     debug: bool = false,
@@ -925,7 +926,7 @@ pub fn networkOptionsFromManifest(allocator: std.mem.Allocator, manifest_network
     return .{ .network = .spore, .policy = policy };
 }
 
-fn manifestNetworkFromOptions(network: NetworkMode, policy: *const spore_net_policy.Config) ?spore.Network {
+pub fn manifestNetworkFromOptions(network: NetworkMode, policy: *const spore_net_policy.Config) ?spore.Network {
     if (network != .spore) return null;
     return .{
         .allow_cidrs = policy.allowCidrSlice(),
@@ -2063,6 +2064,18 @@ pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Opti
     if (opts.vcpus != 1) return error.UnsupportedVcpuCount;
 
     const backend = try resolveBackend(opts.backend);
+    var gateway: net_gateway.Process = undefined;
+    var gateway_active = false;
+    const network: virtio_net.Runtime = if (opts.network_runtime) |runtime| runtime else blk: {
+        if (opts.network == .spore) {
+            try gateway.start(context.io, allocator, opts.spore_executable, opts.debug, opts.network_policy);
+            gateway_active = true;
+            break :blk gateway.runtime();
+        }
+        break :blk .{};
+    };
+    defer if (gateway_active) gateway.deinit();
+    const network_manifest = manifestNetworkFromOptions(opts.network, &opts.network_policy);
     const kernel = try std.Io.Dir.cwd().readFileAlloc(context.io, opts.kernel_path, allocator, .limited(max_file_size));
     const initrd = try loadRunInitrd(context.io, allocator, opts.initrd_path);
     var runtime_disk = try openRuntimeDisk(context, allocator, .{
@@ -2074,7 +2087,7 @@ pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Opti
     });
     defer runtime_disk.deinit();
     const has_rootfs = opts.rootfs_path != null or opts.rootfs != null;
-    const boot_args = try cmdline(allocator, opts.guest_port, has_rootfs, rootfsWritable(opts), .disabled);
+    const boot_args = try cmdline(allocator, opts.guest_port, has_rootfs, rootfsWritable(opts), opts.network);
 
     const cause = switch (backend) {
         .auto => unreachable,
@@ -2089,9 +2102,11 @@ pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Opti
                 .disk_backend = runtime_disk.backend(),
                 .disk_snapshot = runtime_disk.snapshot(),
                 .rootfs = opts.rootfs,
+                .network_manifest = network_manifest,
                 .resume_dir = opts.resume_dir,
                 .ram_restore_mode = .eager_chunks,
                 .exec_control = control,
+                .network = network,
                 .environ_map = context.environ_map,
             });
         },
@@ -2106,13 +2121,16 @@ pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Opti
                 .disk_backend = runtime_disk.backend(),
                 .disk_snapshot = runtime_disk.snapshot(),
                 .rootfs = opts.rootfs,
+                .network_manifest = network_manifest,
                 .resume_dir = opts.resume_dir,
                 .ram_restore_mode = .eager_chunks,
                 .exec_control = control,
+                .network = network,
                 .environ_map = context.environ_map,
             });
         },
     };
+    if (network.failed()) return error.NetworkGatewayFailed;
     return switch (cause) {
         .monitor_stopped => .{ .backend = backend, .exit = .stopped },
         .snapshotted => .{ .backend = backend, .exit = .snapshotted },

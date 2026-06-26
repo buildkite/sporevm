@@ -40,6 +40,9 @@ const create_usage =
     \\  --initrd root.cpio      Initrd path (default: embedded minimal exec initrd)
     \\  --rootfs rootfs.ext4    Attach rootfs image read-only as virtio-blk
     \\  --image REF             Build or reuse cached OCI rootfs
+    \\  --net                   Experimental SporeVM-managed networking
+    \\  --allow-cidr CIDR       With --net, restrict public egress to this CIDR
+    \\  --allow-host HOST       With --net, restrict public egress to DNS A answers for this host
     \\  --memory VALUE          Guest memory: auto, 512mb, 2gb, ... (default: auto = 16GiB)
     \\  --vcpus N               Guest vCPU count; must be 1 today
     \\  --guest-port N          Guest vsock listen port (default: 10700)
@@ -133,6 +136,7 @@ pub const Spec = struct {
     rootfs_path: ?[]const u8 = null,
     rootfs: ?spore.Rootfs = null,
     disk: ?spore.Disk = null,
+    network: ?spore.Network = null,
     image_ref: ?[]const u8 = null,
     resume_dir: ?[]const u8 = null,
     memory: memory_config.Config = .{},
@@ -225,6 +229,8 @@ pub const LifecycleResult = struct {
 
 const CreateOptions = struct {
     spec: Spec,
+    network: run_mod.NetworkMode = .disabled,
+    network_policy: run_mod.NetworkPolicy = .{},
 };
 
 const ExecOptions = struct {
@@ -277,6 +283,7 @@ pub fn createCli(
     const parsed = try parseCreateArgs(args, allocator, stderr, mode);
     const parsed_ms = monotonicMs();
     var spec = parsed.spec;
+    spec.network = run_mod.manifestNetworkFromOptions(parsed.network, &parsed.network_policy);
     const paths = try cliPaths(init, allocator, "create", spec.name);
     const paths_ms = monotonicMs();
     if (!monitorBackendSupported(spec.backend)) {
@@ -513,10 +520,10 @@ pub fn resumeCli(
         exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
     };
     defer manifest.deinit();
-    if (manifest.value.network != null) {
-        const message = "spore resume: named lifecycle networking is not supported yet; use spore run --from for one-shot network resumes";
+    const network_options = run_mod.networkOptionsFromManifest(allocator, manifest.value.network) catch {
+        const message = "spore resume: invalid network policy in manifest";
         exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "resume"), message);
-    }
+    };
     const rootfs = try run_mod.resumeRootfsForRun(allocator, manifest.value);
     const disk = try run_mod.resumeDiskForRun(allocator, manifest.value);
     if (rootfs == null and manifest.value.devices.len != diskless_resume_device_count) {
@@ -549,6 +556,7 @@ pub fn resumeCli(
         .resume_dir = spore_dir,
         .rootfs = rootfs,
         .disk = disk,
+        .network = run_mod.manifestNetworkFromOptions(network_options.network, &network_options.policy),
         .memory = memory,
         .vcpus = 1,
         .guest_port = base.guest_port,
@@ -906,6 +914,8 @@ fn parseCreateArgs(
 ) !CreateOptions {
     var name: ?[]const u8 = null;
     var spec = Spec{ .name = "" };
+    var network: run_mod.NetworkMode = .disabled;
+    var network_policy = run_mod.NetworkPolicy{};
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -923,6 +933,20 @@ fn parseCreateArgs(
             spec.rootfs_path = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--image")) {
             spec.image_ref = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
+        } else if (std.mem.eql(u8, args[i], "--net")) {
+            network = .spore;
+        } else if (std.mem.eql(u8, args[i], "--allow-cidr")) {
+            const raw = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
+            network_policy.addAllowCidr(raw) catch |err| {
+                const message = allocLifecycleMessage(allocator, "spore create: invalid --allow-cidr {s}: {s}", .{ raw, @errorName(err) });
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
+            };
+        } else if (std.mem.eql(u8, args[i], "--allow-host")) {
+            const raw = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
+            network_policy.addAllowHost(raw) catch |err| {
+                const message = allocLifecycleMessage(allocator, "spore create: invalid --allow-host {s}: {s}", .{ raw, @errorName(err) });
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
+            };
         } else if (std.mem.eql(u8, args[i], "--memory")) {
             const raw = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
             spec.memory = memory_config.parse(raw) catch |err| {
@@ -973,7 +997,11 @@ fn parseCreateArgs(
         const message = "spore create: --rootfs and --image are mutually exclusive";
         exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
     }
-    return .{ .spec = spec };
+    if (network == .disabled and network_policy.hasRules()) {
+        const message = "spore create: --allow-cidr and --allow-host require --net";
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
+    }
+    return .{ .spec = spec, .network = network, .network_policy = network_policy };
 }
 
 fn parseExecArgs(args: []const []const u8) ExecOptions {
@@ -1202,6 +1230,17 @@ fn spawnMonitor(init: std.process.Init, allocator: std.mem.Allocator, spec: Spec
     if (spec.resume_dir) |path| {
         try argv.append("--resume");
         try argv.append(path);
+    }
+    if (spec.network) |network| {
+        try argv.append("--net");
+        for (network.allow_cidrs) |cidr| {
+            try argv.append("--allow-cidr");
+            try argv.append(cidr);
+        }
+        for (network.allow_hosts) |host| {
+            try argv.append("--allow-host");
+            try argv.append(host);
+        }
     }
     try appendMemoryArg(allocator, &argv, spec.memory);
     try appendIntArg(allocator, &argv, "--vcpus", spec.vcpus);
@@ -1679,6 +1718,10 @@ test "lifecycle metadata helpers round trip spec ready and pid" {
         .name = "bench-1",
         .backend = "hvf",
         .image_ref = "docker.io/library/alpine:3.20",
+        .network = .{
+            .allow_cidrs = &.{"93.184.216.34/32"},
+            .allow_hosts = &.{"example.com"},
+        },
         .memory = .{ .policy = .explicit, .bytes = 512 * 1024 * 1024 },
     });
     var spec = try readSpec(allocator, io, paths);
@@ -1686,6 +1729,8 @@ test "lifecycle metadata helpers round trip spec ready and pid" {
     try std.testing.expectEqualStrings("bench-1", spec.value.name);
     try std.testing.expectEqualStrings("hvf", spec.value.backend);
     try std.testing.expectEqualStrings("docker.io/library/alpine:3.20", spec.value.image_ref.?);
+    try std.testing.expectEqualStrings("93.184.216.34/32", spec.value.network.?.allow_cidrs[0]);
+    try std.testing.expectEqualStrings("example.com", spec.value.network.?.allow_hosts[0]);
     try std.testing.expectEqual(memory_config.Policy.explicit, spec.value.memory.policy);
     try std.testing.expectEqual(@as(u64, 512 * 1024 * 1024), spec.value.memory.bytes);
 
@@ -1715,6 +1760,27 @@ test "create parser accepts memory policy" {
     const explicit_opts = try parseCreateArgs(&.{ "bench-1", "--memory", "16gb" }, allocator, &stderr.writer, .human);
     try std.testing.expectEqual(memory_config.Policy.explicit, explicit_opts.spec.memory.policy);
     try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024 * 1024), explicit_opts.spec.memory.bytes);
+}
+
+test "create parser accepts network allow policy" {
+    const allocator = std.testing.allocator;
+    var stderr: Io.Writer.Allocating = .init(allocator);
+    defer stderr.deinit();
+
+    const opts = try parseCreateArgs(&.{
+        "bench-1",
+        "--net",
+        "--allow-cidr",
+        "93.184.216.34/32",
+        "--allow-host",
+        "example.com",
+    }, allocator, &stderr.writer, .human);
+
+    try std.testing.expectEqual(run_mod.NetworkMode.spore, opts.network);
+    try std.testing.expectEqual(@as(usize, 1), opts.network_policy.allow_cidr_count);
+    try std.testing.expectEqualStrings("93.184.216.34/32", opts.network_policy.allow_cidrs[0]);
+    try std.testing.expectEqual(@as(usize, 1), opts.network_policy.allow_host_count);
+    try std.testing.expectEqualStrings("example.com", opts.network_policy.allow_hosts[0]);
 }
 
 test "lifecycle detects incomplete ready and stale pid state" {
