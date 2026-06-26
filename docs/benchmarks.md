@@ -193,6 +193,16 @@ timings for every summarized hot path. It also includes pre-shaped series keyed
 as `benchmark/mode`, such as `cold_tti/sequential` or
 `warm_spore_tti/burst`.
 
+Each series point carries median `value`, `p95`, `p99`, success rate, commit,
+branch, and Buildkite build number. Runs also include host context (`os`,
+`arch`, `kernel`, CPU model/count, memory, load average, and disk space) so
+public charts can distinguish product movement from runner noise.
+
+When the underlying `spore run` logs expose phase timings, the suite summarizes
+them under `phase_metrics` and exports median phase values on each series point.
+Currently that includes rootfs open/verification, backend restore/pre-run,
+vsock connect, exec response, first output, and exec-probe timing slices.
+
 Append to an existing published history with:
 
 ```console
