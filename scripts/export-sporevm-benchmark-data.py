@@ -26,6 +26,11 @@ LABELS = {
     "memory_throughput": "Memory Throughput",
 }
 
+RUNNER_LABELS = {
+    "cleanroom-mac": "macOS",
+    "cleanroom-linux-arm64": "Linux ARM64",
+}
+
 
 def die(message: str) -> None:
     print(f"error: {message}", file=sys.stderr)
@@ -199,6 +204,10 @@ def merge_runs(runs: list[object], new_run: dict[str, object], max_runs: int) ->
 def build_series(runs: list[dict[str, object]]) -> list[dict[str, object]]:
     series: dict[str, dict[str, object]] = {}
     for run in runs:
+        runner = run.get("runner") if isinstance(run.get("runner"), dict) else {}
+        commit = run.get("commit") if isinstance(run.get("commit"), dict) else {}
+        runner_key = str(runner.get("queue") or "")
+        runner_label = RUNNER_LABELS.get(runner_key, runner_key)
         for raw_result in run.get("results", []):
             if not isinstance(raw_result, dict):
                 continue
@@ -206,22 +215,30 @@ def build_series(runs: list[dict[str, object]]) -> list[dict[str, object]]:
             value = number(raw_result.get("value"))
             if not name or value is None:
                 continue
+            series_name = f"{name}@{runner_key}" if runner_key else name
+            label = raw_result.get("label")
+            if runner_label:
+                label = f"{label} / {runner_label}"
             item = series.setdefault(
-                name,
+                series_name,
                 {
-                    "name": name,
+                    "name": series_name,
+                    "result_name": name,
                     "benchmark": raw_result.get("benchmark"),
                     "mode": raw_result.get("mode"),
-                    "label": raw_result.get("label"),
+                    "label": label,
                     "unit": raw_result.get("unit"),
                     "lower_is_better": raw_result.get("lower_is_better"),
+                    "runner": {"queue": runner_key} if runner_key else {},
                     "points": [],
                 },
             )
             item["points"].append({
                 "run_id": run.get("run_id"),
                 "generated_at": run.get("generated_at"),
-                "commit": (run.get("commit") or {}).get("sha") if isinstance(run.get("commit"), dict) else None,
+                "commit": commit.get("sha"),
+                "branch": commit.get("branch"),
+                "build_number": runner.get("build_number"),
                 "value": value,
                 "success_rate": raw_result.get("success_rate"),
             })
@@ -289,6 +306,12 @@ def self_test() -> None:
         data = export(args)
         assert len(data["runs"]) == 1
         assert data["series"][0]["points"][0]["value"] == 123.0
+        partitioned = build_series([
+            {"run_id": "mac", "generated_at": "2026-06-26T00:00:00Z", "runner": {"queue": "cleanroom-mac"}, "results": data["runs"][0]["results"]},
+            {"run_id": "linux", "generated_at": "2026-06-26T00:01:00Z", "runner": {"queue": "cleanroom-linux-arm64"}, "results": data["runs"][0]["results"]},
+        ])
+        assert len(partitioned) == 2
+        assert {item["label"] for item in partitioned} == {"Cold TTI / sequential / macOS", "Cold TTI / sequential / Linux ARM64"}
         summary["results"][0]["tti_ms"]["median"] = 111.0
         write_json(summary_path, summary)
         data = export(args)
