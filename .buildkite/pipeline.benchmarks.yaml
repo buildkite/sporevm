@@ -1,0 +1,76 @@
+steps:
+  - label: ":bar_chart: Benchmarks macOS"
+    key: "benchmarks-macos"
+    plugins:
+      - aws-assume-role-with-web-identity#v1.4.0:
+          role-arn: "arn:aws:iam::724772075326:role/sporevm-benchmarks-writer"
+          session-tags:
+            - organization_slug
+            - pipeline_slug
+            - runner_environment
+      - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
+          version: "2026.5.12"
+    cache:
+      paths:
+        - "~/.local/share/mise"
+        - "~/.cache/mise"
+        - "~/.local/state/mise"
+      size: "20g"
+      name: "mise-cache"
+    command: |
+      set -euo pipefail
+      scripts/ci-buildkite-benchmarks.sh
+      aws s3 sync zig-cache/sporevm-benchmarks/ "s3://sporevm-benchmarks/builds/${BUILDKITE_BUILD_NUMBER}/${BUILDKITE_COMMIT}/macos/" \
+        --no-progress \
+        --exclude "*" \
+        --include "latest-summary.json" \
+        --include "site/*" \
+        --include "buildkite-annotation.md" \
+        --include "*/config.json" \
+        --include "*/results.jsonl" \
+        --include "*/summary.json" \
+        --include "*/logs/*" \
+        --include "*/rootfs-cache/*.json" \
+        --exclude "*/work/*" \
+        --exclude "*/bundle-cache/*" \
+        --exclude "*/rootfs-cache/cas/*"
+    agents:
+      queue: cleanroom-mac
+
+  - label: ":bar_chart: Benchmarks Linux ARM64"
+    key: "benchmarks-linux-arm64"
+    plugins:
+      - aws-assume-role-with-web-identity#v1.4.0:
+          role-arn: "arn:aws:iam::724772075326:role/sporevm-benchmarks-writer"
+          session-tags:
+            - organization_slug
+            - pipeline_slug
+            - runner_environment
+      - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
+          version: "2026.5.12"
+    cache:
+      paths:
+        - "~/.local/share/mise"
+        - "~/.cache/mise"
+        - "~/.local/state/mise"
+      size: "20g"
+      name: "mise-cache"
+    command: |
+      set -euo pipefail
+      scripts/ci-buildkite-benchmarks.sh
+      aws s3 sync zig-cache/sporevm-benchmarks/ "s3://sporevm-benchmarks/builds/${BUILDKITE_BUILD_NUMBER}/${BUILDKITE_COMMIT}/linux-arm64/" \
+        --no-progress \
+        --exclude "*" \
+        --include "latest-summary.json" \
+        --include "site/*" \
+        --include "buildkite-annotation.md" \
+        --include "*/config.json" \
+        --include "*/results.jsonl" \
+        --include "*/summary.json" \
+        --include "*/logs/*" \
+        --include "*/rootfs-cache/*.json" \
+        --exclude "*/work/*" \
+        --exclude "*/bundle-cache/*" \
+        --exclude "*/rootfs-cache/cas/*"
+    agents:
+      queue: cleanroom-linux-arm64
