@@ -3,6 +3,7 @@ set -euo pipefail
 
 upload_benchmark_artifacts() {
   buildkite-agent artifact upload "zig-cache/sporevm-benchmarks/latest-summary.json" || true
+  buildkite-agent artifact upload "zig-cache/sporevm-benchmarks/site/*" || true
   buildkite-agent artifact upload "zig-cache/sporevm-benchmarks/*/config.json" || true
   buildkite-agent artifact upload "zig-cache/sporevm-benchmarks/*/results.jsonl" || true
   buildkite-agent artifact upload "zig-cache/sporevm-benchmarks/*/summary.json" || true
@@ -44,6 +45,7 @@ trap finish_benchmark_step EXIT
 mise install
 mise run build
 scripts/benchmark-sporevm-suite.py --profile "${SPOREVM_BENCHMARK_PROFILE:-comparison}" --no-build
+scripts/export-sporevm-benchmark-data.py zig-cache/sporevm-benchmarks/latest-summary.json
 if [[ -n "${SPOREVM_BENCHMARK_BASELINE:-}" ]]; then
   scripts/compare-sporevm-benchmarks.py "${SPOREVM_BENCHMARK_BASELINE}" zig-cache/sporevm-benchmarks/latest-summary.json
 fi

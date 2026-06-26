@@ -10,6 +10,21 @@ It writes raw JSONL, a summary JSON, logs, and a `latest-summary.json` pointer
 under `zig-cache/sporevm-benchmarks/`. The output is designed for CI artifact
 upload and later comparison.
 
+Export static trend data for dashboards with:
+
+```console
+mise run benchmark:export
+```
+
+That converts `latest-summary.json` into:
+
+- `zig-cache/sporevm-benchmarks/site/data.json`
+- `zig-cache/sporevm-benchmarks/site/data.js`
+
+The JavaScript artifact assigns `window.SPOREVM_BENCHMARK_DATA`, so a static
+page can render the latest run plus any retained history without learning the
+runner's raw artifact layout.
+
 ## Profiles
 
 ```console
@@ -160,30 +175,6 @@ Compare two summary files with:
 scripts/compare-sporevm-benchmarks.py baseline-summary.json candidate-summary.json
 ```
 
-## Substrate Snapshot Comparison
-
-The public Substrate snapshot page measures restore start to the first in-guest
-vsock reply. The closest SporeVM product-path comparison is resumed child
-`exec_response_ms` from `spore run --events=jsonl --from child -- /bin/true`.
-
-```console
-mise run benchmark:substrate-snapshot
-```
-
-For a quick 2 GiB local check:
-
-```console
-scripts/benchmark-substrate-snapshot.py --memory-mib 2048 --iterations 1
-```
-
-This fetches the latest `https://benchmarks.substrate.so/<arch>/data.js`, runs
-matching RAM sizes, and writes JSONL plus `summary.json` under
-`zig-cache/sporevm-substrate-snapshot/`. Restore rows fail by default unless the
-child used proof-backed local RAM with backend `mode=local_backing` and
-`MAP_PRIVATE` file-backed memory. The summary reports both the existing
-`exec_response_ms` and `backend_pre_run_ms + exec_response_ms`, which is the
-closer restore-to-first-reply comparison.
-
 Defaults fail when:
 
 - median TTI regresses by more than 20 percent and at least 50ms;
@@ -194,23 +185,61 @@ Defaults fail when:
 Thresholds are flags so CI can tighten release gates without changing the
 benchmark data format.
 
+## Publishing Trends
+
+The export format is intentionally small: each run records commit and runner
+metadata, benchmark profile, backend, image, memory, and lower-is-better median
+timings for every summarized hot path. It also includes pre-shaped series keyed
+as `benchmark/mode`, such as `cold_tti/sequential` or
+`warm_spore_tti/burst`.
+
+Append to an existing published history with:
+
+```console
+scripts/export-sporevm-benchmark-data.py \
+  zig-cache/sporevm-benchmarks/latest-summary.json \
+  --history public-benchmarks/data.json \
+  --json-out public-benchmarks/data.json \
+  --js-out public-benchmarks/data.js
+```
+
+Keep separate histories for different hardware classes or profiles. A `ci`
+profile on a busy shared runner and a `full` profile on fixed A1 hardware answer
+different questions.
+
 ## Buildkite
 
-The Buildkite benchmark step runs automatically on `main` after merge. Non-main
-builds can opt in with:
+The main Buildkite pipeline triggers the dedicated `sporevm-benchmarks` pipeline
+on `main` after merge. Non-main builds can opt in with:
 
 ```console
 SPOREVM_RUN_BENCHMARKS=1
 ```
 
-It runs on `cleanroom-mac` by default so the suite has a supported HVF backend,
-and defaults to the broader `comparison` profile. Override with
-`SPOREVM_BENCHMARK_PROFILE=ci` for a short cold/warm run, or `full` when a build
-should pay for the full benchmark matrix.
+The dedicated benchmark pipeline runs macOS and Linux ARM64 benchmark jobs in
+parallel on `cleanroom-mac` and `cleanroom-linux-arm64`. It defaults to the
+broader `comparison` profile. Override with `SPOREVM_BENCHMARK_PROFILE=ci` for a
+short cold/warm run, or `full` when a build should pay for the full benchmark
+matrix.
+
+The benchmark steps live in `.buildkite/pipeline.benchmarks.yaml`. A standalone
+Buildkite pipeline can use this repository with this upload command:
+
+```console
+buildkite-agent pipeline upload .buildkite/pipeline.benchmarks.yaml
+```
+
+That dedicated pipeline also uploads the full benchmark directories to:
+
+```text
+s3://sporevm-benchmarks/builds/${BUILDKITE_BUILD_NUMBER}/${BUILDKITE_COMMIT}/macos/
+s3://sporevm-benchmarks/builds/${BUILDKITE_BUILD_NUMBER}/${BUILDKITE_COMMIT}/linux-arm64/
+```
 
 If `SPOREVM_BENCHMARK_BASELINE` points to a summary JSON available in the job
 workspace, the step compares the new `latest-summary.json` against that
 baseline. Baselines should come from the same profile unless the comparator is
 run by hand with a narrower `--only` list. Regardless of comparison result, the
-step uploads benchmark JSON, logs, and rootfs metadata as artifacts and publishes
-a Buildkite annotation summarizing the latest benchmark run.
+step exports `site/data.json` and `site/data.js`, uploads benchmark JSON, logs,
+rootfs metadata, and trend data as artifacts, and publishes a Buildkite
+annotation summarizing the latest benchmark run.
