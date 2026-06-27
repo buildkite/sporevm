@@ -1,9 +1,10 @@
 # Agent Notes
 
-- The plan of record is `docs/plans/foundation.md`. Work in slices; keep the
-  plan updated when scope, sequencing, or decisions change.
-- This project is in early development: breaking changes are acceptable, and
-  the spore format carries no compatibility promise before 1.0.
+- Durable contracts live in `docs/`. Active follow-up plans live in
+  `docs/plans/`; update the relevant plan when scope, sequencing, or decisions
+  change.
+- SporeVM is still evolving, but post-1.0 user-facing and format changes should
+  be deliberate, documented, and reflected in release notes.
 - Zig toolchain is pinned in `mise.toml`. Build with `mise run build`, test
   with `mise run test`. Do not float the Zig version casually; upgrades are
   deliberate, one release at a time.
@@ -13,7 +14,8 @@
 - Machine state in spore manifests is normalized architectural aarch64 state.
   Never serialize raw KVM or Hypervisor.framework structs into the format.
 - Keep the device model frozen: virtio-mmio console, blk, net, vsock, rng,
-  plus the generation device. Additions require editing the foundation plan.
+  plus the generation device. Additions require updating `docs/spore-format.md`,
+  `SECURITY.md`, and the relevant durable design doc.
 - Hypervisor-specific code lives behind the hypervisor interface; device
   model, DTB generation, and manifest code must stay backend-neutral and
   shared.

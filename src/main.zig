@@ -1,7 +1,7 @@
 //! The `spore` CLI.
 //!
-//! `spore run` is the one-shot path. Named VM lifecycle commands grow in
-//! monitor-backed slices; see docs/plans/lifecycle-monitor.md.
+//! `spore run` is the one-shot path. Named VM lifecycle commands are backed by
+//! local monitor processes; see docs/lifecycle.md.
 
 const std = @import("std");
 const Io = std.Io;

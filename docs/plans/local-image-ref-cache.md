@@ -1,17 +1,15 @@
 ---
 status: active
-last_reviewed: 2026-06-26
+last_reviewed: 2026-06-28
 spec_refs:
-  - docs/plans/foundation.md
-  - docs/plans/lifecycle-monitor.md
+  - docs/lifecycle.md
   - docs/filesystem.md
   - docs/rootfs.md
   - src/local_paths.zig
   - src/run.zig
   - src/rootfs.zig
 related_plans:
-  - docs/plans/foundation.md
-  - docs/plans/lifecycle-monitor.md
+  - docs/lifecycle.md
   - docs/filesystem.md
 ---
 

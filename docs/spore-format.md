@@ -1,7 +1,12 @@
 # Spore Format
 
-**Status:** v0 implemented (`src/spore.zig`), single-vCPU, same-host HVF and
-KVM producers/consumers. v0 carries no compatibility promise.
+**Status:** manifest format v0 implemented (`src/spore.zig`), single-vCPU,
+same-host HVF and KVM producers/consumers.
+
+Format v0 is still the current SporeVM 1.x manifest and artifact contract.
+Do not rename version or kind strings to v1 for release-label symmetry; use a
+format v1 only for an incompatible on-disk, bundle, or guest-visible contract
+change with a migration decision.
 
 A spore is a sealed, content-addressed checkpoint of a VM. The format, not the
 implementation, is the product: two SporeVM builds on different hypervisors
@@ -133,7 +138,7 @@ object-store sources, `remote.peer_bytes_read` for HTTP(S) peer sources,
 `materialization.cache.bytes_reused`, and rootfs cache hit/fetch/reuse counters
 under `rootfs.cache`.
 
-## Manifest v0
+## Manifest Format v0
 
 `manifest.json` fields (see `src/spore.zig` for the authoritative shapes):
 
@@ -231,26 +236,26 @@ under `rootfs.cache`.
   must attach a fresh gateway that satisfies the recorded `requirements` and
   policy or fail closed.
 
-## Not yet captured in v0
+## Not Yet Captured By Manifest v0
 
 - General block-device state is still incomplete. The current writable disk
   contract is one rootfs-bound COW chain over a verified immutable ext4 rootfs
   artifact.
 - Access traces: the KVM and HVF lazy-restore harnesses can write local
-  first-touch traces for measurement, but v0 does not persist access traces or
-  prefetch hints in the manifest.
+  first-touch traces for measurement, but manifest v0 does not persist access
+  traces or prefetch hints.
 - Multi-vCPU machine state.
 - Kernel identity in the platform contract (pinned-build enforcement).
 - Durable disk/device identity fixup beyond the current diskless helper. The
   product initrd consumes generation params for hostname and applies
   host-provided start/resume time to the guest clock, but machine-id, MAC,
   entropy, and other disk-backed workload fixups are not final.
-- Cross-frequency architected timer restore: v0 records and enforces the
-  counter frequency, but cannot translate a running Linux guest between
+- Cross-frequency architected timer restore: manifest v0 records and enforces
+  the counter frequency, but cannot translate a running Linux guest between
   different `CNTFRQ_EL0` domains.
-- Live network flows: v0 persists requested network capability and policy only.
-  Active TCP flows and learned DNS answers are dropped across capture, resume,
-  and fork.
+- Live network flows: manifest v0 persists requested network capability and
+  policy only. Active TCP flows and learned DNS answers are dropped across
+  capture, resume, and fork.
 
 ## Invariants that hold regardless of version
 
@@ -301,4 +306,5 @@ under `rootfs.cache`.
   reject.
 - Manifests carry a format version; consumers fail closed on versions or
   platform contracts they cannot satisfy.
-- Pre-1.0 versions carry no compatibility promise.
+- A future format-version bump needs an explicit compatibility and migration
+  decision.

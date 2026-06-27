@@ -12,7 +12,7 @@ const generation = @import("generation.zig");
 /// Device model version recorded in spore manifests.
 pub const device_model_version = 4;
 
-/// CPU feature profile recorded in spore manifests. v0 is the current
+/// CPU feature profile recorded in spore manifests. Profile v0 is the current
 /// Apple-M/Graviton common-denominator policy; KVM enforces it by masking RNDR
 /// before guest boot.
 pub const cpu_profile = "sporevm-aarch64-v0";

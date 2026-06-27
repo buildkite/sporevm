@@ -1,0 +1,103 @@
+# Named Lifecycle
+
+Named lifecycle keeps a VM alive behind one local monitor process so callers can
+create a warmed guest, run repeated commands, checkpoint it, resume it under a
+new name, and remove it without learning the monitor socket protocol.
+
+## User Contract
+
+```bash
+spore create bench-1 --image docker.io/library/alpine:3.20
+spore exec bench-1 -- /bin/echo hi
+spore suspend bench-1 --out bench-1.spore
+spore resume bench-1.spore --name bench-2
+spore ls
+spore rm bench-2
+```
+
+`spore run` remains the one-shot command. The stable named surface is
+`create`, `exec`, `suspend`, `resume --name`, `fork --vm`, `ls`, and `rm` on
+supported HVF and KVM hosts.
+
+Machine callers use global `--json` for single-result lifecycle commands:
+
+```bash
+spore --json create bench-1 --image docker.io/library/alpine:3.20
+spore --json ls
+```
+
+`spore exec` forwards guest stdout and stderr as workload streams.
+
+## Runtime State
+
+Live VM state is runtime state, not cache state:
+
+```text
+$SPOREVM_RUNTIME_DIR/vms/<name>/
+  control.sock
+  pid
+  spec.json
+  ready.json
+  create-timing.json
+  monitor-timing.json
+  console.log
+```
+
+If `SPOREVM_RUNTIME_DIR` is unset, SporeVM uses the platform runtime directory
+or a private temp fallback. Runtime directories must be private to the current
+user. Stale entries fail closed unless the recorded monitor pid is dead and the
+user removes or recreates the VM.
+
+Each VM has one monitor process. The monitor owns the hypervisor VM, vCPU loop,
+virtio state, rootfs fd, writable disk state, console log, vsock state, optional
+network gateway, and a local newline-delimited JSON control socket.
+
+## Checkpoints And Forks
+
+`spore suspend NAME --out DIR` consumes the named VM and writes a spore.
+`spore snapshot` is not a public command; live named fork uses an internal
+snapshot-and-continue monitor action so the source VM keeps running:
+
+```bash
+spore create golden
+spore exec golden -- /bin/true
+spore fork --vm golden --count 2 --name worker-%d
+spore exec worker-0 -- /bin/writeout
+```
+
+`--name` is required with `--vm`. For `--count > 1`, it must contain exactly one
+`%d`-style integer placeholder. SporeVM validates every child name before
+pausing the source VM.
+
+Named checkpoints support diskless VMs, image-created writable rootfs state, and
+explicit `--rootfs PATH` checkpoints backed by exact immutable rootfs artifacts.
+Named live fork is currently diskless-only.
+
+## Monitor Boundary
+
+The monitor protocol is local-only and protected by private runtime-directory
+permissions. There is no TCP control socket and no central `spore daemon`.
+Unknown monitor request types fail closed.
+
+Monitor processes deny child process execution through an embedded macOS
+sandbox profile or Linux seccomp filter after optional startup helpers are
+spawned. `mise run smoke:monitor-jail` covers the denied-operation path.
+
+## Limits
+
+- No stdin streaming, TTY, or interactive terminal.
+- No multi-vCPU lifecycle support until the run path supports it.
+- No disk-backed or networked named live fork yet.
+- No live network-flow checkpointing.
+- No OCI `Entrypoint`, `Cmd`, or `User` semantics. Callers pass explicit argv.
+
+## Validation
+
+Useful focused checks:
+
+```bash
+mise run smoke:lifecycle
+mise run smoke:monitor-jail
+mise run smoke:monitor-failure-modes
+scripts/benchmark-sporevm-lifecycle.sh
+```
