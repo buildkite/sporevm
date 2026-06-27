@@ -205,7 +205,8 @@ When the underlying `spore run` logs expose phase timings, the suite summarizes
 them under `phase_metrics` and exports median phase values on each series point.
 Currently that includes rootfs open/verification, backend restore/pre-run,
 backend run/tail, vsock connect, exec response, first output, and exec-probe
-timing slices.
+timing slices. KVM runs also export probe-completion timing, and guest timing
+frames expose listen, request accept/decode, spawn, and exit slices.
 
 Append to an existing published history with:
 
