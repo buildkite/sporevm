@@ -111,10 +111,10 @@ spore run --net --events=jsonl -- /bin/wget -qO- http://169.254.169.254/
 Networking is off by default. `--net` means "attach the guest to a
 SporeVM-managed virtual network." The default policy allows outbound public
 egress but blocks dangerous host/control-plane destinations. When allow rules
-are present, egress is restricted to the configured hosts and CIDRs. Bound
-services are explicit guest-local names backed by host Unix sockets or loopback
-TCP endpoints; they do not replace the egress policy and are not published host
-ports.
+are present, egress is restricted to the configured hosts and CIDRs. The landed
+bound-service shape is one explicit guest-local name backed by a host Unix
+stream socket; it does not replace the egress policy and is not a published host
+port. Loopback TCP targets are deferred.
 
 The internal data path is:
 
@@ -513,9 +513,14 @@ Definition of done:
 - Policy-profile files or reusable network policy manifests.
 - Programmable policy languages such as CEL or eBPF.
 - Optional diagnostic adapters such as `tap:<ifname>` or external helper engines.
+- Bound-service TCP loopback targets, custom guest ports, multiple services or
+  service IPs, and application-layer `Host` routing.
+- Bound-service availability events.
+- Manifest/schema support to persist declared bound services and re-bind them
+  for capture, `spore run --from`, and named resume.
 
 ## Open Questions
 
-No open question blocks the first slice. The first implementation can choose the
-frame-stream transport shape as an internal detail and revise this plan once the
-virtio-net backend interface lands.
+No open question blocks the current implemented slice. Remaining bound-service
+work is listed under Deferred Work and should stay out of the first PR unless a
+real caller needs it.
