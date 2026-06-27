@@ -882,15 +882,35 @@ fn fuzzFrameStreamAndArp(_: void, s: *std.testing.Smith) !void {
     const len = @min(s.slice(&bytes), bytes.len);
     var out: [max_frame_len]u8 = undefined;
     var forwarder = TestDnsForwarder{ .fail = true };
+    const bound_service = spore_net_policy.BoundService{
+        .declaration = "metadata=unix:/tmp/metadata.sock",
+        .name = "metadata",
+        .unix_path = "/tmp/metadata.sock",
+    };
 
     _ = arpReply(bytes[0..len], &out);
     _ = frameReply(bytes[0..len], &out, forwarder.forwarder(), null, null);
+    _ = frameReply(bytes[0..len], &out, forwarder.forwarder(), null, bound_service);
+
+    var query_buf: [512]u8 = undefined;
+    const query = testDnsQuery(0x4545, "metadata.spore.internal", &query_buf);
+    var frame_buf: [max_frame_len]u8 = undefined;
+    const service_frame = testDnsFrame(query, &frame_buf);
+    _ = frameReply(service_frame, &out, forwarder.forwarder(), null, bound_service);
+
+    var mutated_buf: [max_frame_len]u8 = undefined;
+    @memcpy(mutated_buf[0..service_frame.len], service_frame);
+    for (bytes[0..@min(len, service_frame.len)], 0..) |byte, i| {
+        mutated_buf[i] ^= byte;
+    }
+    _ = frameReply(mutated_buf[0..service_frame.len], &out, forwarder.forwarder(), null, bound_service);
 
     if (len < frame_header_len) return;
     const frame_len = decodeFrameLen(bytes[0..frame_header_len]) catch return;
     if (frame_header_len + frame_len > len) return;
     _ = arpReply(bytes[frame_header_len..][0..frame_len], &out);
     _ = frameReply(bytes[frame_header_len..][0..frame_len], &out, forwarder.forwarder(), null, null);
+    _ = frameReply(bytes[frame_header_len..][0..frame_len], &out, forwarder.forwarder(), null, bound_service);
 }
 
 test "fuzz spore-netd frame stream, ARP, IPv4, UDP, and DNS handling" {
