@@ -54,6 +54,10 @@ mixed into TTI. By default the suite also performs an untimed
 OCI-to-ext4 materialization are not mixed into TTI. Pass `--no-prewarm-rootfs`
 when intentionally measuring the full cold image path.
 
+TTI profiles default to `--memory 512mb` so startup comparisons measure the hot
+launch path rather than the first-slice `auto` memory contract. Pass
+`--memory auto` when intentionally measuring the 16GiB automatic-memory path.
+
 ## Benchmarks
 
 ### Cold TTI
@@ -63,7 +67,7 @@ Cold TTI follows the ComputeSDK benchmark shape: the timer starts before
 after the command completes.
 
 ```text
-spore run --image node@sha256:... --memory auto -- /usr/local/bin/node -v
+spore run --image node@sha256:... --memory 512mb -- /usr/local/bin/node -v
 ```
 
 This path works on both KVM and HVF today. It is the apples-to-apples startup

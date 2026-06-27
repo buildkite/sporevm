@@ -1146,7 +1146,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--backend", default=infer_backend(), choices=("auto", "hvf", "kvm"))
     parser.add_argument("--image", default=DEFAULT_IMAGE)
     parser.add_argument("--platform", default=DEFAULT_PLATFORM)
-    parser.add_argument("--memory", default="auto")
+    parser.add_argument("--memory", default="512mb")
     parser.add_argument("--command", default=DEFAULT_COMMAND)
     parser.add_argument("--timeout-s", type=int)
     parser.add_argument("--writable-rootfs-iterations", type=int, help="Writable-rootfs iterations per workload")
