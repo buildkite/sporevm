@@ -1,18 +1,20 @@
 ---
 status: active
-last_reviewed: 2026-06-20
+last_reviewed: 2026-06-28
 spec_refs:
-  - docs/plans/foundation.md
+  - docs/memory.md
   - docs/plans/automatic-memory.md
   - docs/spore-format.md
+  - docs/fanout.md
   - SECURITY.md
   - src/resume.zig
   - src/fanout.zig
   - src/spore.zig
 related_plans:
-  - docs/plans/foundation.md
+  - docs/memory.md
   - docs/plans/automatic-memory.md
-  - docs/plans/distribution.md
+  - docs/filesystem.md
+  - docs/fanout.md
 ---
 
 # Automatic Local RAM Backing
@@ -73,9 +75,9 @@ provenance plus fallback, not as content verification of the whole backing file.
 - No macOS kernel-enforced page verification in the first slice.
 - No change to the manifest chunk format or the portable distribution contract.
 - No attempt to defend against a malicious same-UID local process that can read
-  the host-local signing key and rewrite local files. The v0 threat model is
-  untrusted guests and untrusted peers, not hostile code with the user's local
-  filesystem authority.
+  the host-local signing key and rewrite local files. The current threat model
+  is untrusted guests and untrusted peers, not hostile code with the user's
+  local filesystem authority.
 
 ## Target Model
 

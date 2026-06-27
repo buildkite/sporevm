@@ -8,6 +8,17 @@ The public module is [`src/libspore.zig`](../src/libspore.zig). It re-exports
 the product surface from [`src/api.zig`](../src/api.zig); backend, device,
 storage, monitor, and CLI modules stay internal.
 
+## Product Contract
+
+The CLI is the widest process contract: human output by default, global
+`spore --json <command>` for supported single-result commands, and explicit
+JSONL event streams for runtime events. Workload stdout and stderr stay workload
+streams.
+
+`libspore` is the in-process contract. The CLI, C ABI, and Go binding wrap the
+same product APIs and JSON result schemas; they should not reimplement command
+behavior or depend on CLI parsing.
+
 ## Importing
 
 Add the module from this package in your `build.zig` dependency graph, then:
@@ -186,6 +197,9 @@ The named surface is:
 `deinitNamedForkResult`, and `deinitNamedList` for owned results.
 
 ## Networking
+
+See [SporeVM Networking](networking.md) for the CLI policy and manifest
+contract.
 
 Call `networkCapabilities()` before accepting user policy:
 

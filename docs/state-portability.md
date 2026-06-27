@@ -1,8 +1,8 @@
 # Spore State Portability Contract
 
-**Status:** v0 current implementation. This document records what SporeVM can
-capture, map, translate, and reject when restoring an aarch64 spore across the
-KVM and Hypervisor.framework backends.
+**Status:** current implementation for manifest format v0. This document records
+what SporeVM can capture, map, translate, and reject when restoring an aarch64
+spore across the KVM and Hypervisor.framework backends.
 
 The spore format describes bytes on disk. This document describes the portable
 meaning of those bytes: which guest-visible state is part of the contract, how
@@ -14,14 +14,16 @@ failed runs and keep backend-private state out of the spore contract.
 
 ## Scope
 
-v0 portability is deliberately narrow:
+Manifest-format-v0 portability is deliberately narrow:
 
 - Guest ISA: aarch64 only.
 - vCPU topology: one vCPU.
 - Backends: Linux KVM and Apple Hypervisor.framework.
 - Device model: the frozen SporeVM board contract — virtio-mmio console,
   optional blk, net, vsock, rng, and the generation MMIO device.
-- Memory: full eager RAM materialization from content-addressed chunks.
+- Memory: portable restore is chunk-authoritative. Product same-host restore may
+  use local proof-backed `ram.backing`, but that is acceleration metadata, not a
+  portability authority.
 - Disk: a captured `spore run --image` workload may reference one verified
   immutable ext4 rootfs artifact and, for image-created spores, manifest-bound
   chunked rootfs storage. It may also reference an optional sealed writable
@@ -29,16 +31,15 @@ v0 portability is deliberately narrow:
   rootfs artifacts, layer indexes, and disk objects. General block devices are
   still outside the portable contract.
 
-Cross-ISA restore, multi-vCPU restore, persisted access traces, remote product
-proof for writable disk bundles, and broader disk/device fixups are later
-slices.
+Cross-ISA restore, multi-vCPU restore, persisted access traces, general volumes,
+and broader disk/device fixups are later slices.
 
 ## Platform contract
 
 `manifest.platform` is the restore gate. The destination backend must satisfy
 these fields exactly unless this document says a field is translatable:
 
-| Field | v0 policy | Why it matters |
+| Field | Current policy | Why it matters |
 | --- | --- | --- |
 | `arch` | must be `aarch64` | Guest RAM and registers are ISA-specific. |
 | `cpu_profile` | must match `sporevm-aarch64-v0` | Guest-visible feature IDs must match the saved execution environment. |
@@ -51,7 +52,8 @@ these fields exactly unless this document says a field is translatable:
 Current observed timer contracts:
 
 - Apple Hypervisor.framework guest timer: `24_000_000` Hz.
-- AWS Graviton KVM dev host: `1_050_000_000` Hz.
+- AWS `m7g.metal` KVM host: `1_050_000_000` Hz.
+- AWS `a1.metal` KVM host: `83_333_333` Hz.
 
 That mismatch is intentionally rejected. A positive KVM→HVF smoke needs a KVM
 producer whose guest-visible counter frequency is 24MHz, or a later timer
@@ -60,7 +62,7 @@ block identical-host fork/fan-out.
 
 ## State inventory
 
-| State area | Spore representation | KVM producer | KVM consumer | HVF producer | HVF consumer | v0 status |
+| State area | Spore representation | KVM producer | KVM consumer | HVF producer | HVF consumer | Status |
 | --- | --- | --- | --- | --- | --- | --- |
 | RAM | BLAKE3-addressed fixed chunks, zero chunks elided | yes | yes | yes | yes | portable |
 | GPRs `x0`–`x30` | fixed array | yes | yes | yes | yes | portable |
@@ -82,7 +84,7 @@ block identical-host fork/fan-out.
 | Immutable rootfs base | optional exact artifact plus optional `chunked-ext4-rootfs-v0` storage descriptor | yes via `spore run --image` | verifies exact artifact fd or chunked index/chunks | yes via `spore run --image` | verifies exact artifact fd or chunked index/chunks | product resume base |
 | Writable root disk layers | optional `cow-block-v0` chain over the effective immutable rootfs base | yes for local layer store | verifies layer indexes and disk objects | yes for local layer store | verifies layer indexes and disk objects | product resume; bundle materialization unit-covered |
 | Network capability and policy | optional `spore-net-v0` plus allow CIDRs/hosts, exact host-port rules, and bound-service requirements; no live flows or host socket material | yes | fresh gateway | yes | fresh gateway | policy portable; flows dropped; bound services fail closed unless restored |
-| General writable disk contents | not represented | no | reject | no | reject | out of v0 |
+| General writable disk contents | not represented | no | reject | no | reject | out of current format |
 | Kernel identity | not yet represented | no | no | no | no | planned contract field |
 | Access trace | not yet represented | no | no | no | no | local KVM/HVF lazy traces only; not a portability contract |
 
@@ -96,7 +98,7 @@ enters the manifest.
 The value is guest architectural state and may be copied by name across
 backends.
 
-Current portable v0 set:
+Current portable manifest-v0 set:
 
 - GPRs: `x0`–`x30`.
 - Control flow: `pc`, `cpsr`.
@@ -117,8 +119,8 @@ spec update and backend mapping in the same slice.
 The value is guest-visible but chosen by the board/backend contract rather than
 by the suspended workload.
 
-- `mpidr_el1` is captured for inspection but skipped on apply. The v0 board is
-  single-vCPU and sets MPIDR during vCPU bring-up.
+- `mpidr_el1` is captured for inspection but skipped on apply. The current
+  board is single-vCPU and sets MPIDR during vCPU bring-up.
 - GIC base addresses are not translated. They are platform fields and must
   match because the guest has already observed and mapped them.
 
@@ -127,7 +129,7 @@ by the suspended workload.
 The value is controlled by the CPU profile at guest creation, not by saving raw
 backend feature registers.
 
-- ID registers such as `ID_AA64*` are not serialized in v0.
+- ID registers such as `ID_AA64*` are not serialized in manifest v0.
 - KVM masks `ID_AA64ISAR0_EL1.RNDR` so Linux does not patch in RNDR/RNDRRS
   instructions unavailable on Apple Hypervisor.framework guests.
 - Restore checks `cpu_profile` instead of trying to reconcile raw host feature
@@ -157,9 +159,10 @@ escape hatch.
 
 ### Outside the spore
 
-These are intentionally not captured in v0:
+These are intentionally not captured in manifest v0:
 
-- Disk contents and external host files.
+- General disk contents and external host files. Rootfs-bound `cow-block-v0`
+  layers are captured as described above.
 - Network connections and host-side sockets.
 - Host paths, credentials, secrets, and runtime policy.
 - Kernel image identity and DTB identity, until the platform contract grows
@@ -167,10 +170,10 @@ These are intentionally not captured in v0:
 
 ## GICv3 portability
 
-Portable GIC state is the most backend-sensitive part of v0. The manifest form
-is architectural: distributor and redistributor MMIO offsets plus ICC register
-names. Backend handles, object references, and raw kernel/HVF structs must not
-cross the format boundary.
+Portable GIC state is the most backend-sensitive part of the current manifest
+format. The manifest form is architectural: distributor and redistributor MMIO
+offsets plus ICC register names. Backend handles, object references, and raw
+kernel/HVF structs must not cross the format boundary.
 
 ### KVM
 
@@ -200,7 +203,7 @@ Current HVF gaps:
 - asserted PPI line levels from a portable producer are rejected on HVF because
   there is no safe destination API for them;
 - a few unsupported zero/reset registers are skipped only when their value is
-  known to be harmless for the v0 single-vCPU board.
+  known to be harmless for the current single-vCPU board.
 
 ## Restore direction matrix
 
@@ -261,9 +264,9 @@ Current evidence:
 ## Next contract work
 
 1. Add kernel image identity to the platform contract.
-2. Broaden disk-backed remote proof beyond same-class KVM while keeping the
-   product disk contract rootfs-bound; add general volumes only for a concrete
-   workflow that cannot live in the rootfs.
+2. Broaden disk-backed portability evidence beyond same-class KVM while keeping
+   the product disk contract rootfs-bound; add general volumes only for a
+   concrete workflow that cannot live in the rootfs.
 3. Decide the timer portability design: fixed guest timer profile at VM
    creation, frequency-neutral timer state plus guest-visible constraints, or
    host-class matching only.

@@ -7,7 +7,7 @@ that alters the attack surface.
 
 ## Threat Model
 
-An untrusted guest must not escape the VMM. The v0 threat model is self-hosted
+An untrusted guest must not escape the VMM. The current threat model is self-hosted
 CI and agent isolation: hostile code runs inside the guest, and chunk data may
 arrive from untrusted peers. We do not claim hardened multi-tenant public
 cloud isolation.
@@ -27,7 +27,7 @@ fuzz targets from the slice that introduces it:
 | Guest memory access during dirty scans | guest | KVM dirty-log and HVF write-protect harness paths have landed; dirty pages plus VMM-originated virtio writes are coalesced to fixed 2MiB chunks, zero chunks are elided, and non-zero chunks are BLAKE3-addressed before being recorded in the manifest. |
 | Lazy RAM fault handling | guest page faults plus spore CAS chunks | KVM userfaultfd and HVF abort-exit paths are opt-in; faults materialize whole verified chunks and fail closed on malformed manifests or chunk mismatches |
 | Spore manifest decode | registry, disk | fuzzed; unknown versions and malformed manifests fail closed |
-| CAS chunk reads | peers, registry, disk | BLAKE3 verified before restore; malformed memory manifests are fuzzed; compression is not in v0 |
+| CAS chunk reads | peers, registry, disk | BLAKE3 verified before restore; malformed memory manifests are fuzzed; compression is unsupported |
 | Local RAM backing proof sidecar | local disk | Product restore paths open `ram.backing.proof` without following symlinks, require a regular file, and read at most 16KiB; malformed JSON, missing keys, foreign keys, stale file identity, memory fingerprint mismatch, and bad MAC fall back to verified chunks. The proof is host-local provenance metadata for a `MAP_PRIVATE` fd, not portable byte-integrity authority |
 | Bundle metadata, chunkpack index, pack segments, and pull/push URIs | peers, registry, disk, S3, HTTP(S) | `bundle.json`, `rootfs.index.json`, and chunkpack index parsing are fuzzed; unpack/pull only accept canonical metadata paths, canonical child ids, canonical pack paths, verified rootfs artifact paths, descriptor-derived rootfs CAS index/object paths, manifest-derived disk layer/object paths, absolute undecoded `file://` pull sources, and digest-pinned `s3://...@sha256:<bundle>` or `http(s)://...@sha256:<bundle>` pull sources. S3 and HTTP(S) pull download only the canonical files named by validated metadata, verify the canonical bundle digest before materialization, then verify segment SHA256 plus logical BLAKE3 chunk IDs, rootfs CAS index/object digests, and BLAKE3 disk objects before writing chunks or attaching writable disk layers. HTTP(S) redirects, mutable query strings, fragments, userinfo, percent-encoded paths, and path traversal are rejected |
 | Node-local distribution chunk cache | local disk | `spore pull` stores memory chunks by BLAKE3 id only after verifying source bytes, re-verifies cache hits before hard-linking or copying them into a materialized spore, and fails closed on corrupt, non-file, or symlinked cache entries |
@@ -58,8 +58,8 @@ fuzz targets from the slice that introduces it:
   use chunked rootfs storage, and explicit `--rootfs PATH` VMs use exact rootfs
   artifacts.
 - **The device model stays minimal.** Every device addition expands both the
-  attack surface and the portability contract, and requires editing
-  docs/plans/foundation.md.
+  attack surface and the portability contract, and requires updating
+  `docs/spore-format.md`, this document, and the relevant durable design doc.
 - **Fuzzing runs continuously in CI**, not as a one-off audit.
 
 ## Reporting

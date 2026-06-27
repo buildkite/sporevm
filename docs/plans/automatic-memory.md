@@ -1,9 +1,9 @@
 ---
 status: active
-last_reviewed: 2026-06-20
+last_reviewed: 2026-06-28
 spec_refs:
-  - docs/plans/foundation.md
-  - docs/plans/lifecycle-monitor.md
+  - docs/memory.md
+  - docs/lifecycle.md
   - docs/spore-format.md
   - src/run.zig
   - src/lifecycle.zig
@@ -11,8 +11,8 @@ spec_refs:
   - src/kvm/vm.zig
   - src/hvf/vm.zig
 related_plans:
-  - docs/plans/foundation.md
-  - docs/plans/lifecycle-monitor.md
+  - docs/memory.md
+  - docs/lifecycle.md
   - docs/plans/automatic-local-ram-backing.md
 ---
 
@@ -78,8 +78,8 @@ on the kernel/initrd/DTB ranges the VMM actually populated.
   this plan.
 - No balloon or free-page-reporting device in the first slice. That remains
   future work for shrinking manifests and reclaiming guest-free pages.
-- No compatibility alias for `--memory-mib` in product commands. The project is
-  pre-1.0 and the public surface can break.
+- No compatibility alias for `--memory-mib` in product commands unless a real
+  external dependency needs it.
 - No churn to lower-level harness flags such as `kvm-boot --mem-mib` or
   `hvf-boot --mem-mib` in the first slice.
 - No scheduler or host admission controller. `spore ls` should expose the
@@ -210,8 +210,8 @@ best-effort scans.
   `MAP_PRIVATE`.
 - Memory manifests already store byte-sized platform RAM, 2MiB chunk refs, and
   optional local backing metadata.
-- Foundation Slice 7 is complete for the foundation target: caught-up dirty
-  tracking avoids suspend-time full-RAM scans on KVM and HVF.
+- Always-on dirty tracking is implemented for the current product target:
+  caught-up dirty tracking avoids suspend-time full-RAM scans on KVM and HVF.
 - Dirty RAM sealing is now shared in `src/dirty_ram.zig`, but initial seeding
   still defaults to scanning every configured chunk unless callers provide a
   narrower seed set.
@@ -294,8 +294,8 @@ project consider larger auto values.
 
 Done when:
 
-- KVM and HVF have representative 16GiB product-path runs in the foundation
-  plan or this plan's progress snapshot.
+- KVM and HVF have representative 16GiB product-path runs in `docs/memory.md`
+  or this plan's progress snapshot.
 - The results distinguish configured RAM from resident/private memory.
 
 ## Verification

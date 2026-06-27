@@ -4,8 +4,8 @@
 //! fixed-size `chunks/<blake3-hex>` files with all-zero chunks elided; optional
 //! writable disk layers use verified `disklayers/` indexes and `diskobjects/`
 //! clusters. Machine state is normalized architectural aarch64 state — never raw
-//! hypervisor structures (see docs/spore-format.md). v0 carries no compatibility
-//! promise.
+//! hypervisor structures (see docs/spore-format.md). Format v0 is the current
+//! manifest contract; future versions should be deliberate migrations.
 //!
 //! Manifests and chunks may come from untrusted storage: parsing is strict,
 //! chunk contents are verified against their ids before use, and restore
