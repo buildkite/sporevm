@@ -16,6 +16,7 @@ spec_refs:
   - src/run.zig
   - src/resume.zig
   - include/spore.h
+  - bindings/go/spore.go
 related_plans:
   - docs/plans/foundation.md
   - docs/plans/run-bridge.md
@@ -399,8 +400,11 @@ The first implementation should pin a small stable code table in tests:
   pkg-config file, and C smoke coverage includes build info, option
   initialization, network capabilities, host-info JSON, inspect-bundle defaults,
   and named lifecycle defaults on aarch64 hosts.
-- No Go binding exists yet. The intended first Go slice is a cgo wrapper over
-  the existing C ABI for build info, host-info, and inspect-bundle only.
+- Slice 7 is implemented in this branch: `bindings/go` provides a cgo wrapper
+  over the existing C ABI for build info, context lifetime, host-info, and
+  inspect-bundle. The Go package decodes the same JSON contracts into Go
+  structs, requires C ABI version 6 or newer, and intentionally exposes no
+  runtime methods until the matching runtime C ABI calls exist.
 
 ## Delivery Strategy
 

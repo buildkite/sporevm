@@ -385,3 +385,51 @@ spore_free_string(context, json);
 
 Set `SPOREVM_RUNTIME_DIR`, cache roots, and similar process settings with
 `spore_context_set_env` before calling lifecycle functions.
+
+## Go Binding
+
+The first Go binding lives in [`bindings/go`](../bindings/go). It is a thin cgo
+adapter over the C ABI, so `libspore` must be installed or discoverable through
+`pkg-config`.
+
+```go
+client, err := spore.New()
+if err != nil {
+    return err
+}
+defer client.Close()
+
+info, err := client.HostInfo(ctx)
+if err != nil {
+    return err
+}
+
+bundle, err := client.InspectBundle(ctx, spore.InspectBundleOptions{
+    Source: "file:///tmp/base.bundle",
+})
+if err != nil {
+    return err
+}
+
+_ = info
+_ = bundle
+```
+
+The initial surface covers build info, context lifetime, host-info, and
+inspect-bundle. It decodes the same JSON contracts as the CLI and C ABI, and it
+requires C ABI version 6 or newer. Go context cancellation is checked before
+entering short C calls; long-running runtime cancellation is not exposed until
+the Zig product API and C ABI provide it.
+
+From a source checkout, build `libspore` first and point Go at the generated
+pkg-config and dynamic library paths:
+
+```bash
+mise run build
+cd bindings/go
+PKG_CONFIG_PATH="$PWD/../../zig-out/lib/pkgconfig" \
+DYLD_LIBRARY_PATH="$PWD/../../zig-out/lib" \
+go test ./...
+```
+
+Use `LD_LIBRARY_PATH` instead of `DYLD_LIBRARY_PATH` on Linux.
