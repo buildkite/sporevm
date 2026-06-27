@@ -159,6 +159,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
     }
     defer if (gateway_active) gateway.deinit();
     const network: virtio_net.Runtime = if (gateway_active) gateway.runtime() else .{};
+    errdefer run_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
 
     validateResumeDiskManifest(parsed.value);
     var runtime_disk = try run_mod.openRuntimeDisk(context, allocator, .{

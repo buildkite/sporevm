@@ -449,7 +449,8 @@ Definition of done:
   JSONL denied-egress events.
   `mise run smoke:run-net-capture` covers manifest policy persistence and
   fresh gateway reattachment through `spore run --from`.
-  Add a focused bound-service smoke only after the Unix-socket proxy path lands.
+  `mise run smoke:run-net-bind-service` covers the Unix-socket bound-service
+  proxy path.
 - Backend smokes: the same one-shot network smoke on HVF and KVM.
 - Regression checks: no behavior change for `spore run` without `--net`,
   capture without network, rootfs-backed run, and lifecycle commands.

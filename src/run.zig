@@ -2082,6 +2082,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     }
     defer if (gateway_active) gateway.deinit();
     const network: virtio_net.Runtime = if (gateway_active) gateway.runtime() else .{};
+    errdefer finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
     const network_manifest = manifestNetworkFromOptions(opts.network, &opts.network_policy);
 
     const resuming = opts.resume_dir != null;
