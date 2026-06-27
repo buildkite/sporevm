@@ -49,9 +49,9 @@ spore run --kernel Image --initrd minimal.cpio -- /bin/writeout
 
 When kernel or initrd are omitted, `spore run` resolves:
 
-- kernel: the managed SporeVM run aarch64 kernel, honoring
+- kernel: the managed SporeVM aarch64 kernel, honoring
   `SPOREVM_KERNEL_IMAGE` as an explicit local override, with managed downloads
-  requiring the release `.config` to include the run-kernel Docker-adjacent
+  requiring the release `.config` to include the runtime Docker-adjacent
   options;
 - initrd: the embedded minimal exec initrd, honoring `SPOREVM_RUN_INITRD` as an
   explicit local override.

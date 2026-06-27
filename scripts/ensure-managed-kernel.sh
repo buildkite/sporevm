@@ -7,19 +7,21 @@ usage:
   scripts/ensure-managed-kernel.sh run|sporevm|initrd|rootfs
 
 Resolve, download, cache, and verify a managed aarch64 Linux kernel Image from
-buildkite/cleanroom-kernels. Prints the absolute Image path on stdout.
+GitHub releases. Prints the absolute Image path on stdout.
 
 Kinds:
-  run      SporeVM run kernel with initrd, virtio-blk, ext4, and Docker runtime support
-  sporevm  Legacy SporeVM smoke/fork kernel with /dev/mem support
+  run      SporeVM kernel with initrd, virtio-blk, ext4, and Docker runtime support
+  sporevm  Alias for run
   initrd   cleanroom minimal initrd-profile kernel
   rootfs   cleanroom minimal rootfs-profile kernel
 
 Environment:
   SPOREVM_KERNEL_IMAGE       explicit local Image path; skips download
-  SPOREVM_KERNEL_RELEASE     cleanroom-kernels release tag (default: v0.5.2)
+  SPOREVM_KERNEL_RELEASE     kernel release tag (default: v0.6.1)
   SPOREVM_KERNEL_VERSION     Linux version in the asset name (default: 6.1.155)
-  SPOREVM_KERNEL_REPOSITORY  GitHub repo (default: buildkite/cleanroom-kernels)
+  SPOREVM_KERNEL_REPOSITORY  GitHub repo override
+                              default: buildkite/sporevm-kernels for run/sporevm,
+                              buildkite/cleanroom-kernels for initrd/rootfs
   SPOREVM_KERNEL_CACHE_DIR   cache directory override
 EOF
 }
@@ -148,21 +150,21 @@ if [[ -n "${SPOREVM_KERNEL_IMAGE:-}" ]]; then
   exit 0
 fi
 
-release="${SPOREVM_KERNEL_RELEASE:-v0.5.2}"
+release="${SPOREVM_KERNEL_RELEASE:-v0.6.1}"
 linux_version="${SPOREVM_KERNEL_VERSION:-6.1.155}"
-repo="${SPOREVM_KERNEL_REPOSITORY:-buildkite/cleanroom-kernels}"
+repo="${SPOREVM_KERNEL_REPOSITORY:-}"
 
 case "${kind}" in
-  run)
-    asset="sporevm-run-arm64-linux-${linux_version}-Image"
-    ;;
-  sporevm)
+  run | sporevm)
+    repo="${repo:-buildkite/sporevm-kernels}"
     asset="sporevm-arm64-linux-${linux_version}-Image"
     ;;
   initrd)
+    repo="${repo:-buildkite/cleanroom-kernels}"
     asset="cleanroom-darwin-vz-minimal-initrd-arm64-linux-${linux_version}-Image"
     ;;
   rootfs)
+    repo="${repo:-buildkite/cleanroom-kernels}"
     asset="cleanroom-darwin-vz-minimal-rootfs-arm64-linux-${linux_version}-Image"
     ;;
   *)
@@ -176,7 +178,7 @@ dest="${dest_dir}/${asset}"
 sha_dest="${dest}.sha256"
 config_dest=""
 require_config=0
-if [[ "${kind}" == "run" ]]; then
+if [[ "${kind}" == "run" || "${kind}" == "sporevm" ]]; then
   config_dest="${dest}.config"
   require_config=1
 fi

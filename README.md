@@ -138,7 +138,7 @@ Run one command in a throwaway VM:
 spore run -- /bin/writeout
 ```
 
-`spore run` uses the managed SporeVM run kernel and the embedded minimal exec
+`spore run` uses the managed SporeVM kernel and the embedded minimal exec
 initrd. On first use it downloads the managed kernel, verifies it, checks the
 release kernel config for required runtime features, then caches it under the
 platform cache directory.
