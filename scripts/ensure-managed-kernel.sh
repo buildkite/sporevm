@@ -20,7 +20,7 @@ Environment:
   SPOREVM_KERNEL_RELEASE     kernel release tag (default: v0.6.1)
   SPOREVM_KERNEL_VERSION     Linux version in the asset name (default: 6.1.155)
   SPOREVM_KERNEL_REPOSITORY  GitHub repo override
-                              default: buildkite/sporevm-kernels for run/sporevm,
+                              default: sporevm/kernels for run/sporevm,
                               buildkite/cleanroom-kernels for initrd/rootfs
   SPOREVM_KERNEL_CACHE_DIR   cache directory override
 EOF
@@ -163,7 +163,7 @@ repo="${SPOREVM_KERNEL_REPOSITORY:-}"
 
 case "${kind}" in
   run | sporevm)
-    repo="${repo:-buildkite/sporevm-kernels}"
+    repo="${repo:-sporevm/kernels}"
     asset="sporevm-arm64-linux-${linux_version}-Image"
     ;;
   initrd)

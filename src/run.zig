@@ -41,7 +41,7 @@ const max_guest_working_dir_len = 255;
 const max_guest_request_len = 8191;
 const max_guest_port = 65535;
 const embedded_run_initrd = run_assets.minimal_exec_initrd;
-const default_kernel_repository = "buildkite/sporevm-kernels";
+const default_kernel_repository = "sporevm/kernels";
 const default_kernel_release = "v0.6.1";
 const default_kernel_version = "6.1.155";
 const managed_run_kernel_required_config_symbols = [_][]const u8{
@@ -3698,9 +3698,9 @@ test "managed run kernel asset names validate input" {
 
 test "managed kernel repository cache name validates owner and repo" {
     const allocator = std.testing.allocator;
-    const cache = try managedKernelRepositoryCacheName(allocator, "buildkite/sporevm-kernels");
+    const cache = try managedKernelRepositoryCacheName(allocator, "sporevm/kernels");
     defer allocator.free(cache);
-    try std.testing.expectEqualStrings("buildkite-sporevm-kernels", cache);
+    try std.testing.expectEqualStrings("sporevm-kernels", cache);
 
     try std.testing.expectError(error.BadManagedKernelRepository, managedKernelRepositoryCacheName(allocator, "buildkite"));
     try std.testing.expectError(error.BadManagedKernelRepository, managedKernelRepositoryCacheName(allocator, "../sporevm-kernels"));
