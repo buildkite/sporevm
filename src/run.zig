@@ -41,8 +41,8 @@ const max_guest_working_dir_len = 255;
 const max_guest_request_len = 8191;
 const max_guest_port = 65535;
 const embedded_run_initrd = run_assets.minimal_exec_initrd;
-const default_kernel_repository = "buildkite/cleanroom-kernels";
-const default_kernel_release = "v0.5.2";
+const default_kernel_repository = "buildkite/sporevm-kernels";
+const default_kernel_release = "v0.6.1";
 const default_kernel_version = "6.1.155";
 const managed_run_kernel_required_config_symbols = [_][]const u8{
     "CONFIG_CGROUPS",
@@ -702,7 +702,7 @@ pub const cli_usage =
     \\
     \\Options:
     \\  --backend auto|hvf|kvm  Backend to run (default: auto)
-    \\  --kernel Image          Kernel Image path (default: managed SporeVM run kernel)
+    \\  --kernel Image          Kernel Image path (default: managed SporeVM kernel)
     \\  --initrd root.cpio      Initrd path (default: embedded minimal exec initrd)
     \\  --from DIR              Resume from an existing spore, then run argv
     \\  --rootfs rootfs.ext4    Attach local rootfs read-only; capture unsupported
@@ -1770,7 +1770,7 @@ fn managedKernelOptions(init: std.process.Init) ManagedKernelOptions {
 
 fn managedRunKernelAssetName(allocator: std.mem.Allocator, linux_version: []const u8) ![]const u8 {
     try validateManagedKernelVersion(linux_version);
-    return std.fmt.allocPrint(allocator, "sporevm-run-arm64-linux-{s}-Image", .{linux_version});
+    return std.fmt.allocPrint(allocator, "sporevm-arm64-linux-{s}-Image", .{linux_version});
 }
 
 fn managedRunKernelConfigAssetName(allocator: std.mem.Allocator, image_asset: []const u8) ![]const u8 {
@@ -3614,20 +3614,20 @@ test "managed run kernel asset names validate input" {
     const allocator = std.testing.allocator;
     const asset = try managedRunKernelAssetName(allocator, "6.1.155");
     defer allocator.free(asset);
-    try std.testing.expectEqualStrings("sporevm-run-arm64-linux-6.1.155-Image", asset);
+    try std.testing.expectEqualStrings("sporevm-arm64-linux-6.1.155-Image", asset);
 
     const config_asset = try managedRunKernelConfigAssetName(allocator, asset);
     defer allocator.free(config_asset);
-    try std.testing.expectEqualStrings("sporevm-run-arm64-linux-6.1.155-Image.config", config_asset);
+    try std.testing.expectEqualStrings("sporevm-arm64-linux-6.1.155-Image.config", config_asset);
 
     try std.testing.expectError(error.BadManagedKernelVersion, managedRunKernelAssetName(allocator, "../bad"));
 }
 
 test "managed kernel repository cache name validates owner and repo" {
     const allocator = std.testing.allocator;
-    const cache = try managedKernelRepositoryCacheName(allocator, "buildkite/cleanroom-kernels");
+    const cache = try managedKernelRepositoryCacheName(allocator, "buildkite/sporevm-kernels");
     defer allocator.free(cache);
-    try std.testing.expectEqualStrings("buildkite-cleanroom-kernels", cache);
+    try std.testing.expectEqualStrings("buildkite-sporevm-kernels", cache);
 
     try std.testing.expectError(error.BadManagedKernelRepository, managedKernelRepositoryCacheName(allocator, "buildkite"));
     try std.testing.expectError(error.BadManagedKernelRepository, managedKernelRepositoryCacheName(allocator, "../cleanroom-kernels"));
