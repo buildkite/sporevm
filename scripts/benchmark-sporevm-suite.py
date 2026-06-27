@@ -287,12 +287,14 @@ class BenchmarkRunner:
         self.run_id = f"{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
         self.output_dir = Path(args.output_dir).resolve()
         self.run_dir = self.output_dir / self.run_id
+        scratch_dir = Path(args.scratch_dir).resolve() if args.scratch_dir else None
+        self.scratch_run_dir = scratch_dir / self.run_id if scratch_dir else self.run_dir
         self.log_dir = self.run_dir / "logs"
-        self.work_dir = self.run_dir / "work"
+        self.work_dir = self.scratch_run_dir / "work"
         self.raw_path = self.run_dir / "results.jsonl"
         self.summary_path = self.run_dir / "summary.json"
-        self.rootfs_cache_dir = Path(args.rootfs_cache_dir).resolve() if args.rootfs_cache_dir else self.run_dir / "rootfs-cache"
-        self.bundle_cache_dir = self.run_dir / "bundle-cache"
+        self.rootfs_cache_dir = Path(args.rootfs_cache_dir).resolve() if args.rootfs_cache_dir else self.scratch_run_dir / "rootfs-cache"
+        self.bundle_cache_dir = self.scratch_run_dir / "bundle-cache"
         self.spore_bin = Path(args.spore_bin).resolve()
         self.backend = args.backend
         self.command = parse_shell_words(args.command)
@@ -406,6 +408,7 @@ class BenchmarkRunner:
             "prewarm_memory": self.args.prewarm_memory,
             "spore_bin": str(self.spore_bin),
             "output_dir": str(self.run_dir),
+            "scratch_dir": str(self.scratch_run_dir),
             "rootfs_cache_dir": str(self.rootfs_cache_dir),
             "bundle_cache_dir": str(self.bundle_cache_dir),
         }
@@ -443,11 +446,20 @@ class BenchmarkRunner:
                 self.run_distribution_tti(mode, base_dir)
         if "writable_rootfs" in self.args.benchmarks:
             self.run_writable_rootfs()
+        self.copy_rootfs_cache_metadata()
         summary = self.summary()
         json_dump(self.summary_path, summary)
         latest_path = self.output_dir / "latest-summary.json"
         json_dump(latest_path, summary)
         print(f"benchmark suite ok: results={self.raw_path} summary={self.summary_path}")
+
+    def copy_rootfs_cache_metadata(self) -> None:
+        output_cache_dir = self.run_dir / "rootfs-cache"
+        if self.rootfs_cache_dir == output_cache_dir or not self.rootfs_cache_dir.exists():
+            return
+        output_cache_dir.mkdir(parents=True, exist_ok=True)
+        for metadata_path in self.rootfs_cache_dir.glob("*.json"):
+            shutil.copy2(metadata_path, output_cache_dir / metadata_path.name)
 
     def run_cold_tti(self, mode: str) -> None:
         count = self.count_for_mode(mode)
@@ -1043,6 +1055,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--stagger-delay-ms", type=int, help="Delay between staggered launches")
     parser.add_argument("--include-distribution-concurrency", action="store_true", help="Run distribution TTI for every selected mode, not just sequential")
     parser.add_argument("--output-dir", default="zig-cache/sporevm-benchmarks")
+    parser.add_argument("--scratch-dir", default="", help="Directory for large benchmark work/cache; durable output stays under --output-dir")
     parser.add_argument("--rootfs-cache-dir", default="")
     parser.add_argument("--spore-bin", default=str(repo_root() / "zig-out/bin/spore"))
     parser.add_argument("--backend", default=infer_backend(), choices=("auto", "hvf", "kvm"))

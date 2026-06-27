@@ -32,7 +32,54 @@ finish_benchmark_step() {
   trap - EXIT
   upload_benchmark_artifacts
   annotate_benchmark_results "${status}"
+  cleanup_benchmark_scratch
   exit "${status}"
+}
+
+choose_prepared_scratch_root() {
+  local candidate="/var/tmp/nvme/sporevm-benchmarks"
+  [[ -d "${candidate}" && -w "${candidate}" ]] || return 1
+  printf '%s\n' "${candidate}"
+}
+
+choose_benchmark_scratch_root() {
+  if [[ -n "${SPOREVM_BENCHMARK_SCRATCH_ROOT:-}" ]]; then
+    mkdir -p "${SPOREVM_BENCHMARK_SCRATCH_ROOT}"
+    [[ -w "${SPOREVM_BENCHMARK_SCRATCH_ROOT}" ]] || {
+      echo "error: SPOREVM_BENCHMARK_SCRATCH_ROOT is not writable: ${SPOREVM_BENCHMARK_SCRATCH_ROOT}" >&2
+      return 1
+    }
+    printf '%s\n' "${SPOREVM_BENCHMARK_SCRATCH_ROOT}"
+    return 0
+  fi
+
+  choose_prepared_scratch_root
+}
+
+benchmark_scratch_dir=""
+
+prepare_benchmark_scratch() {
+  local root
+  if [[ -n "${SPOREVM_BENCHMARK_SCRATCH_ROOT:-}" ]]; then
+    root="$(choose_benchmark_scratch_root)"
+  else
+    root="$(choose_benchmark_scratch_root || true)"
+  fi
+  [[ -n "${root}" ]] || return 0
+
+  benchmark_scratch_dir="$(mktemp -d "${root%/}/sporevm-benchmark.XXXXXX")"
+  mkdir -p "${benchmark_scratch_dir}/tmp"
+  export TMPDIR="${benchmark_scratch_dir}/tmp"
+  echo "using benchmark scratch: ${benchmark_scratch_dir}" >&2
+}
+
+cleanup_benchmark_scratch() {
+  [[ -n "${benchmark_scratch_dir}" ]] || return 0
+  [[ -z "${SPORE_KEEP_BENCH_SCRATCH:-}" ]] || {
+    echo "kept benchmark scratch: ${benchmark_scratch_dir}" >&2
+    return 0
+  }
+  rm -rf "${benchmark_scratch_dir}" || true
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,7 +91,12 @@ trap finish_benchmark_step EXIT
 
 mise install
 mise run build
-scripts/benchmark-sporevm-suite.py --profile "${SPOREVM_BENCHMARK_PROFILE:-comparison}" --no-build
+prepare_benchmark_scratch
+benchmark_args=(--profile "${SPOREVM_BENCHMARK_PROFILE:-comparison}" --no-build)
+if [[ -n "${benchmark_scratch_dir}" ]]; then
+  benchmark_args+=(--scratch-dir "${benchmark_scratch_dir}")
+fi
+scripts/benchmark-sporevm-suite.py "${benchmark_args[@]}"
 scripts/export-sporevm-benchmark-data.py zig-cache/sporevm-benchmarks/latest-summary.json
 if [[ -n "${SPOREVM_BENCHMARK_BASELINE:-}" ]]; then
   scripts/compare-sporevm-benchmarks.py "${SPOREVM_BENCHMARK_BASELINE}" zig-cache/sporevm-benchmarks/latest-summary.json
