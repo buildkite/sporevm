@@ -10,6 +10,9 @@ It writes raw JSONL, a summary JSON, logs, and a `latest-summary.json` pointer
 under `zig-cache/sporevm-benchmarks/`. The output is designed for CI artifact
 upload and later comparison.
 
+Use `--scratch-dir PATH` when large benchmark work and caches should live on a
+faster disk while durable output remains under `zig-cache/sporevm-benchmarks/`.
+
 Export static trend data for dashboards with:
 
 ```console
@@ -246,6 +249,10 @@ parallel on `cleanroom-mac` and `cleanroom-linux-arm64`. It defaults to the
 broader `comparison` profile for manual runs. Override with
 `SPOREVM_BENCHMARK_PROFILE=ci` for a short cold/warm run, or `full` when a build
 should pay for the full benchmark matrix.
+
+The CI wrapper honors `SPOREVM_BENCHMARK_SCRATCH_ROOT` when set. Otherwise it
+uses `/var/tmp/nvme/sporevm-benchmarks` when that prepared path exists and is
+writable, falling back to the checkout disk.
 
 The benchmark steps live in `.buildkite/pipeline.benchmarks.yaml`. A standalone
 Buildkite pipeline can use this repository with this upload command:
