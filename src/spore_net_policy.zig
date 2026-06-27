@@ -5,12 +5,20 @@ const std = @import("std");
 pub const max_allow_cidrs = 16;
 pub const max_allow_hosts = 16;
 pub const max_learned_host_ips = 64;
+pub const max_bound_services = 16;
+pub const max_bound_service_name_len = 63;
+pub const max_unix_socket_path_len = 103;
 
 pub const ParseError = error{
     InvalidCidr,
     InvalidHost,
+    InvalidBoundService,
+    InvalidBoundServiceName,
+    InvalidBoundServiceTarget,
+    UnsupportedBoundServiceTarget,
     TooManyAllowCidrs,
     TooManyAllowHosts,
+    TooManyBoundServices,
 };
 
 pub const Decision = enum {
@@ -37,11 +45,19 @@ pub const Cidr = struct {
     }
 };
 
+pub const BoundService = struct {
+    declaration: []const u8,
+    name: []const u8,
+    unix_path: []const u8,
+};
+
 pub const Config = struct {
     allow_cidrs: [max_allow_cidrs][]const u8 = [_][]const u8{""} ** max_allow_cidrs,
     allow_cidr_count: usize = 0,
     allow_hosts: [max_allow_hosts][]const u8 = [_][]const u8{""} ** max_allow_hosts,
     allow_host_count: usize = 0,
+    bound_services: [max_bound_services]BoundService = undefined,
+    bound_service_count: usize = 0,
 
     pub fn addAllowCidr(self: *Config, raw: []const u8) ParseError!void {
         _ = try parseCidr(raw);
@@ -57,8 +73,33 @@ pub const Config = struct {
         self.allow_host_count += 1;
     }
 
+    pub fn addBindService(self: *Config, raw: []const u8) ParseError!void {
+        const eq = std.mem.indexOfScalar(u8, raw, '=') orelse return error.InvalidBoundService;
+        if (std.mem.indexOfScalar(u8, raw[eq + 1 ..], '=') != null) return error.InvalidBoundService;
+        const name = raw[0..eq];
+        const target = raw[eq + 1 ..];
+        try validateBoundServiceName(name);
+
+        const unix_prefix = "unix:";
+        if (!std.mem.startsWith(u8, target, unix_prefix)) return error.UnsupportedBoundServiceTarget;
+        const path = target[unix_prefix.len..];
+        try validateUnixSocketPath(path);
+
+        if (self.bound_service_count >= max_bound_services) return error.TooManyBoundServices;
+        self.bound_services[self.bound_service_count] = .{
+            .declaration = raw,
+            .name = name,
+            .unix_path = path,
+        };
+        self.bound_service_count += 1;
+    }
+
     pub fn hasRules(self: Config) bool {
         return self.allow_cidr_count != 0 or self.allow_host_count != 0;
+    }
+
+    pub fn hasBoundServices(self: Config) bool {
+        return self.bound_service_count != 0;
     }
 
     pub fn allowCidrSlice(self: *const Config) []const []const u8 {
@@ -67,6 +108,10 @@ pub const Config = struct {
 
     pub fn allowHostSlice(self: *const Config) []const []const u8 {
         return self.allow_hosts[0..self.allow_host_count];
+    }
+
+    pub fn boundServiceSlice(self: *const Config) []const BoundService {
+        return self.bound_services[0..self.bound_service_count];
     }
 };
 
@@ -211,6 +256,21 @@ pub fn validateHost(raw: []const u8) ParseError!void {
         _ = i;
     }
     if (label_len == 0 or prev == '-') return error.InvalidHost;
+}
+
+pub fn validateBoundServiceName(raw: []const u8) ParseError!void {
+    if (raw.len == 0 or raw.len > max_bound_service_name_len) return error.InvalidBoundServiceName;
+    if (raw[0] == '-' or raw[raw.len - 1] == '-') return error.InvalidBoundServiceName;
+    for (raw) |c| {
+        if ((c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '-') continue;
+        return error.InvalidBoundServiceName;
+    }
+}
+
+fn validateUnixSocketPath(raw: []const u8) ParseError!void {
+    if (raw.len == 0 or raw[0] != '/') return error.InvalidBoundServiceTarget;
+    if (raw.len > max_unix_socket_path_len) return error.InvalidBoundServiceTarget;
+    if (std.mem.indexOfScalar(u8, raw, 0) != null) return error.InvalidBoundServiceTarget;
 }
 
 pub fn isHardFloorBlocked(addr: [4]u8) bool {
@@ -437,4 +497,23 @@ test "spore-net policy DNS rebinding answers cannot override hard floor" {
     try std.testing.expectEqual(@as(usize, 2), policy.noteDnsResponse(query, response));
     try std.testing.expectEqual(Decision.deny_hard_floor, policy.decideIpv4(.{ 169, 254, 169, 254 }));
     try std.testing.expectEqual(Decision.allow, policy.decideIpv4(.{ 93, 184, 216, 34 }));
+}
+
+test "spore-net policy parses bound unix service declarations" {
+    var config = Config{};
+    try config.addBindService("metadata=unix:/tmp/metadata.sock");
+
+    try std.testing.expect(config.hasBoundServices());
+    try std.testing.expectEqual(@as(usize, 1), config.bound_service_count);
+    try std.testing.expectEqualStrings("metadata=unix:/tmp/metadata.sock", config.bound_services[0].declaration);
+    try std.testing.expectEqualStrings("metadata", config.bound_services[0].name);
+    try std.testing.expectEqualStrings("/tmp/metadata.sock", config.bound_services[0].unix_path);
+}
+
+test "spore-net policy rejects invalid bound service declarations" {
+    var config = Config{};
+    try std.testing.expectError(error.InvalidBoundService, config.addBindService("metadata"));
+    try std.testing.expectError(error.InvalidBoundServiceName, config.addBindService("MetaData=unix:/tmp/metadata.sock"));
+    try std.testing.expectError(error.UnsupportedBoundServiceTarget, config.addBindService("metadata=tcp:127.0.0.1:8080"));
+    try std.testing.expectError(error.InvalidBoundServiceTarget, config.addBindService("metadata=unix:relative.sock"));
 }

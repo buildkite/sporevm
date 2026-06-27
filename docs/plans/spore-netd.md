@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-06-18
+last_reviewed: 2026-06-27
 spec_refs:
   - docs/plans/foundation.md
   - SECURITY.md
@@ -12,6 +12,8 @@ spec_refs:
   - src/zmoltcp_gateway.zig
   - src/virtio/net.zig
   - src/run.zig
+  - src/net_gateway.zig
+  - src/spore_net_policy.zig
   - src/hvf/vm.zig
   - src/kvm/vm.zig
   - guest/minimal-initrd/
@@ -40,10 +42,11 @@ transport are implementation details.
 
 The first useful version should be deliberately narrow: IPv4, static guest
 configuration, ARP for the gateway, DNS UDP/53 proxying, outbound TCP proxying,
-and a hard default egress floor. Captured spores now persist the requested
-network capability and allow policy so `spore run --from` can attach a fresh
-gateway under the same rules. Published ports, general UDP, IPv6, DHCP, and
-live-flow preservation across suspend/resume are later work.
+bound guest-local services, machine-readable network events, and a hard default
+egress floor. Captured spores now persist the requested network capability and
+allow policy so `spore run --from` can attach a fresh gateway under the same
+rules. Published ports, general UDP, IPv6, DHCP, and live-flow preservation
+across suspend/resume are later work.
 
 ## Problem
 
@@ -101,11 +104,17 @@ The public CLI starts small:
 ```console
 spore run --net -- /bin/nslookup example.com
 spore run --net -- /bin/sh -lc 'wget -qO- http://example.com/'
+spore run --net --bind-service metadata=unix:/tmp/metadata.sock -- /bin/wget -qO- http://metadata.spore.internal/
+spore run --net --events=jsonl -- /bin/wget -qO- http://169.254.169.254/
 ```
 
 Networking is off by default. `--net` means "attach the guest to a
 SporeVM-managed virtual network." The default policy allows outbound public
-egress but blocks dangerous host/control-plane destinations.
+egress but blocks dangerous host/control-plane destinations. When allow rules
+are present, egress is restricted to the configured hosts and CIDRs. The landed
+bound-service shape is one explicit guest-local name backed by a host Unix
+stream socket; it does not replace the egress policy and is not a published host
+port. Loopback TCP targets are deferred.
 
 The internal data path is:
 
@@ -115,7 +124,7 @@ guest eth0
   -> src/virtio/net.zig
   -> length-prefixed Ethernet frame stream
   -> spore-netd
-  -> host DNS/TCP sockets
+  -> host DNS/TCP sockets or bound host-local services
 ```
 
 The initial static link uses fixed addressing:
@@ -141,7 +150,7 @@ avoid address allocation, DHCP, or multiple guests per virtual network.
 - `spore-netd` owns the adapter around `zmoltcp`, DNS forwarding, egress policy
   checks, host socket creation, flow lifetime, timeouts, logging, and shutdown.
 - `src/run.zig` owns the user-facing `--net` option, helper startup, boot args,
-  and fail-closed orchestration.
+  `--bind-service` declarations, event wiring, and fail-closed orchestration.
 - KVM and HVF own only their usual MMIO/IRQ/wakeup plumbing. They must not grow
   backend-specific network policy.
 - The guest initrd owns static `eth0` setup from boot args or the generation
@@ -159,6 +168,9 @@ avoid address allocation, DHCP, or multiple guests per virtual network.
   by default.
 - Do not expose the host's original peer addresses to the guest in v0.
 - Do not let DNS answers override the hard floor.
+- Do not let bound services open arbitrary host paths. Each service must be
+  declared explicitly, use a valid guest-local name, and reattach fresh on
+  resume or fail closed.
 - Bound all frame, packet, DNS, and TCP state sizes.
 - Treat malformed Ethernet/IP/DNS/TCP packets as guest-controlled input and
   either drop them or reset the guest flow without panicking.
@@ -221,6 +233,13 @@ avoid address allocation, DHCP, or multiple guests per virtual network.
   spores: capture records requested network capability and policy, `spore run
   --from` and named `spore resume --name` reattach a fresh helper-backed gateway
   under the recorded policy, and live TCP flow state remains non-portable.
+- `spore run --net --bind-service NAME=unix:/path.sock` now supports one
+  non-named run service: `NAME.spore.internal` resolves to the gateway IP and
+  guest TCP port 80 proxies bytes to the declared host Unix stream socket. More
+  than one bound service still fails before VM startup.
+- Denied TCP egress now emits typed `--events=jsonl` network audit events via
+  the existing `spore-netd` stderr and parent gateway path. Bound service
+  availability events are not implemented yet.
 
 ## Delivery Strategy
 
@@ -373,20 +392,66 @@ Definition of done:
 - Named lifecycle support reuses the same policy persistence and fresh-gateway
   resume contract as one-shot `spore run --net`.
 
+### Slice 10: Bound Services and Network Events
+
+Status: implemented for non-named `spore run`; broader bound-service
+capabilities are deferred below.
+
+Expose explicitly declared host-local services to the guest while keeping
+SporeVM-owned networking and egress policy in `spore-netd`. The implemented
+service target is a host Unix socket; TCP loopback targets can follow if needed.
+Network audit events should flow through the existing `--events=jsonl` run event
+stream instead of a separate telemetry subsystem.
+
+Target CLI:
+
+```console
+spore run --net --bind-service metadata=unix:/tmp/metadata.sock -- /bin/wget -qO- http://metadata.spore.internal/
+spore run --net --events=jsonl -- /bin/wget -qO- http://169.254.169.254/
+```
+
+Definition of done:
+
+- `--bind-service NAME=unix:/path.sock` parses only with `--net`, rejects invalid
+  names and targets, starts the VM fail-closed when a declared service cannot be
+  represented, and keeps the bound service guest-local.
+- The first landed shape is deliberately capped at exactly one Unix stream
+  target, the default guest HTTP port 80, and the gateway IP returned for
+  `NAME.spore.internal`. TCP host targets, custom guest ports, multiple service
+  IPs, and application-layer `Host` parsing are deferred.
+- `spore-netd` accepts guest TCP/80 connections to the gateway for the configured
+  bound service and proxies bytes to the configured host Unix socket without
+  opening general egress. Ordinary DNS forwarding, outbound TCP proxying, and
+  hard-floor denied-egress events stay on their existing paths.
+- `--events=jsonl` emits typed denied-egress network events with destination,
+  port, and denial reason but no guest payload bytes. Bound service availability
+  events are deferred until there is a concrete consumer.
+- Captured/named spores do not persist or re-bind service declarations in this
+  slice; `spore run --capture --bind-service ...` fails before startup until
+  manifest/schema work can record the re-bind contract. Live service connections
+  remain non-portable and are dropped across suspend/resume/fork.
+- Unit tests cover CLI parsing, service-name validation, target validation,
+  deny-event formatting, and policy precedence between bound services and normal
+  egress.
+
 ## Verification
 
 - Unit tests: CLI parsing, network config serialization, virtio-net RX/TX queue
   behavior, frame protocol encode/decode, ARP, IPv4 checksum, DNS parsing,
-  `zmoltcp` adapter behavior, TCP forwarder policy decisions, egress policy.
+  `zmoltcp` adapter behavior, TCP forwarder policy decisions, egress policy,
+  bound-service parsing, and network event formatting.
 - Fuzzing: virtqueue descriptors, Ethernet frame parsing, IPv4 packet parsing,
   DNS packet parsing, TCP segment parsing, frame-stream decode.
 - Product smokes: guest address/route inspection, DNS lookup, outbound HTTP,
   hard-floor denial, helper crash before ready, helper crash during run.
   `mise run smoke:run-net-http` covers the first outbound HTTP path with the
   minimal initrd `/bin/wget` helper.
-  `mise run smoke:run-net-deny` covers hard-floor denial and debug visibility.
+  `mise run smoke:run-net-deny` covers hard-floor denial, debug visibility, and
+  JSONL denied-egress events.
   `mise run smoke:run-net-capture` covers manifest policy persistence and
   fresh gateway reattachment through `spore run --from`.
+  `mise run smoke:run-net-bind-service` covers the Unix-socket bound-service
+  proxy path.
 - Backend smokes: the same one-shot network smoke on HVF and KVM.
 - Regression checks: no behavior change for `spore run` without `--net`,
   capture without network, rootfs-backed run, and lifecycle commands.
@@ -414,6 +479,10 @@ Definition of done:
 - Guest configuration can balloon if it assumes normal distro tools. The plan
   keeps setup in the minimal initrd and avoids DHCP until static setup proves too
   limiting.
+- Replacing `spore-netd` with a user-provided network helper is too much power
+  for the Cleanroom service-exposure case. Bound services keep SporeVM on the
+  egress path while still letting tools provide guest-reachable metadata,
+  artifact, or harness endpoints.
 
 ## Resolved Decisions
 
@@ -426,6 +495,10 @@ Definition of done:
   library.
 - Keep `--net` as the durable public surface; adapter names and helper details
   stay internal until there is a proven need to expose them.
+- Keep policy as basic CLI flags and structured runtime data, not eBPF, CEL, or
+  another programmable filter language in SporeVM core.
+- Add `--bind-service` as a guest-local service primitive, not as published
+  ports or a replacement network helper.
 - Start with one-shot `spore run --net`, not `spore exec` hot attach.
 - Start with IPv4, static addressing, ARP, DNS, and outbound TCP only.
 - Treat live network flow state as non-portable runtime state.
@@ -439,10 +512,16 @@ Definition of done:
 - DHCP or dynamic address allocation.
 - Multiple NICs or guest networks.
 - Policy-profile files or reusable network policy manifests.
+- Programmable policy languages such as CEL or eBPF.
 - Optional diagnostic adapters such as `tap:<ifname>` or external helper engines.
+- Bound-service TCP loopback targets, custom guest ports, multiple services or
+  service IPs, and application-layer `Host` routing.
+- Bound-service availability events.
+- Manifest/schema support to persist declared bound services and re-bind them
+  for capture, `spore run --from`, and named resume.
 
 ## Open Questions
 
-No open question blocks the first slice. The first implementation can choose the
-frame-stream transport shape as an internal detail and revise this plan once the
-virtio-net backend interface lands.
+No open question blocks the current implemented slice. Remaining bound-service
+work is listed under Deferred Work and should stay out of the first PR unless a
+real caller needs it.
