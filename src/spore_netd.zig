@@ -38,7 +38,7 @@ const max_dns_payload_len = max_frame_len - ethernet_header_len - ipv4_header_mi
 
 const fallback_dns_ipv4: [4]u8 = .{ 1, 1, 1, 1 };
 
-const netd_usage = "usage: spore netd --stdio [--allow-cidr CIDR] [--allow-host HOST]\n";
+const netd_usage = "usage: spore netd --stdio [--allow-cidr CIDR] [--allow-host HOST] [--bind-service NAME=unix:/path.sock]\n";
 
 pub const FrameIoError = error{
     EndOfStream,
@@ -114,6 +114,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     const dns_forwarder = host_dns.forwarder();
     var tcp_gateway: spore_netd_tcp.Gateway = undefined;
     tcp_gateway.init(&policy);
+    tcp_gateway.emit_events = true;
 
     try writeAllFd(2, "ready\n");
     var in_buf: [max_frame_len]u8 = undefined;
@@ -171,6 +172,12 @@ fn parseCliArgs(args: []const []const u8) CliOptions {
                 std.debug.print("spore netd: invalid --allow-host {s}: {s}\n", .{ raw, @errorName(err) });
                 std.process.exit(2);
             };
+        } else if (std.mem.eql(u8, args[i], "--bind-service")) {
+            const raw = takeValue(args, &i, args[i]);
+            opts.policy.addBindService(raw) catch |err| {
+                std.debug.print("spore netd: invalid --bind-service {s}: {s}\n", .{ raw, @errorName(err) });
+                std.process.exit(2);
+            };
         } else {
             std.debug.print("unknown netd argument: {s}\n{s}", .{ args[i], netd_usage });
             std.process.exit(2);
@@ -178,6 +185,10 @@ fn parseCliArgs(args: []const []const u8) CliOptions {
     }
     if (!stdio) {
         std.debug.print("{s}", .{netd_usage});
+        std.process.exit(2);
+    }
+    if (opts.policy.hasBoundServices()) {
+        std.debug.print("spore netd: --bind-service is parsed but the guest-local service proxy is not implemented yet\n", .{});
         std.process.exit(2);
     }
     return opts;

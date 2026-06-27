@@ -194,6 +194,7 @@ pub const Gateway = struct {
     output: OutputQueue = .{},
     current_now: Instant = Instant.ZERO,
     stats: Stats = .{},
+    emit_events: bool = false,
 
     pub fn init(self: *Gateway, policy: *spore_net_policy.Runtime) void {
         self.device = Device.init();
@@ -201,6 +202,7 @@ pub const Gateway = struct {
         self.output.reset();
         self.current_now = Instant.ZERO;
         self.stats = .{};
+        self.emit_events = false;
         for (&self.flows, 0..) |*flow, i| {
             flow.init();
             self.sock_ptrs[i] = &flow.sock;
@@ -315,6 +317,7 @@ pub const Gateway = struct {
         if (request.local.port == 0 or request.remote.port == 0) return false;
         const decision = self.policy.decideIpv4(request.local.addr);
         if (decision == .allow) return true;
+        if (self.emit_events) emitDeniedEgressEvent(request.local.addr, request.local.port, decision);
         std.log.debug(
             "spore-netd denied egress reason={s} dst={d}.{d}.{d}.{d}:{d}",
             .{
@@ -551,6 +554,13 @@ pub fn isBlockedDestination(addr: ipv4.Address) bool {
     if (std.mem.eql(u8, &addr, &spore_net.guest_ipv4)) return true;
     if (std.mem.eql(u8, &addr, &spore_net.gateway_ipv4)) return true;
     return false;
+}
+
+fn emitDeniedEgressEvent(addr: ipv4.Address, port: u16, reason: spore_net_policy.Decision) void {
+    std.debug.print(
+        "spore-net-event egress_denied {d}.{d}.{d}.{d} {d} {s}\n",
+        .{ addr[0], addr[1], addr[2], addr[3], port, reason.name() },
+    );
 }
 
 fn isGuestTcpFrame(frame: []const u8) bool {

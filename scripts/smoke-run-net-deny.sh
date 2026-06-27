@@ -15,7 +15,7 @@ workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-smoke-run-net-deny.XXXXXX")"
 trap 'rm -rf "${workdir}"' EXIT
 
 set +e
-"${spore_bin}" --debug run --net -- /bin/wget -qO- http://169.254.169.254/ >"${workdir}/wget.stdout" 2>"${workdir}/wget.stderr"
+"${spore_bin}" --debug run --net --events=jsonl -- /bin/wget -qO- http://169.254.169.254/ >"${workdir}/wget.stdout" 2>"${workdir}/wget.stderr"
 wget_rc="$?"
 set -e
 
@@ -33,6 +33,21 @@ grep -Fq "denied egress" "${workdir}/wget.stderr" || {
 grep -Fq "169.254.169.254:80" "${workdir}/wget.stderr" || {
   cat "${workdir}/wget.stderr" >&2 || true
   die "debug log did not include denied destination"
+}
+
+grep -Fq '"event":"network"' "${workdir}/wget.stdout" || {
+  cat "${workdir}/wget.stdout" >&2 || true
+  die "event stream did not include network event"
+}
+
+grep -Fq '"type":"egress_denied"' "${workdir}/wget.stdout" || {
+  cat "${workdir}/wget.stdout" >&2 || true
+  die "event stream did not include denied egress type"
+}
+
+grep -Fq '"destination_ip":"169.254.169.254"' "${workdir}/wget.stdout" || {
+  cat "${workdir}/wget.stdout" >&2 || true
+  die "event stream did not include denied destination"
 }
 
 echo "smoke:run-net-deny ok"

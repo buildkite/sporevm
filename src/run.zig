@@ -222,10 +222,30 @@ pub const FailureEvent = struct {
 pub const RunEvent = union(enum) {
     start: StartEvent,
     ready: ReadyEvent,
+    network: NetworkAuditEvent,
     stdout: OutputEvent,
     stderr: OutputEvent,
     exit: ExitEvent,
     failure: FailureEvent,
+};
+
+pub const NetworkAuditKind = enum {
+    egress_denied,
+
+    pub fn name(self: NetworkAuditKind) []const u8 {
+        return switch (self) {
+            .egress_denied => "egress_denied",
+        };
+    }
+};
+
+pub const NetworkAuditEvent = struct {
+    command: []const u8,
+    backend: ?Backend,
+    kind: NetworkAuditKind,
+    destination_ip: [4]u8,
+    destination_port: u16,
+    reason: []const u8,
 };
 
 /// Callback interface for run/resume lifecycle consumers. If the sink fails
@@ -287,6 +307,12 @@ pub const EventEmitter = struct {
         }
     }
 
+    pub fn emitNetworkEvent(self: *EventEmitter, event: net_gateway.NetworkEvent) !void {
+        const sink = self.sink orelse return;
+        try self.emitReady();
+        try sink.emit(.{ .network = networkAuditEvent(self.command, self.backend, event) });
+    }
+
     pub fn emitExit(self: *EventEmitter, result: Result) !void {
         if (self.terminal_emitted) return;
         self.setBackend(result.backend);
@@ -312,7 +338,26 @@ pub const EventEmitter = struct {
             self.write_failed = true;
         };
     }
+
+    pub fn emitNetworkEventBestEffort(self: *EventEmitter, event: net_gateway.NetworkEvent) void {
+        self.emitNetworkEvent(event) catch {
+            self.write_failed = true;
+        };
+    }
 };
+
+fn networkAuditEvent(command: []const u8, backend: ?Backend, event: net_gateway.NetworkEvent) NetworkAuditEvent {
+    return .{
+        .command = command,
+        .backend = backend,
+        .kind = switch (event.kind) {
+            .egress_denied => .egress_denied,
+        },
+        .destination_ip = event.destination_ip,
+        .destination_port = event.destination_port,
+        .reason = event.reason.name(),
+    };
+}
 
 fn exitEvent(command: []const u8, result: Result) ExitEvent {
     return .{
@@ -367,6 +412,7 @@ pub const EventWriter = struct {
                 if (value.backend) |backend| self.setBackend(backend);
                 try self.emitReady();
             },
+            .network => |value| try self.emitNetworkEvent(value),
             .stdout => |value| try self.emitOutputEvent("stdout", value),
             .stderr => |value| try self.emitOutputEvent("stderr", value),
             .exit => |value| try self.emitExitEvent(value),
@@ -410,6 +456,36 @@ pub const EventWriter = struct {
             .offset = output.offset,
             .byte_count = output.bytes.len,
             .data_base64 = data_base64,
+        };
+        try self.write(event);
+    }
+
+    fn emitNetworkEvent(self: *EventWriter, value: NetworkAuditEvent) !void {
+        if (value.backend) |backend| self.setBackend(backend);
+        try self.emitReady();
+        const destination_ip = try std.fmt.allocPrint(
+            self.allocator,
+            "{d}.{d}.{d}.{d}",
+            .{ value.destination_ip[0], value.destination_ip[1], value.destination_ip[2], value.destination_ip[3] },
+        );
+        defer self.allocator.free(destination_ip);
+        const event = struct {
+            schema: []const u8 = machine_output.run_events_schema,
+            schema_version: u32 = machine_output.run_events_schema_version,
+            event: []const u8 = "network",
+            command: []const u8,
+            backend: ?[]const u8,
+            type: []const u8,
+            destination_ip: []const u8,
+            destination_port: u16,
+            reason: []const u8,
+        }{
+            .command = value.command,
+            .backend = self.backend,
+            .type = value.kind.name(),
+            .destination_ip = destination_ip,
+            .destination_port = value.destination_port,
+            .reason = value.reason,
         };
         try self.write(event);
     }
@@ -636,6 +712,8 @@ const cli_usage =
     \\  --net                   Experimental SporeVM-managed networking
     \\  --allow-cidr CIDR       With --net, restrict public egress to this CIDR
     \\  --allow-host HOST       With --net, restrict public egress to DNS A answers for this host
+    \\  --bind-service NAME=unix:/path.sock
+    \\                          With --net, declare a guest-local Unix service
     \\  --capture DIR           Snapshot to DIR; defaults to --capture-on EXIT
     \\  --capture-on WHEN       Capture trigger: EXIT, INT, TERM, HUP, USR1, or USR2
     \\  --continue-after-capture
@@ -781,6 +859,12 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
                 std.debug.print("spore run: invalid --allow-host {s}: {s}\n", .{ raw, @errorName(err) });
                 std.process.exit(2);
             };
+        } else if (std.mem.eql(u8, args[i], "--bind-service")) {
+            const raw = takeValue(args, &i, args[i]);
+            network_policy.addBindService(raw) catch |err| {
+                std.debug.print("spore run: invalid --bind-service {s}: {s}\n", .{ raw, @errorName(err) });
+                std.process.exit(2);
+            };
         } else if (try parseSharedOption(&shared, args, &i)) {
             continue;
         } else if (std.mem.startsWith(u8, args[i], "--")) {
@@ -835,6 +919,10 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         std.debug.print("spore run: --allow-cidr and --allow-host require --net\n", .{});
         std.process.exit(2);
     }
+    if (network == .disabled and network_policy.hasBoundServices()) {
+        std.debug.print("spore run: --bind-service requires --net\n", .{});
+        std.process.exit(2);
+    }
 
     return .{
         .backend = backend,
@@ -861,8 +949,8 @@ fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parse
         };
         defer manifest.deinit();
 
-        if (parsed.network_requested or parsed.network_policy.hasRules()) {
-            failRunSetup("spore run: --from uses the captured network policy; omit --net and network allow flags", .{});
+        if (parsed.network_requested or parsed.network_policy.hasRules() or parsed.network_policy.hasBoundServices()) {
+            failRunSetup("spore run: --from uses the captured network policy; omit --net and network flags", .{});
         }
         const rootfs = resumeRootfsForRun(allocator, manifest.value) catch |err| switch (err) {
             error.UnsupportedRootfsDeviceCount => failRunSetup("spore run: --from supports at most one immutable rootfs disk; found {d} block devices", .{countBlockDevices(manifest.value.devices)}),
@@ -888,6 +976,9 @@ fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parse
 
     if (parsed.capture_path != null and parsed.rootfs_path != null and parsed.image_ref == null) {
         failRunSetup("spore run: --rootfs with --capture is not portable yet; use --image so capture can record immutable rootfs identity", .{});
+    }
+    if (parsed.network_policy.hasBoundServices()) {
+        failRunSetup("spore run: --bind-service is parsed but the guest-local service proxy is not implemented yet", .{});
     }
     const rootfs = resolveRootfsInputForCli(init, allocator, .{
         .rootfs_path = parsed.rootfs_path,
@@ -1555,6 +1646,14 @@ fn jsonStringEquals(value: ?std.json.Value, expected: []const u8) bool {
     return std.mem.eql(u8, actual, expected);
 }
 
+fn jsonIntegerEquals(value: ?std.json.Value, expected: i64) bool {
+    const actual = switch (value orelse return false) {
+        .integer => |integer| integer,
+        else => return false,
+    };
+    return actual == expected;
+}
+
 fn expectJsonStringField(allocator: std.mem.Allocator, line: []const u8, field: []const u8, expected: []const u8) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
     defer parsed.deinit();
@@ -1563,6 +1662,16 @@ fn expectJsonStringField(allocator: std.mem.Allocator, line: []const u8, field: 
         else => return error.BadManifest,
     };
     try std.testing.expect(jsonStringEquals(object.get(field), expected));
+}
+
+fn expectJsonIntegerField(allocator: std.mem.Allocator, line: []const u8, field: []const u8, expected: i64) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.BadManifest,
+    };
+    try std.testing.expect(jsonIntegerEquals(object.get(field), expected));
 }
 
 fn expectNestedJsonStringField(
@@ -2088,6 +2197,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     }) catch |err| {
         if (capture_plan.isSignalCapture() and capture_request.isCompleted() and isCaptureAborted(err)) {
             const result = resultFromAbortedSignalCapture(backend, opts, &stream);
+            finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
             try events.emitExit(result);
             if (events.write_failed) return error.EventSinkFailed;
             return result;
@@ -2104,9 +2214,19 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
             resultFromSignalCapture(backend, opts, &stream),
         else => error.ProbeDidNotComplete,
     };
+    finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
     try events.emitExit(result);
     if (events.write_failed) return error.EventSinkFailed;
     return result;
+}
+
+fn finishGatewayNetworkEvents(gateway: *net_gateway.Process, gateway_active: *bool, events: *EventEmitter) void {
+    if (!gateway_active.*) return;
+    gateway.deinit();
+    gateway_active.* = false;
+    while (gateway.popNetworkEvent()) |event| {
+        events.emitNetworkEventBestEffort(event);
+    }
 }
 
 pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Options, control: vsock.Control) !MonitorResult {
@@ -2806,6 +2926,34 @@ test "event writer emits exactly one terminal failure" {
     try expectNestedJsonStringField(allocator, failure_line, "error", "code", "cache.integrity_failed");
 }
 
+test "event writer emits network denied events" {
+    const allocator = std.testing.allocator;
+    var out: Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var events = EventWriter.init(allocator, &out.writer, "run");
+    const sink = events.sink();
+
+    try sink.emit(.{ .network = .{
+        .command = "run",
+        .backend = .hvf,
+        .kind = .egress_denied,
+        .destination_ip = .{ 169, 254, 169, 254 },
+        .destination_port = 80,
+        .reason = "hard-floor",
+    } });
+
+    var lines = std.mem.splitScalar(u8, out.written(), '\n');
+    const ready_line = lines.next().?;
+    const network_line = lines.next().?;
+    try std.testing.expectEqualStrings("", lines.next().?);
+    try expectJsonStringField(allocator, ready_line, "event", "ready");
+    try expectJsonStringField(allocator, network_line, "event", "network");
+    try expectJsonStringField(allocator, network_line, "type", "egress_denied");
+    try expectJsonStringField(allocator, network_line, "destination_ip", "169.254.169.254");
+    try expectJsonIntegerField(allocator, network_line, "destination_port", 80);
+    try expectJsonStringField(allocator, network_line, "reason", "hard-floor");
+}
+
 fn failingEventSink(_: ?*anyopaque, _: RunEvent) !void {
     return error.TestEventSinkFailed;
 }
@@ -3030,6 +3178,21 @@ test "run cli parser accepts network allow rules" {
     try std.testing.expectEqual(@as(usize, 1), opts.network_policy.allow_host_count);
     try std.testing.expectEqualStrings("example.com", opts.network_policy.allow_hosts[0]);
     try std.testing.expectEqualStrings("/bin/true", opts.command[0]);
+}
+
+test "run cli parser accepts network bind services" {
+    const opts = try parseCliArgs(&.{
+        "--net",
+        "--bind-service",
+        "metadata=unix:/tmp/metadata.sock",
+        "--",
+        "/bin/true",
+    });
+    try std.testing.expectEqual(NetworkMode.spore, opts.network);
+    try std.testing.expect(opts.network_requested);
+    try std.testing.expectEqual(@as(usize, 1), opts.network_policy.bound_service_count);
+    try std.testing.expectEqualStrings("metadata", opts.network_policy.bound_services[0].name);
+    try std.testing.expectEqualStrings("/tmp/metadata.sock", opts.network_policy.bound_services[0].unix_path);
 }
 
 test "run restores network options from manifest policy" {
