@@ -3703,7 +3703,7 @@ test "managed kernel repository cache name validates owner and repo" {
     try std.testing.expectEqualStrings("buildkite-sporevm-kernels", cache);
 
     try std.testing.expectError(error.BadManagedKernelRepository, managedKernelRepositoryCacheName(allocator, "buildkite"));
-    try std.testing.expectError(error.BadManagedKernelRepository, managedKernelRepositoryCacheName(allocator, "../cleanroom-kernels"));
+    try std.testing.expectError(error.BadManagedKernelRepository, managedKernelRepositoryCacheName(allocator, "../sporevm-kernels"));
 }
 
 test "managed kernel checksum parser reads sha256 sidecar" {
