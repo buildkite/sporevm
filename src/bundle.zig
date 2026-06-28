@@ -14,7 +14,6 @@ const chunklib = @import("chunk.zig");
 const cow_disk = @import("cow_disk.zig");
 const disk_layer = @import("disk_layer.zig");
 const gicv3 = @import("gicv3.zig");
-const machine_output = @import("machine_output.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const rootfs_block_index = @import("rootfs_index.zig");
@@ -363,7 +362,7 @@ fn ensureInspectableBundlePath(allocator: std.mem.Allocator, bundle_dir: []const
 }
 
 fn digestRef(hex: []const u8) DigestRef {
-    return machine_output.digestRef(hex);
+    return contracts.digestRef(hex);
 }
 
 fn summarizeChunkpack(allocator: std.mem.Allocator, index: Index) Error!ChunkpackSummary {
