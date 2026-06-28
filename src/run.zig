@@ -23,7 +23,6 @@ const runtime_disk_mod = @import("runtime_disk.zig");
 const run_assets = @import("run_assets");
 const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
-const virtio_blk = @import("virtio/blk.zig");
 const virtio_net = @import("virtio/net.zig");
 const vsock = @import("virtio/vsock.zig");
 
@@ -989,7 +988,7 @@ pub fn manifestNetworkFromOptions(allocator: std.mem.Allocator, network: Network
 }
 
 pub fn resumeRootfsForRun(allocator: std.mem.Allocator, manifest: spore.Manifest) !?spore.Rootfs {
-    const disk_count = countBlockDevices(manifest.devices);
+    const disk_count = spore.countBlockDevices(manifest.devices);
     if (disk_count == 0) return null;
     if (disk_count != 1) return error.UnsupportedRootfsDeviceCount;
     const rootfs = manifest.rootfs orelse return error.MissingRootfsArtifact;
@@ -1002,14 +1001,6 @@ pub fn resumeDiskForRun(allocator: std.mem.Allocator, manifest: spore.Manifest) 
         return try disk_layer.cloneDisk(allocator, disk);
     }
     return null;
-}
-
-fn countBlockDevices(devices: []const spore.TransportState) usize {
-    var count: usize = 0;
-    for (devices) |device| {
-        if (device.device_id == virtio_blk.device_id) count += 1;
-    }
-    return count;
 }
 
 fn cloneRootfs(allocator: std.mem.Allocator, rootfs: spore.Rootfs) !spore.Rootfs {

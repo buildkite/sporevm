@@ -874,6 +874,14 @@ pub fn validateRootfs(rootfs: Rootfs, devices: []const TransportState) Error!voi
     if (rootfs.source) |source| try validateRootfsSource(source);
 }
 
+pub fn countBlockDevices(devices: []const TransportState) usize {
+    var count: usize = 0;
+    for (devices) |device| {
+        if (device.device_id == rootfs_virtio_blk_device_id) count += 1;
+    }
+    return count;
+}
+
 fn validateRootfsDevice(device: RootfsDevice, devices: []const TransportState) Error!void {
     try validateRootfsDeviceShape(device);
     if (device.mmio_slot >= devices.len) return error.BadManifest;
@@ -2157,6 +2165,14 @@ fn testRootfsStorage(mmio_slot: u32) RootfsStorage {
         .base_identity = "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
         .object_namespace = rootfs_storage_object_namespace,
     };
+}
+
+test "manifest counts block devices" {
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBlockDevices(&.{ testTransport(3), testTransport(rootfs_virtio_blk_device_id) }),
+    );
+    try std.testing.expectEqual(@as(usize, 0), countBlockDevices(&.{testTransport(3)}));
 }
 
 test "manifest rootfs artifact validates transport binding" {
