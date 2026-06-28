@@ -63,30 +63,7 @@ if (( idle_memtotal_kb >= idle_max_kb )); then
   die "auto memory idle MemTotal ${idle_memtotal_kb} KB exceeded ${idle_max_kb} KB"
 fi
 
-node_script="
-const fs = require('fs');
-const target = ${pressure_min_kb};
-const bufs = [];
-for (let i = 0; i < 32; i++) {
-  const b = Buffer.allocUnsafe(16 * 1024 * 1024);
-  b.fill(0x5a);
-  bufs.push(b);
-}
-function memTotal() {
-  const match = fs.readFileSync('/proc/meminfo', 'utf8').match(/MemTotal:\\s+(\\d+)/);
-  return Number(match[1]);
-}
-const deadline = Date.now() + 10000;
-function waitForGrowth() {
-  const value = memTotal();
-  if (value >= target || Date.now() >= deadline) {
-    console.log(value);
-    return;
-  }
-  setTimeout(waitForGrowth, 100);
-}
-waitForGrowth();
-"
+node_script='b=[];for(i=0;i<32;i++)b.push(Buffer.alloc(16777216,1));setTimeout(()=>console.log(require("fs").readFileSync("/proc/meminfo","utf8").match(/MemTotal:\s+(\d+)/)[1]),3000)'
 
 pressure_memtotal_kb="$(
   "${spore_bin}" run \
