@@ -646,17 +646,10 @@ fn dnsNameMatchesHost(packet: []const u8, start: usize, host: []const u8) bool {
         }
         first_label = false;
         if (host_i + len > host.len or offset + len > packet.len) return false;
-        for (packet[offset..][0..len]) |c| {
-            if (lowerAscii(c) != lowerAscii(host[host_i])) return false;
-            host_i += 1;
-        }
+        if (!std.ascii.eqlIgnoreCase(packet[offset..][0..len], host[host_i..][0..len])) return false;
+        host_i += len;
         offset += len;
     }
-}
-
-fn lowerAscii(c: u8) u8 {
-    if (c >= 'A' and c <= 'Z') return c + ('a' - 'A');
-    return c;
 }
 
 pub fn testDnsQuery(id: u16, qname: []const u8, out: *[512]u8) []const u8 {
