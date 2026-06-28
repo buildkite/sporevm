@@ -61,14 +61,16 @@ spore run --from /tmp/base.spore -- /bin/cat /var/tmp/example
 
 The rootfs cache key includes the resolved digest-pinned image ref, target
 platform, and rootfs builder version. Mutable tag inputs also get a small local
-ref record, so a warm `spore run --image docker.io/library/alpine:3.20` can go
-straight to the previously validated rootfs instead of re-resolving the tag on
-every invocation. If the ref record or referenced rootfs is missing or
-mismatched, SporeVM falls back to the registry path and updates the record after
-the rootfs cache is valid. Captured image runs also require manifest-bound
-chunked rootfs storage. New builds write it immediately; older cache entries are
-upgraded once when `spore run --image ... --capture` needs to record portable
-rootfs identity.
+ref record, so a warm `spore run --image docker.io/library/alpine:3.20` or
+`spore create --image docker.io/library/alpine:3.20` can go straight to the
+previously validated rootfs instead of re-resolving the tag on every invocation.
+`--pull=missing|always|never` controls whether mutable refs may use that local
+record, force registry refresh, or fail without one. If the ref record or
+referenced rootfs is missing or mismatched, SporeVM falls back to the registry
+path and updates the record after the rootfs cache is valid. Captured image runs
+also require manifest-bound chunked rootfs storage. New builds write it
+immediately; older cache entries are upgraded once when
+`spore run --image ... --capture` needs to record portable rootfs identity.
 
 For local Docker buildx workflows, SporeVM consumes an OCI layout instead of the
 Docker daemon or socket. Buildx writes the layout, then `spore rootfs

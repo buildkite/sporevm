@@ -42,6 +42,8 @@ const create_usage =
     \\  --initrd root.cpio      Initrd path (default: embedded minimal exec initrd)
     \\  --rootfs rootfs.ext4    Attach rootfs image read-only as virtio-blk
     \\  --image REF             Build or reuse cached OCI rootfs
+    \\  --pull=missing|always|never
+    \\                          Pull policy for mutable --image refs (default: missing)
     \\  --net                   Experimental SporeVM-managed networking
     \\  --allow-cidr CIDR       With --net, restrict public egress to this CIDR
     \\  --allow-host HOST       With --net, restrict public egress to DNS A answers for this host
@@ -244,6 +246,7 @@ pub const LifecycleResult = struct {
 
 const CreateOptions = struct {
     spec: Spec,
+    image_pull_policy: run_mod.PullPolicy = .missing,
     network: run_mod.NetworkMode = .disabled,
     network_policy: run_mod.NetworkPolicy = .{},
 };
@@ -297,6 +300,7 @@ pub const CreateNamedOptions = struct {
     initrd_path: ?[]const u8 = null,
     rootfs_path: ?[]const u8 = null,
     image_ref: ?[]const u8 = null,
+    image_pull_policy: run_mod.PullPolicy = .missing,
     network: NamedNetworkOptions = .{},
     memory: memory_config.Config = .{},
     vcpus: u32 = 1,
@@ -442,6 +446,7 @@ fn createNamedWithTiming(
     const rootfs = try run_mod.resolveRootfsInputDetailed(init, arena, .{
         .rootfs_path = spec.rootfs_path,
         .image_ref = spec.image_ref,
+        .pull_policy = options.image_pull_policy,
         .command_name = "create",
         .record_artifact = spec.rootfs_path != null or spec.image_ref != null,
     });
@@ -824,6 +829,7 @@ pub fn createCli(
         .initrd_path = spec.initrd_path,
         .rootfs_path = spec.rootfs_path,
         .image_ref = spec.image_ref,
+        .image_pull_policy = parsed.image_pull_policy,
         .network = .{
             .enabled = parsed.network == .spore,
             .allow_cidrs = if (parsed.network == .spore) parsed.network_policy.allowCidrSlice() else &.{},
@@ -1468,6 +1474,7 @@ fn parseCreateArgs(
 ) !CreateOptions {
     var name: ?[]const u8 = null;
     var spec = Spec{ .name = "" };
+    var image_pull_policy: run_mod.PullPolicy = .missing;
     var network: run_mod.NetworkMode = .disabled;
     var network_policy = run_mod.NetworkPolicy{};
 
@@ -1487,6 +1494,18 @@ fn parseCreateArgs(
             spec.rootfs_path = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--image")) {
             spec.image_ref = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
+        } else if (std.mem.eql(u8, args[i], "--pull")) {
+            const raw = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
+            image_pull_policy = run_mod.PullPolicy.parse(raw) orelse {
+                const message = "spore create: --pull must be missing, always, or never";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
+            };
+        } else if (std.mem.startsWith(u8, args[i], "--pull=")) {
+            const raw = args[i]["--pull=".len..];
+            image_pull_policy = run_mod.PullPolicy.parse(raw) orelse {
+                const message = "spore create: --pull must be missing, always, or never";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
+            };
         } else if (std.mem.eql(u8, args[i], "--net")) {
             network = .spore;
         } else if (std.mem.eql(u8, args[i], "--allow-cidr")) {
@@ -1551,11 +1570,20 @@ fn parseCreateArgs(
         const message = "spore create: --rootfs and --image are mutually exclusive";
         exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
     }
+    if (spec.image_ref == null and image_pull_policy != .missing) {
+        const message = "spore create: --pull requires --image";
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
+    }
     if (network == .disabled and network_policy.hasRules()) {
         const message = "spore create: --allow-cidr and --allow-host require --net";
         exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
     }
-    return .{ .spec = spec, .network = network, .network_policy = network_policy };
+    return .{
+        .spec = spec,
+        .image_pull_policy = image_pull_policy,
+        .network = network,
+        .network_policy = network_policy,
+    };
 }
 
 fn parseExecArgs(args: []const []const u8) ExecOptions {
@@ -2694,6 +2722,21 @@ test "create parser accepts memory policy" {
     const explicit_opts = try parseCreateArgs(&.{ "bench-1", "--memory", "16gb" }, allocator, &stderr.writer, .human);
     try std.testing.expectEqual(memory_config.Policy.explicit, explicit_opts.spec.memory.policy);
     try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024 * 1024), explicit_opts.spec.memory.bytes);
+}
+
+test "create parser accepts image pull policy" {
+    const allocator = std.testing.allocator;
+    var stderr: Io.Writer.Allocating = .init(allocator);
+    defer stderr.deinit();
+
+    const default_opts = try parseCreateArgs(&.{ "bench-1", "--image", "docker.io/library/alpine:3.20" }, allocator, &stderr.writer, .human);
+    try std.testing.expectEqual(run_mod.PullPolicy.missing, default_opts.image_pull_policy);
+
+    const equals_opts = try parseCreateArgs(&.{ "bench-1", "--pull=always", "--image", "docker.io/library/alpine:3.20" }, allocator, &stderr.writer, .human);
+    try std.testing.expectEqual(run_mod.PullPolicy.always, equals_opts.image_pull_policy);
+
+    const value_opts = try parseCreateArgs(&.{ "bench-1", "--image", "docker.io/library/alpine:3.20", "--pull", "never" }, allocator, &stderr.writer, .human);
+    try std.testing.expectEqual(run_mod.PullPolicy.never, value_opts.image_pull_policy);
 }
 
 test "create parser accepts network allow policy" {

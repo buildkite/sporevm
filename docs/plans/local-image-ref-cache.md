@@ -164,9 +164,8 @@ No filesystem walk, glob, or metadata scan is needed.
 - Slice 1 is implemented: mutable tags check a direct-addressed local ref record
   before registry resolution, then update that record after the referenced
   rootfs cache entry is valid.
-- `spore run --image` supports `--pull=missing|always|never` for mutable refs.
-  `spore create --image` still uses the default missing behavior until lifecycle
-  CLI policy wiring lands.
+- `spore run --image` and `spore create --image` support
+  `--pull=missing|always|never` for mutable refs.
 - The lifecycle benchmark already resolves mutable tags once before timed loops
   so benchmark numbers do not accidentally measure registry latency.
 
@@ -184,13 +183,13 @@ run uses the local ref record and lands near digest-pinned timing.
 
 ### Slice 2: Explicit Pull Policy
 
-Status: partly landed for `spore run`.
+Status: landed.
 
 Add `--pull=missing|always|never` to `spore run` and `spore create`.
 
-`spore run --pull=always` refreshes the ref record, `spore run --pull=never`
-fails without network when the local record is absent, and the default behavior
-remains `missing`. `spore create --pull` remains a follow-up.
+`spore run --pull=always` and `spore create --pull=always` refresh the ref
+record, `--pull=never` fails without network when the local record is absent,
+and the default behavior remains `missing`.
 
 ### Slice 3: Observability And Docs
 
@@ -206,8 +205,9 @@ refresh, and rootfs cache hit.
 - Unit tests for ref-key stability and field validation.
 - Unit tests for cache miss behavior when the ref record, metadata JSON, or ext4
   file is missing or mismatched.
-- CLI tests for `spore run --pull=always` and `spore run --pull=never` parsing,
-  plus no-network `--pull=never` cache-miss behavior.
+- CLI tests for `spore run --pull=always`, `spore run --pull=never`,
+  `spore create --pull=always`, and `spore create --pull=never` parsing, plus
+  no-network `--pull=never` cache-miss behavior.
 - Local smoke:
 
   ```console
@@ -242,7 +242,7 @@ refresh, and rootfs cache hit.
 - Use SporeVM's existing rootfs cache root, including `SPOREVM_ROOTFS_CACHE_DIR`.
 - Keep rootfs cache keys immutable and digest-based.
 - Use a hashed filename for ref records, not tag text in path names.
-- Make `spore create --pull=missing` the default once lifecycle policy lands.
+- Make `spore create --pull=missing` the default.
 - Do not use the Docker daemon for this slice.
 
 ## Deferred Work
