@@ -11,6 +11,7 @@ pub const api = @import("api.zig");
 pub const board = @import("board.zig");
 pub const block_source = @import("block_source.zig");
 pub const boot = @import("boot.zig");
+pub const boot_harness = @import("boot_harness.zig");
 pub const bundle = @import("bundle.zig");
 pub const capture = @import("capture.zig");
 pub const chunk = @import("chunk.zig");
