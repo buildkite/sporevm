@@ -238,7 +238,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             .counter_frequency_hz = host_counter_frequency_hz,
             .device_count = transports.len,
         });
-        // The file-backed path is only enabled for trusted same-host forks.
+        // The file-backed path is only enabled for proof-gated local backing.
         // Otherwise RAM is materialized through verified chunks.
         const memory_plan = try spore.validateMemoryForRam(m.memory, ram_bytes.len);
         if (restore_stats) |*stats| {
