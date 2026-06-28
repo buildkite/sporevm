@@ -1519,7 +1519,7 @@ fn packRootfsStorageIndexed(
     try validateRootfsStorageForRootfs(storage, rootfs);
 
     if (seen_storages.contains(storage.index_digest)) {
-        const existing = findRootfsStorageEntryInSlice(storage_entries.items, storage.index_digest) orelse return error.BadManifest;
+        const existing = findRootfsStorageEntry(storage_entries.items, storage.index_digest) orelse return error.BadManifest;
         if (!rootfsStorageEntryMatches(existing, storage)) return error.BadManifest;
         return 0;
     }
@@ -1658,7 +1658,7 @@ fn unpackRootfsStorageIndexed(
     cache_root: []const u8,
 ) Error!RootfsMaterializeResult {
     try validateRootfsStorageForRootfs(storage, rootfs);
-    const entry = findRootfsStorageEntry(index, storage.index_digest) orelse return error.BadManifest;
+    const entry = findRootfsStorageEntry(index.storages, storage.index_digest) orelse return error.BadManifest;
     if (!rootfsStorageEntryMatches(entry, storage)) return error.BadManifest;
 
     const source_index_path = try pathZ(allocator, "{s}/{s}", .{ options.bundle_dir, entry.index_path });
@@ -1715,11 +1715,7 @@ fn findRootfsEntry(index: RootfsIndex, digest: []const u8) ?RootfsArtifactEntry 
     return null;
 }
 
-fn findRootfsStorageEntry(index: RootfsIndex, index_digest: []const u8) ?RootfsStorageEntry {
-    return findRootfsStorageEntryInSlice(index.storages, index_digest);
-}
-
-fn findRootfsStorageEntryInSlice(entries: []const RootfsStorageEntry, index_digest: []const u8) ?RootfsStorageEntry {
+fn findRootfsStorageEntry(entries: []const RootfsStorageEntry, index_digest: []const u8) ?RootfsStorageEntry {
     for (entries) |entry| {
         if (std.mem.eql(u8, entry.index_digest, index_digest)) return entry;
     }
