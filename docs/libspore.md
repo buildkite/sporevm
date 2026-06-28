@@ -187,6 +187,10 @@ const forked = try libspore.forkNamed(init, allocator, .{
 defer libspore.deinitNamedForkResult(allocator, forked);
 ```
 
+For mutable image refs, Zig callers can set `.image_pull_policy` to `.missing`,
+`.always`, or `.never`; the C and Go bindings use the default `.missing`
+policy.
+
 The named surface is:
 
 - `createNamed`
