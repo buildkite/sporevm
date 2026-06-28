@@ -74,8 +74,8 @@ static int64_t t_request_decode = 0;
 static int64_t t_command_start = 0;
 static int64_t t_command_exit = 0;
 static int sigchld_pipe[2] = { -1, -1 };
-// PSI monitor windows below 500ms are rejected by the kernel.
-static const char memory_pressure_trigger[] = "some 10000 500000\n";
+static const char memory_high_limit[] = "402653184\n";
+static const char memory_high_max[] = "max\n";
 
 static int path_is_dir(const char *path);
 
@@ -756,13 +756,22 @@ static int setup_memory_pressure(struct session *session, pid_t pid) {
   if (mkdir(session->memory_cgroup_path, 0755) != 0) return memory_pressure_setup_error("create cgroup");
 
   char path[192];
+  if (cgroup_child_path(path, sizeof(path), session->memory_cgroup_path, "memory.high") != 0 ||
+      write_text_file(path, memory_high_limit) != 0) return memory_pressure_setup_error("set high limit");
   if (cgroup_child_path(path, sizeof(path), session->memory_cgroup_path, "cgroup.procs") != 0 ||
       write_pid_file(path, pid) != 0) return memory_pressure_setup_error("move process");
-  if (cgroup_child_path(path, sizeof(path), session->memory_cgroup_path, "memory.pressure") != 0) return memory_pressure_setup_error("format pressure path");
-  session->memory_pressure_fd = open(path, O_RDWR | O_CLOEXEC | O_NONBLOCK);
-  if (session->memory_pressure_fd < 0) return memory_pressure_setup_error("open pressure");
-  if (write_all(session->memory_pressure_fd, memory_pressure_trigger, sizeof(memory_pressure_trigger) - 1) != 0) return memory_pressure_setup_error("arm pressure trigger");
+  if (cgroup_child_path(path, sizeof(path), session->memory_cgroup_path, "memory.events") != 0) return memory_pressure_setup_error("format events path");
+  session->memory_pressure_fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+  if (session->memory_pressure_fd < 0) return memory_pressure_setup_error("open events");
+  char buf[256];
+  (void)read(session->memory_pressure_fd, buf, sizeof(buf));
   return 0;
+}
+
+static void lift_memory_pressure_limit(struct session *session) {
+  char path[192];
+  if (cgroup_child_path(path, sizeof(path), session->memory_cgroup_path, "memory.high") != 0) return;
+  (void)write_text_file(path, memory_high_max);
 }
 
 static void close_client(struct client *client) {
@@ -1355,6 +1364,7 @@ static void maybe_send_memory_pressure(struct session *session, struct client *c
     return;
   }
   session->memory_pressure_sent = 1;
+  lift_memory_pressure_limit(session);
   close(session->memory_pressure_fd);
   session->memory_pressure_fd = -1;
 }
