@@ -26,12 +26,13 @@ asking users to choose a trust mode. Product restore paths should use the
 fastest memory source that fits the local provenance rules, then fall back to
 chunk-verified restore when that proof is absent or invalid.
 
-The first version should be deliberately small: a local proof sidecar next to
+The landed first version is deliberately small: a local proof sidecar next to
 `ram.backing`, a host-local signing key file, and a resume planner that treats
 the proof as an acceleration hint only. This proof says "this host produced and
 still recognizes this backing file for this manifest"; it does not prove every
 page still matches the manifest's chunk refs. The portable source of truth
-remains the manifest's BLAKE3 chunk refs.
+remains the manifest's BLAKE3 chunk refs. The remaining active slice is an
+opportunistic Linux fs-verity upgrade behind the same automatic planner.
 
 ## Problem
 
@@ -219,6 +220,8 @@ Done when:
 
 ### Slice 3: Linux fs-verity Upgrade
 
+Status: not started.
+
 Add an opportunistic Linux-only verifier behind the same automatic planner. When
 the filesystem supports fs-verity, enable it after finalizing `ram.backing`,
 store the verity digest in the proof, and verify the digest before mapping.
@@ -294,9 +297,10 @@ Validation on 2026-06-20:
   protected by owner-only `0700` root and `0600` file permissions, and is allowed
   to be ephemeral. Lost keys invalidate proofs and force chunk fallback.
 - Restore-source observability is part of Slice 1.
-- The first slice should replace the explicit fan-out trust plumbing before that
-  UX ships.
+- The first slice replaced the explicit fan-out trust plumbing before that UX
+  shipped.
 
 ## Open Questions
 
-No blocking questions for Slice 1.
+No blocking questions for the landed slices. Slice 3 needs Linux filesystem
+support and benchmark evidence before it is worth implementing.
