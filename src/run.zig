@@ -1441,14 +1441,6 @@ fn monotonicMs() u64 {
     return @as(u64, @intCast(ts.sec)) * std.time.ms_per_s + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
 }
 
-fn regularFileNoSymlink(io: Io, path: []const u8) !bool {
-    const stat = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
-        error.FileNotFound, error.AccessDenied, error.PermissionDenied, error.SymLinkLoop => return false,
-        else => |e| return e,
-    };
-    return stat.kind == .file;
-}
-
 fn jsonStringEquals(value: ?std.json.Value, expected: []const u8) bool {
     const actual = switch (value orelse return false) {
         .string => |string| string,
@@ -1633,8 +1625,8 @@ fn validateManagedKernelRepository(repository: []const u8) !void {
 }
 
 fn verifiedManagedKernelPath(io: Io, allocator: std.mem.Allocator, image_path: []const u8, sha_path: []const u8) !bool {
-    if (!try regularFileNoSymlink(io, image_path)) return false;
-    if (!try regularFileNoSymlink(io, sha_path)) return false;
+    if (!try rootfs_cache.regularFileNoSymlink(io, image_path)) return false;
+    if (!try rootfs_cache.regularFileNoSymlink(io, sha_path)) return false;
     const expected = readExpectedSha256(io, allocator, sha_path) catch |err| switch (err) {
         error.BadManagedKernelChecksum => return false,
         else => |e| return e,
@@ -1664,7 +1656,7 @@ fn managedRunKernelConfigHasRequiredSymbols(io: Io, allocator: std.mem.Allocator
 }
 
 fn missingManagedRunKernelConfigSymbolFromPath(io: Io, allocator: std.mem.Allocator, config_path: []const u8) !?[]const u8 {
-    if (!try regularFileNoSymlink(io, config_path)) return error.ManagedKernelConfigMissing;
+    if (!try rootfs_cache.regularFileNoSymlink(io, config_path)) return error.ManagedKernelConfigMissing;
     const config = try Io.Dir.cwd().readFileAlloc(io, config_path, allocator, .limited(max_kernel_config_asset_size));
     defer allocator.free(config);
     return missingManagedRunKernelConfigSymbol(allocator, config);
