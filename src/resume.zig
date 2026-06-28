@@ -325,7 +325,7 @@ const PreparedResumeAttach = struct {
 
 fn loadGenerationParams(io: Io, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
     const params = try Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(generation.params_size));
-    try validateGenerationParams(allocator, params);
+    try generation.validateFanoutParams(allocator, params);
     return params;
 }
 
@@ -340,9 +340,8 @@ fn prepareResumeAttach(allocator: std.mem.Allocator, manifest: spore.Manifest, g
     const generation_state = try gen_dev.capture(allocator);
     errdefer allocator.free(generation_state.params_b64);
 
-    var params_end = gen_dev.params.len;
-    while (params_end > 0 and gen_dev.params[params_end - 1] == 0) : (params_end -= 1) {}
-    if (params_end == 0) {
+    const params_payload = gen_dev.paramsPayload();
+    if (params_payload.len == 0) {
         const payload = struct {
             type: []const u8 = "attach",
             session_id: []const u8 = "default",
@@ -364,7 +363,7 @@ fn prepareResumeAttach(allocator: std.mem.Allocator, manifest: spore.Manifest, g
         stderr_offset: u64 = 0,
         params_json: []const u8,
     }{
-        .params_json = gen_dev.params[0..params_end],
+        .params_json = params_payload,
     };
     const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(json);
@@ -372,47 +371,6 @@ fn prepareResumeAttach(allocator: std.mem.Allocator, manifest: spore.Manifest, g
         .request = try std.fmt.allocPrint(allocator, "{s}\n", .{json}),
         .generation_state = generation_state,
     };
-}
-
-fn validateGenerationParams(allocator: std.mem.Allocator, params: []const u8) !void {
-    if (params.len == 0 or params.len > generation.params_size) return error.BadGenerationPayload;
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, params, .{}) catch return error.BadGenerationPayload;
-    defer parsed.deinit();
-    const object = switch (parsed.value) {
-        .object => |object| object,
-        else => return error.BadGenerationPayload,
-    };
-
-    _ = try requiredJsonString(object, "run_id");
-    _ = try requiredJsonU64(object, "child_id");
-    const parallel_index = try requiredJsonU64(object, "parallel_index");
-    const parallel_count = try requiredJsonU64(object, "parallel_count");
-    const fork_index = try requiredJsonU64(object, "fork_index");
-    const fork_count = try requiredJsonU64(object, "fork_count");
-    _ = try requiredJsonString(object, "fork_batch_id");
-    _ = try requiredJsonString(object, "vm_id");
-
-    if (parallel_count == 0 or fork_count == 0) return error.BadGenerationPayload;
-    if (parallel_index >= parallel_count or fork_index >= fork_count) return error.BadGenerationPayload;
-}
-
-fn requiredJsonU64(object: std.json.ObjectMap, field: []const u8) !u64 {
-    const value = object.get(field) orelse return error.BadGenerationPayload;
-    return switch (value) {
-        .integer => |integer| if (integer >= 0) @intCast(integer) else error.BadGenerationPayload,
-        .number_string => |string| std.fmt.parseInt(u64, string, 10) catch return error.BadGenerationPayload,
-        else => error.BadGenerationPayload,
-    };
-}
-
-fn requiredJsonString(object: std.json.ObjectMap, field: []const u8) ![]const u8 {
-    const value = object.get(field) orelse return error.BadGenerationPayload;
-    const string = switch (value) {
-        .string => |string| string,
-        else => return error.BadGenerationPayload,
-    };
-    if (string.len == 0) return error.BadGenerationPayload;
-    return string;
 }
 
 fn resolveBackend(backend: Backend) !Backend {
@@ -516,9 +474,8 @@ test "resume attach request carries refreshed generation params" {
 
     var restored = generation.Device{};
     try restored.restore(allocator, attach.generation_state);
-    var params_end = restored.params.len;
-    while (params_end > 0 and restored.params[params_end - 1] == 0) : (params_end -= 1) {}
-    try std.testing.expect(std.mem.indexOf(u8, restored.params[0..params_end], "\"resume_time_unix_ns\":") != null);
+    const params_payload = restored.paramsPayload();
+    try std.testing.expect(std.mem.indexOf(u8, params_payload, "\"resume_time_unix_ns\":") != null);
 
     const AttachPayload = struct {
         params_json: []const u8,
@@ -528,7 +485,7 @@ test "resume attach request carries refreshed generation params" {
         .ignore_unknown_fields = true,
     });
     defer parsed.deinit();
-    try std.testing.expectEqualStrings(restored.params[0..params_end], parsed.value.params_json);
+    try std.testing.expectEqualStrings(params_payload, parsed.value.params_json);
 }
 
 test "resume attach request accepts explicit generation params" {
@@ -536,7 +493,7 @@ test "resume attach request accepts explicit generation params" {
     const params =
         \\{"run_id":"rails-rspec-1","child_id":7,"parallel_index":7,"parallel_count":1000,"fork_index":7,"fork_count":1000,"fork_batch_id":"batch-1","vm_id":"spore-child-7"}
     ;
-    try validateGenerationParams(allocator, params);
+    try generation.validateFanoutParams(allocator, params);
 
     const manifest = testDiskGuardManifest(&.{}, false);
     const attach = try prepareResumeAttach(allocator, manifest, params);
@@ -546,19 +503,7 @@ test "resume attach request accepts explicit generation params" {
 
     var restored = generation.Device{};
     try restored.restore(allocator, attach.generation_state);
-    var params_end = restored.params.len;
-    while (params_end > 0 and restored.params[params_end - 1] == 0) : (params_end -= 1) {}
-    try std.testing.expectEqualStrings(params, restored.params[0..params_end]);
-}
-
-test "explicit generation params require shard identity fields" {
-    const allocator = std.testing.allocator;
-    try std.testing.expectError(error.BadGenerationPayload, validateGenerationParams(allocator,
-        \\{"run_id":"rails-rspec-1","parallel_index":0,"parallel_count":1}
-    ));
-    try std.testing.expectError(error.BadGenerationPayload, validateGenerationParams(allocator,
-        \\{"run_id":"rails-rspec-1","child_id":1,"parallel_index":2,"parallel_count":2,"fork_index":0,"fork_count":1,"fork_batch_id":"batch-1","vm_id":"spore-child-1"}
-    ));
+    try std.testing.expectEqualStrings(params, restored.paramsPayload());
 }
 
 test "resume memory defaults to manifest ram size" {
