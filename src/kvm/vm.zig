@@ -94,6 +94,10 @@ pub const Config = struct {
     exec_control: ?vsock.Control = null,
 };
 
+fn hasFreshCaptureTrigger(config: Config) bool {
+    return config.snapshot_after_ms != null or config.snapshot_on_probe_complete or config.capture_request != null;
+}
+
 pub const DirtyTrackingOptions = struct {
     enabled: bool = false,
     /// 0 disables periodic collection and measures only the final tail flush.
@@ -203,7 +207,10 @@ const SpinLock = struct {
 };
 
 pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
-    try topology.requireSingleVcpu(config.vcpus);
+    try topology.validateVcpuCount(config.vcpus);
+    if (config.vcpus != 1 and (config.resume_dir != null or hasFreshCaptureTrigger(config) or config.exec_control != null or config.dirty_tracking.enabled or config.virtio_mem_region_size != 0)) {
+        return error.UnsupportedVcpuCount;
+    }
 
     var resume_parsed: ?std.json.Parsed(spore.Manifest) = null;
     defer if (resume_parsed) |*parsed| parsed.deinit();
@@ -302,9 +309,24 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     }
     const transports = transports_buf[0..transport_count];
 
-    const vcpu_fd: std.c.fd_t = @intCast(try kvm.ioctl(vm_fd, kvm.KVM_CREATE_VCPU, 0, "KVM_CREATE_VCPU"));
-    defer closeFd(vcpu_fd);
-    try initVcpu(vm_fd, vcpu_fd);
+    const run_size = try kvm.ioctl(kvm_fd, kvm.KVM_GET_VCPU_MMAP_SIZE, 0, "KVM_GET_VCPU_MMAP_SIZE");
+    const vcpu_count: usize = @intCast(config.vcpus);
+    var vcpus = try allocator.alloc(KvmVcpu, vcpu_count);
+    for (vcpus) |*vcpu| vcpu.* = .{};
+    errdefer {
+        for (vcpus) |*vcpu| vcpu.deinit();
+        allocator.free(vcpus);
+    }
+    for (vcpus, 0..) |*vcpu, index| {
+        try vcpu.init(vm_fd, run_size, @intCast(index));
+        try initVcpu(vm_fd, vcpu.fd);
+    }
+    defer {
+        for (vcpus) |*vcpu| vcpu.deinit();
+        allocator.free(vcpus);
+    }
+    const primary_vcpu = &vcpus[0];
+    const vcpu_fd = primary_vcpu.fd;
     try initGic(gic_dev.fd);
 
     if (config.resume_dir) |spore_dir| {
@@ -397,30 +419,22 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         }
     }
 
-    const run_size = try kvm.ioctl(kvm_fd, kvm.KVM_GET_VCPU_MMAP_SIZE, 0, "KVM_GET_VCPU_MMAP_SIZE");
-    const run_bytes = try std.posix.mmap(
-        null,
-        run_size,
-        .{ .READ = true, .WRITE = true },
-        .{ .TYPE = .SHARED },
-        vcpu_fd,
-        0,
-    );
-    defer std.posix.munmap(run_bytes);
     var run_wake_signal = KvmRunWakeSignal.install();
     defer run_wake_signal.deinit();
-    var run_wake = KvmRunWake{
-        .run = run_bytes,
-        .process_id = linux.getpid(),
-        .thread_id = linux.gettid(),
-    };
-    if (config.capture_request) |request_capture| {
-        request_capture.setWake(wakeKvmRun, &run_wake);
+    const run_bytes = primary_vcpu.run_bytes;
+    primary_vcpu.wake.thread_id = linux.gettid();
+    var multi_wake = KvmRunWakeSet{ .vcpus = vcpus };
+    if (config.vcpus == 1) {
+        if (config.capture_request) |request_capture| {
+            request_capture.setWake(wakeKvmRun, &primary_vcpu.wake);
+        }
+        if (config.exec_control) |control| {
+            control.setWake(.{ .context = &primary_vcpu.wake, .wakeFn = wakeControlKvmRun });
+        }
+        config.network.setWake(.{ .context = &primary_vcpu.wake, .wakeFn = wakeNetworkKvmRun });
+    } else {
+        config.network.setWake(.{ .context = &multi_wake, .wakeFn = wakeNetworkKvmRunSet });
     }
-    if (config.exec_control) |control| {
-        control.setWake(.{ .context = &run_wake, .wakeFn = wakeControlKvmRun });
-    }
-    config.network.setWake(.{ .context = &run_wake, .wakeFn = wakeNetworkKvmRun });
     defer config.network.clearWake();
     defer if (config.capture_request) |request_capture| request_capture.clearWake();
 
@@ -446,6 +460,20 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         probe.markStarted();
         try vsock_dev.attachHostStream(probe);
         try flushVsockRxKvm(vm_fd, &vsock_dev, &transports_buf[vsock_transport_index], ram, vsock_transport_index);
+    }
+    if (config.vcpus != 1) {
+        return runFreshMultiVcpu(allocator, .{
+            .vm_fd = vm_fd,
+            .vcpus = vcpus,
+            .wake_set = &multi_wake,
+            .config = &config,
+            .transports = transports,
+            .gen_dev = &gen_dev,
+            .ram = ram,
+            .net_dev = &net_dev,
+            .net_transport_index = net_transport_index,
+            .start_ms = start_ms,
+        });
     }
     var exec_probe_done = false;
     var handled_memory_pressure_count: u32 = 0;
@@ -612,6 +640,52 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
 
 const kvm_run_wake_signal = posix.SIG.URG;
 
+const KvmVcpu = struct {
+    index: topology.VcpuIndex = 0,
+    fd: std.c.fd_t = -1,
+    run_bytes: []u8 = undefined,
+    run_mapped: bool = false,
+    wake: KvmRunWake = undefined,
+    thread: ?std.Thread = null,
+
+    fn init(self: *KvmVcpu, vm_fd: std.c.fd_t, run_size: usize, index: topology.VcpuIndex) !void {
+        const fd: std.c.fd_t = @intCast(try kvm.ioctl(vm_fd, kvm.KVM_CREATE_VCPU, @intCast(index), "KVM_CREATE_VCPU"));
+        errdefer closeFd(fd);
+        const run_bytes = try std.posix.mmap(
+            null,
+            run_size,
+            .{ .READ = true, .WRITE = true },
+            .{ .TYPE = .SHARED },
+            fd,
+            0,
+        );
+        self.* = .{
+            .index = index,
+            .fd = fd,
+            .run_bytes = run_bytes,
+            .run_mapped = true,
+            .wake = .{
+                .run = run_bytes,
+                .process_id = linux.getpid(),
+                .thread_id = 0,
+            },
+        };
+    }
+
+    fn deinit(self: *KvmVcpu) void {
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+        if (self.run_mapped) {
+            std.posix.munmap(self.run_bytes);
+            self.run_mapped = false;
+        }
+        if (self.fd >= 0) {
+            closeFd(self.fd);
+            self.fd = -1;
+        }
+    }
+};
+
 const KvmRunWake = struct {
     run: []u8,
     process_id: linux.pid_t,
@@ -620,6 +694,14 @@ const KvmRunWake = struct {
     fn wakeRun(self: *KvmRunWake) void {
         self.run[kvm.RunLayout.immediate_exit] = 1;
         _ = linux.tgkill(self.process_id, self.thread_id, kvm_run_wake_signal);
+    }
+};
+
+const KvmRunWakeSet = struct {
+    vcpus: []KvmVcpu,
+
+    fn wakeAll(self: *KvmRunWakeSet) void {
+        for (self.vcpus) |*vcpu| vcpu.wake.wakeRun();
     }
 };
 
@@ -655,6 +737,11 @@ fn wakeNetworkKvmRun(context: ?*anyopaque) void {
     wake.wakeRun();
 }
 
+fn wakeNetworkKvmRunSet(context: ?*anyopaque) void {
+    const wake_set: *KvmRunWakeSet = @ptrCast(@alignCast(context orelse return));
+    wake_set.wakeAll();
+}
+
 fn wakeControlKvmRun(context: *anyopaque) void {
     const wake: *KvmRunWake = @ptrCast(@alignCast(context));
     wake.wakeRun();
@@ -663,6 +750,193 @@ fn wakeControlKvmRun(context: *anyopaque) void {
 fn handleKvmRunWakeSignal(_: posix.SIG, _: *const posix.siginfo_t, _: ?*anyopaque) callconv(.c) void {
     // Empty handler: the signal exists only to interrupt KVM_RUN after
     // `immediate_exit` is set by a helper thread.
+}
+
+const MultiKvmResult = union(enum) {
+    exit: ExitCause,
+    err: anyerror,
+};
+
+const MultiKvmRunState = struct {
+    mutex: std.Thread.Mutex = .{},
+    stop: std.atomic.Value(bool) = .init(false),
+    result_value: ?MultiKvmResult = null,
+
+    fn stopped(self: *MultiKvmRunState) bool {
+        return self.stop.load(.acquire);
+    }
+
+    fn finish(self: *MultiKvmRunState, new_result: MultiKvmResult) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.result_value == null) self.result_value = new_result;
+        self.stop.store(true, .release);
+    }
+
+    fn result(self: *MultiKvmRunState) ?MultiKvmResult {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.result_value;
+    }
+};
+
+const MultiKvmRunOptions = struct {
+    vm_fd: std.c.fd_t,
+    vcpus: []KvmVcpu,
+    wake_set: *KvmRunWakeSet,
+    config: *const Config,
+    transports: []mmio.Transport,
+    gen_dev: *generation.Device,
+    ram: guestmem.GuestRam,
+    net_dev: *net.Net,
+    net_transport_index: usize,
+    start_ms: u64,
+};
+
+const MultiKvmThreadContext = struct {
+    vm_fd: std.c.fd_t,
+    vcpu: *KvmVcpu,
+    state: *MultiKvmRunState,
+    device_lock: *std.Thread.Mutex,
+    network: net.Runtime,
+    transports: []mmio.Transport,
+    gen_dev: *generation.Device,
+    ram: guestmem.GuestRam,
+    net_dev: *net.Net,
+    net_transport_index: usize,
+};
+
+fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiKvmRunOptions) !ExitCause {
+    var state = MultiKvmRunState{};
+    var device_lock = std.Thread.Mutex{};
+    const contexts = try allocator.alloc(MultiKvmThreadContext, options.vcpus.len);
+    defer allocator.free(contexts);
+    defer joinKvmVcpuThreads(options.vcpus);
+    errdefer {
+        state.finish(.{ .err = error.KvmThreadStartFailed });
+        options.wake_set.wakeAll();
+    }
+
+    for (options.vcpus, contexts) |*vcpu, *ctx| {
+        ctx.* = .{
+            .vm_fd = options.vm_fd,
+            .vcpu = vcpu,
+            .state = &state,
+            .device_lock = &device_lock,
+            .network = options.config.network,
+            .transports = options.transports,
+            .gen_dev = options.gen_dev,
+            .ram = options.ram,
+            .net_dev = options.net_dev,
+            .net_transport_index = options.net_transport_index,
+        };
+        vcpu.thread = try std.Thread.spawn(.{}, kvmVcpuThreadMain, .{ctx});
+    }
+
+    while (true) {
+        if (state.result()) |result| {
+            options.wake_set.wakeAll();
+            return finishMultiKvmResult(result);
+        }
+        if (options.config.network.failed()) {
+            state.finish(.{ .err = error.NetworkGatewayFailed });
+            continue;
+        }
+        if (options.config.exec_probe) |probe| {
+            if (probe.state == .failed) {
+                state.finish(.{ .err = error.VsockProbeFailed });
+                continue;
+            }
+            if (probe.state == .complete) {
+                std.log.debug("kvm multi-vcpu probe completion timing: observed_ms={d}", .{probe.elapsedMs()});
+                state.finish(.{ .exit = .probe_complete });
+                continue;
+            }
+            if (probe.elapsedMs() > options.config.exec_probe_timeout_ms) {
+                state.finish(.{ .err = error.VsockProbeTimedOut });
+                continue;
+            }
+        }
+        const elapsed_ms = (try monotonicMs()) -| options.start_ms;
+        if (options.config.snapshot_after_ms) |after_ms| {
+            if (elapsed_ms >= after_ms) {
+                state.finish(.{ .err = error.UnsupportedVcpuCount });
+                continue;
+            }
+        }
+        std.time.sleep(std.time.ns_per_ms);
+    }
+}
+
+fn finishMultiKvmResult(result: MultiKvmResult) !ExitCause {
+    return switch (result) {
+        .exit => |cause| cause,
+        .err => |err| err,
+    };
+}
+
+fn joinKvmVcpuThreads(vcpus: []KvmVcpu) void {
+    for (vcpus) |*vcpu| {
+        if (vcpu.thread) |thread| {
+            vcpu.wake.wakeRun();
+            thread.join();
+            vcpu.thread = null;
+        }
+    }
+}
+
+fn kvmVcpuThreadMain(ctx: *MultiKvmThreadContext) void {
+    ctx.vcpu.wake.thread_id = linux.gettid();
+    while (!ctx.state.stopped()) {
+        const run_result = kvm.runVcpu(ctx.vcpu.fd) catch |err| {
+            ctx.state.finish(.{ .err = err });
+            return;
+        };
+        const stopped_for_wake = ctx.vcpu.run_bytes[kvm.RunLayout.immediate_exit] != 0;
+        _ = consumeCaptureWake(null, ctx.vcpu.run_bytes);
+        if (ctx.state.stopped()) continue;
+
+        if (ctx.network.failed()) {
+            ctx.state.finish(.{ .err = error.NetworkGatewayFailed });
+            continue;
+        }
+        var flushed_network = false;
+        ctx.device_lock.lock();
+        if (ctx.network.consumeWake()) {
+            flushNetworkRxKvm(ctx.vm_fd, ctx.net_dev, &ctx.transports[ctx.net_transport_index], ctx.ram, ctx.net_transport_index) catch |err| {
+                ctx.device_lock.unlock();
+                ctx.state.finish(.{ .err = err });
+                return;
+            };
+            flushed_network = true;
+        }
+        ctx.device_lock.unlock();
+        if (flushed_network) continue;
+        if (run_result == .interrupted or stopped_for_wake) continue;
+
+        switch (kvm.exitReason(ctx.vcpu.run_bytes)) {
+            kvm.KVM_EXIT_MMIO => {
+                ctx.device_lock.lock();
+                handleMmio(ctx.vm_fd, ctx.vcpu.run_bytes, ctx.transports, ctx.gen_dev, ctx.ram) catch |err| {
+                    ctx.device_lock.unlock();
+                    ctx.state.finish(.{ .err = err });
+                    return;
+                };
+                ctx.device_lock.unlock();
+            },
+            kvm.KVM_EXIT_SYSTEM_EVENT => switch (kvm.systemEventType(ctx.vcpu.run_bytes)) {
+                kvm.KVM_SYSTEM_EVENT_SHUTDOWN => ctx.state.finish(.{ .exit = .guest_off }),
+                kvm.KVM_SYSTEM_EVENT_RESET => ctx.state.finish(.{ .exit = .guest_reset }),
+                else => ctx.state.finish(.{ .err = error.UnexpectedExit }),
+            },
+            kvm.KVM_EXIT_SHUTDOWN => ctx.state.finish(.{ .exit = .guest_off }),
+            kvm.KVM_EXIT_FAIL_ENTRY, kvm.KVM_EXIT_INTERNAL_ERROR => ctx.state.finish(.{ .err = error.UnexpectedExit }),
+            else => |reason| {
+                std.log.err("unhandled KVM exit reason {d} on vcpu {d}", .{ reason, ctx.vcpu.index });
+                ctx.state.finish(.{ .err = error.UnexpectedExit });
+            },
+        }
+    }
 }
 
 fn flushVsockRxKvm(

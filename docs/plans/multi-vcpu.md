@@ -249,13 +249,17 @@ limit.
   8, while public C/Go boundary surfaces still carry `u32` fields.
 - `run.execute` and `run.executeMonitor` validate the cap and pass `vcpus` into
   backend configs.
-- KVM and HVF backend configs carry `vcpus`, feed it into DTB construction, and
-  still fail closed for counts other than 1 before VM creation.
+- KVM backend configs carry `vcpus`, feed it into DTB construction, and can run
+  fresh non-capture, non-monitor multi-vCPU guests with one host thread per
+  vCPU. KVM capture/resume/monitor paths and transient virtio-mem still fail
+  closed for `vcpus != 1`.
+- HVF backend configs carry `vcpus`, feed it into DTB construction, and still
+  fail closed for counts other than 1 before VM creation.
 - Lifecycle metadata records `vcpus`; named create/monitor, named resume, and
   named fork reject unsupported multi-vCPU lifecycle state before guest boot.
 - `board.buildDtb` emits one CPU node per `cpu_count`, and DTB tests cover
   multi-node CPU topology plus redistributor region sizing.
-- KVM and HVF both still create exactly one vCPU.
+- HVF still creates exactly one vCPU.
 - KVM snapshot code captures and restores one vCPU fd plus vCPU0 GIC attrs.
 - HVF snapshot code captures and restores one vCPU handle plus HVF-private GIC
   state.
@@ -288,6 +292,10 @@ Done when:
 Implement KVM vCPU arrays, per-vCPU run threads, all-vCPU wake handling, and
 serialized MMIO/device handling. Keep capture disabled for `vcpus != 1` in this
 slice.
+
+Status: implemented in this branch slice on 2026-06-28. Validation: `mise run
+test`, `mise run build`, and `git diff --check`. Live KVM smoke remains pending
+because this validation host does not expose `/dev/kvm`.
 
 Done when:
 

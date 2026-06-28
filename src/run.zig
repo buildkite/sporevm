@@ -1854,7 +1854,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
 
     const resuming = opts.resume_dir != null;
     const memory_plan = runMemoryPlan(opts.memory, .{
-        .fixed_ram = resuming or opts.capture_path != null,
+        .fixed_ram = resuming or opts.capture_path != null or opts.vcpus != 1,
         .auto_hotplug_capable = opts.auto_memory_hotplug_capable,
     });
     const local_backing_start = monotonicMs();
