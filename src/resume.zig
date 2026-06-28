@@ -15,7 +15,6 @@ const generation = @import("generation.zig");
 const run_mod = @import("run.zig");
 const runtime_disk = @import("runtime_disk.zig");
 const spore = @import("spore.zig");
-const virtio_blk = @import("virtio/blk.zig");
 const virtio_net = @import("virtio/net.zig");
 const vsock = @import("virtio/vsock.zig");
 
@@ -362,7 +361,7 @@ fn prepareResumeAttach(allocator: std.mem.Allocator, manifest: spore.Manifest, g
 }
 
 fn validateResumeDiskManifest(manifest: spore.Manifest) void {
-    const disk_count = countBlockDevices(manifest.devices);
+    const disk_count = spore.countBlockDevices(manifest.devices);
     if (disk_count == 0) return;
     if (disk_count != 1) {
         failResumeSetup("spore resume: only one immutable rootfs disk is supported; found {d} block devices", .{disk_count});
@@ -378,14 +377,6 @@ fn validateResumeDiskManifest(manifest: spore.Manifest) void {
             failResumeSetup("spore resume: invalid writable disk metadata in manifest", .{});
         };
     }
-}
-
-fn countBlockDevices(devices: []const spore.TransportState) usize {
-    var count: usize = 0;
-    for (devices) |device| {
-        if (device.device_id == virtio_blk.device_id) count += 1;
-    }
-    return count;
 }
 
 fn failResumeSetup(comptime fmt: []const u8, args: anytype) noreturn {
@@ -476,32 +467,6 @@ test "resume attach request accepts explicit generation params" {
     try std.testing.expectEqualStrings(params, restored.paramsPayload());
 }
 
-test "resume counts block devices for disk dependency classification" {
-    const disk_device = spore.TransportState{
-        .device_id = virtio_blk.device_id,
-        .status = 0,
-        .device_features_sel = 0,
-        .driver_features_sel = 0,
-        .driver_features = 0,
-        .queue_sel = 0,
-        .interrupt_status = 0,
-        .queues = &.{},
-    };
-    const console_device = spore.TransportState{
-        .device_id = 3,
-        .status = 0,
-        .device_features_sel = 0,
-        .driver_features_sel = 0,
-        .driver_features = 0,
-        .queue_sel = 0,
-        .interrupt_status = 0,
-        .queues = &.{},
-    };
-
-    try std.testing.expectEqual(@as(usize, 1), countBlockDevices(&.{ console_device, disk_device }));
-    try std.testing.expectEqual(@as(usize, 0), countBlockDevices(&.{console_device}));
-}
-
 fn testDiskGuardManifest(devices: []spore.TransportState, with_disk: bool) spore.Manifest {
     return .{
         .platform = .{
@@ -552,7 +517,7 @@ fn testDiskGuardManifest(devices: []spore.TransportState, with_disk: bool) spore
 
 test "resume accepts writable disk manifests for layered runtime setup" {
     var devices = [_]spore.TransportState{.{
-        .device_id = virtio_blk.device_id,
+        .device_id = spore.rootfs_virtio_blk_device_id,
         .status = 0,
         .device_features_sel = 0,
         .driver_features_sel = 0,
