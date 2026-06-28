@@ -214,9 +214,9 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     try hvf.check(hvf.hv_gic_create(gic_config), "hv_gic_create");
     const gic_ms = monotonicMs() - gic_start;
 
-    // Guest RAM. Eager and trusted-file resumes map the whole range up front;
-    // lazy chunk resumes leave it unmapped in HVF and materialize chunks from
-    // instruction/data-abort exits in the run loop.
+    // Guest RAM. Eager and proof-gated local backing resumes map the whole
+    // range up front; lazy chunk resumes leave it unmapped in HVF and
+    // materialize chunks from instruction/data-abort exits in the run loop.
     const map_ram_start = monotonicMs();
     const ram_mapping = try mapRam(config, if (resume_parsed) |parsed| parsed.value else null);
     const map_ram_ms = monotonicMs() - map_ram_start;
