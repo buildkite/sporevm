@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: landed
 last_reviewed: 2026-06-28
 spec_refs:
   - docs/spore-format.md
@@ -23,8 +23,8 @@ related_plans:
 
 ## Summary
 
-SporeVM already exposes a `--vcpus N` option at the product boundary, but the
-runtime still rejects every value except `1`. The intended outcome is that
+At plan start, SporeVM exposed a `--vcpus N` option at the product boundary,
+but the runtime rejected every value except `1`. The landed outcome is that
 operators can boot, capture, restore, and fan out aarch64 guests with more than
 one vCPU without weakening the existing isolation, portability, or fail-closed
 manifest rules.
@@ -309,8 +309,8 @@ serialized MMIO/device handling. Keep capture disabled for `vcpus != 1` in this
 slice.
 
 Status: implemented in this branch slice on 2026-06-28. Validation: `mise run
-test`, `mise run build`, and `git diff --check`. Live KVM smoke remains pending
-because this validation host does not expose `/dev/kvm`.
+test`, `mise run build`, `git diff --check`, and final KVM smoke via
+`scripts/smoke-multi-vcpu.sh` on the `sporevm-ops` ARM64 Linux CI host.
 
 Done when:
 
@@ -361,9 +361,8 @@ Done when:
 
 Status: implemented for the manifest data model and fail-closed validators in
 this branch slice on 2026-06-28. Validation: `git diff --check`, `mise run
-test`, and `mise run build`. The current runtime, fork, and bundle production
-paths still use manifest v0 loaders/writers; v1 fork/fan-out and bundle
-preservation remain in Slice 7 when v1 capture/restore has producers.
+test`, and `mise run build`. Runtime v1 producers/consumers and v1
+fork/fan-out and bundle preservation landed in later slices.
 
 ### Slice 5: KVM Multi-vCPU Capture and Resume
 
@@ -381,8 +380,8 @@ Done when:
 - stale or incompatible vCPU topology fails at manifest/platform validation.
 
 Status: implemented in this branch slice on 2026-06-28. Validation: `git diff
---check`, `mise run test`, and `mise run build`. Live KVM smoke remains pending
-because this validation host does not expose `/dev/kvm`.
+--check`, `mise run test`, `mise run build`, and final KVM smoke via
+`scripts/smoke-multi-vcpu.sh` on the `sporevm-ops` ARM64 Linux CI host.
 
 ### Slice 6: HVF Multi-vCPU Capture and Resume
 
@@ -495,6 +494,7 @@ Validation:
   incompatible format feature is requested.
 - KVM can land before HVF internally, but the product surface must describe
   backend support explicitly and reject unsupported backends before guest start.
+- The first product cap is `1..8`, centralized in the shared topology helper.
 
 ## Deferred Work
 
@@ -503,17 +503,14 @@ Validation:
 - Cross-frequency timer translation.
 - Transient virtio-mem capture/resume; this needs a separate automatic-memory
   device-model migration before multi-vCPU should depend on it.
+- Portable HVF `gicv3_multi` production; this plan ships same-HVF restore with
+  tagged `backend_private` GIC state.
 - CPU hotplug after boot.
 - Scheduler admission based on host CPU capacity.
 
 ## Open Questions
 
-- First product cap: default to `1..8` unless backend probing proves a lower
-  safe cap. This is not blocking Slice 1 because the shared validation helper can
-  centralize the value.
-- HVF portable GIC production: Slice 6 ships same-HVF restore with tagged
-  `backend_private` GIC state. Portable `gicv3_multi` production remains the
-  cross-backend gap.
+None.
 
 ## Key Learnings From Pressure-Testing
 
