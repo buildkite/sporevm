@@ -229,6 +229,11 @@ pub const ListStats = struct {
     dirty_chunks_pending: ?u64 = null,
 };
 
+const ListMetadata = struct {
+    memory: ListMemory,
+    stats: ListStats,
+};
+
 pub const lifecycle_schema = "spore.lifecycle.v1";
 pub const lifecycle_schema_version: u32 = 1;
 
@@ -1421,13 +1426,13 @@ pub fn listEntries(allocator: std.mem.Allocator, io: Io, runtime_root: []const u
         const state = try classifyVmState(allocator, io, paths, pid_alive);
         if (state == .absent) continue;
         const pid = if (state == .ready or state == .stale) readPid(allocator, io, paths) catch null else null;
-        const memory = readListMemory(allocator, io, paths) catch null;
+        const metadata = readListMetadata(allocator, io, paths) catch null;
         try entries.append(.{
             .name = try allocator.dupe(u8, entry.name),
             .state = state.name(),
             .pid = pid,
-            .memory = memory,
-            .stats = if (memory) |value| listStatsFromMemory(value) else .{},
+            .memory = if (metadata) |value| value.memory else null,
+            .stats = if (metadata) |value| value.stats else .{},
         });
     }
     const out = try entries.toOwnedSlice();
@@ -1444,10 +1449,19 @@ fn emptyListEntries(allocator: std.mem.Allocator) ![]ListEntry {
     return allocator.alloc(ListEntry, 0);
 }
 
-fn readListMemory(allocator: std.mem.Allocator, io: Io, paths: Paths) !ListMemory {
+fn readListMetadata(allocator: std.mem.Allocator, io: Io, paths: Paths) !ListMetadata {
     var spec = try readSpec(allocator, io, paths);
     defer spec.deinit();
-    return listMemoryFromConfig(spec.value.memory);
+    const memory = listMemoryFromConfig(spec.value.memory);
+    var stats = listStatsFromMemory(memory);
+    if (spec.value.resume_dir) |dir| {
+        const backing_stats = readBackingFileStats(allocator, dir) catch null;
+        if (backing_stats) |value| {
+            stats.backing_logical_bytes = value.backing_logical_bytes;
+            stats.backing_allocated_bytes = value.backing_allocated_bytes;
+        }
+    }
+    return .{ .memory = memory, .stats = stats };
 }
 
 fn listMemoryFromConfig(memory: memory_config.Config) ListMemory {
@@ -1463,6 +1477,55 @@ fn listStatsFromMemory(memory: ListMemory) ListStats {
         .chunk_size = chunk_size,
         .chunks_total = std.math.divCeil(u64, memory.bytes, chunk_size) catch unreachable,
     };
+}
+
+fn readBackingFileStats(allocator: std.mem.Allocator, dir: []const u8) !ListStats {
+    const backing_path = try std.fs.path.resolve(allocator, &.{ dir, spore.ram_backing_path });
+    defer allocator.free(backing_path);
+    const backing_path_z = try allocator.dupeZ(u8, backing_path);
+    defer allocator.free(backing_path_z);
+
+    const fd = std.c.open(backing_path_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    if (fd < 0) return error.FileNotFound;
+    defer _ = std.c.close(fd);
+
+    return fstatBackingFileStats(fd);
+}
+
+fn fstatBackingFileStats(fd: std.c.fd_t) !ListStats {
+    if (comptime builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var statx_buf: linux.Statx = undefined;
+        const rc = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{
+            .TYPE = true,
+            .MODE = true,
+            .SIZE = true,
+            .BLOCKS = true,
+        }, &statx_buf);
+        if (linux.errno(rc) != .SUCCESS) return error.IoFailed;
+        if (!linux.S.ISREG(statx_buf.mode)) return error.FileNotFound;
+        return .{
+            .backing_logical_bytes = statx_buf.size,
+            .backing_allocated_bytes = if (statx_buf.mask.BLOCKS)
+                std.math.mul(u64, statx_buf.blocks, 512) catch null
+            else
+                null,
+        };
+    } else if (comptime builtin.os.tag.isDarwin()) {
+        var stat: std.c.Stat = undefined;
+        if (std.c.fstat(fd, &stat) != 0) return error.IoFailed;
+        if (!std.c.S.ISREG(stat.mode)) return error.FileNotFound;
+        if (stat.size < 0) return error.IoFailed;
+        return .{
+            .backing_logical_bytes = @intCast(stat.size),
+            .backing_allocated_bytes = if (stat.blocks >= 0)
+                std.math.mul(u64, @intCast(stat.blocks), 512) catch null
+            else
+                null,
+        };
+    } else {
+        return error.UnsupportedPlatform;
+    }
 }
 
 fn writeMemoryValue(writer: *Io.Writer, memory: ListMemory) !void {
@@ -2898,8 +2961,15 @@ test "lifecycle list entries sorts and classifies VM directories" {
 
     const stale = try pathsFromRoot(allocator, root, "b-stale");
     defer stale.deinit(allocator);
+    const stale_spore_dir = try std.fs.path.resolve(allocator, &.{ root, "b-stale.spore" });
+    defer allocator.free(stale_spore_dir);
+    try ensureDirPath(io, stale_spore_dir);
+    const stale_backing_path = try std.fs.path.resolve(allocator, &.{ stale_spore_dir, spore.ram_backing_path });
+    defer allocator.free(stale_backing_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = stale_backing_path, .data = "backing-bytes" });
     try writeSpec(allocator, io, stale, .{
         .name = "b-stale",
+        .resume_dir = stale_spore_dir,
         .memory = .{ .policy = .explicit, .bytes = 512 * 1024 * 1024 },
     });
     try writeReady(allocator, io, stale, .{
@@ -2936,6 +3006,8 @@ test "lifecycle list entries sorts and classifies VM directories" {
     try std.testing.expectEqual(@as(?i64, 9001), entries[1].pid);
     try std.testing.expectEqualStrings("explicit", entries[1].memory.?.policy);
     try std.testing.expectEqual(@as(u64, 512 * 1024 * 1024), entries[1].memory.?.bytes);
+    try std.testing.expectEqual(@as(?u64, 13), entries[1].stats.backing_logical_bytes);
+    try std.testing.expect(entries[1].stats.backing_allocated_bytes != null);
     try std.testing.expectEqual(@as(?u64, 256), entries[1].stats.chunks_total);
 }
 
