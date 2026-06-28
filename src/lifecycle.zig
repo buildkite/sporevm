@@ -12,6 +12,7 @@ const memory_config = @import("memory.zig");
 const run_mod = @import("run.zig");
 const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
+const topology = @import("topology.zig");
 
 pub const runtime_dir_env = local_paths.runtime_dir_env;
 pub const max_name_len = 128;
@@ -77,7 +78,7 @@ const create_usage =
     \\  --allow-cidr CIDR       With --net, restrict public egress to this CIDR
     \\  --allow-host HOST       With --net, restrict public egress to DNS A answers for this host
     \\  --memory VALUE          Guest memory: auto, 512mb, 2gb, ... (default: auto = 16GiB)
-    \\  --vcpus N               Guest vCPU count; must be 1 today
+    \\  --vcpus N               Guest vCPU count (1-8; current backends accept 1)
     \\  --guest-port N          Guest vsock listen port (default: 10700)
     \\  --timeout-ms N          Exec timeout in milliseconds (default: 30000)
     \\  --console-log PATH      Write guest console output to PATH
@@ -195,7 +196,7 @@ pub const Spec = struct {
     image_ref: ?[]const u8 = null,
     resume_dir: ?[]const u8 = null,
     memory: memory_config.Config = .{},
-    vcpus: u32 = 1,
+    vcpus: topology.VcpuCount = 1,
     guest_port: u32 = 10700,
     timeout_ms: u64 = 30_000,
     console_log_path: ?[]const u8 = null,
@@ -354,7 +355,7 @@ pub const CreateNamedOptions = struct {
     image_pull_policy: run_mod.PullPolicy = .missing,
     network: NamedNetworkOptions = .{},
     memory: memory_config.Config = .{},
-    vcpus: u32 = 1,
+    vcpus: topology.VcpuCount = 1,
     guest_port: u32 = 10700,
     timeout_ms: u64 = 30_000,
     console_log_path: ?[]const u8 = null,
@@ -466,6 +467,7 @@ fn createNamedWithTiming(
 ) !NamedLifecycleResult {
     if (options.rootfs_path != null and options.image_ref != null) return error.InvalidRootfsInput;
     if (!monitorBackendSupported(options.backend.name())) return error.HostUnsupported;
+    try topology.requireSingleVcpu(options.vcpus);
     try spore.validateAnnotations(options.annotations);
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -934,6 +936,10 @@ pub fn createCli(
         },
         error.NamedVmExists => {
             const message = allocLifecycleMessage(allocator, "spore create: VM already exists or has stale state: {s}", .{spec.name});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
+        },
+        error.UnsupportedVcpuCount => {
+            const message = "spore create: --vcpus currently supports 1";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
         },
         error.InvalidNetworkPolicy, error.InvalidRootfsInput => {
@@ -1831,7 +1837,7 @@ fn parseCreateArgs(
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
         } else if (std.mem.eql(u8, args[i], "--vcpus")) {
             const flag = args[i];
-            spec.vcpus = parseIntArgLifecycleCli(u32, allocator, stderr, mode, "create", takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, flag), flag);
+            spec.vcpus = parseVcpuCountLifecycleCli(allocator, stderr, mode, "create", takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, flag), flag);
         } else if (std.mem.eql(u8, args[i], "--guest-port")) {
             const flag = args[i];
             spec.guest_port = parseIntArgLifecycleCli(u32, allocator, stderr, mode, "create", takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, flag), flag);
@@ -2720,6 +2726,20 @@ fn parseIntArgLifecycleCli(
     };
 }
 
+fn parseVcpuCountLifecycleCli(
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+    command: []const u8,
+    raw: []const u8,
+    flag: []const u8,
+) topology.VcpuCount {
+    return topology.parseVcpuCount(raw) catch {
+        const message = allocLifecycleMessage(allocator, "{s} must be an integer from 1 to {d}", .{ flag, topology.max_vcpus });
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
+    };
+}
+
 pub fn monitorBackendSupported(raw: []const u8) bool {
     return (run_mod.Backend.parse(raw) orelse return false).supportedOnHost();
 }
@@ -3034,6 +3054,15 @@ test "exec parser accepts shell and exact commands" {
     try std.testing.expectEqual(@as(usize, 2), argv_opts.command.len);
     try std.testing.expectEqualStrings("/bin/cat", argv_opts.command[0]);
     try std.testing.expectEqualStrings("/tick", argv_opts.command[1]);
+}
+
+test "create parser accepts bounded vcpu count" {
+    const allocator = std.testing.allocator;
+    var stderr: Io.Writer.Allocating = .init(allocator);
+    defer stderr.deinit();
+
+    const opts = try parseCreateArgs(&.{ "bench-1", "--vcpus", "2" }, allocator, &stderr.writer, .human);
+    try std.testing.expectEqual(@as(topology.VcpuCount, 2), opts.spec.vcpus);
 }
 
 test "create parser accepts image pull policy" {

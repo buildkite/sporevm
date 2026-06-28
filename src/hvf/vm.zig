@@ -26,11 +26,13 @@ const virtio_mem = @import("../virtio/mem.zig");
 const vsock = @import("../virtio/vsock.zig");
 const platform_contract = @import("../platform.zig");
 const spore = @import("../spore.zig");
+const topology = @import("../topology.zig");
 const snapshot = @import("snapshot.zig");
 
 pub const Config = struct {
     kernel: []const u8,
     ram_size: u64 = 512 * 1024 * 1024,
+    vcpus: topology.VcpuCount = 1,
     virtio_mem_region_size: u64 = 0,
     cmdline: []const u8 = "console=hvc0",
     initrd: ?[]const u8 = null,
@@ -206,6 +208,7 @@ const ec_sysreg: u6 = 0x18;
 
 pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     const setup_start = monotonicMs();
+    try topology.requireSingleVcpu(config.vcpus);
     const hv_vm_create_start = setup_start;
     try hvf.check(hvf.hv_vm_create(null), "hv_vm_create");
     const hv_vm_create_ms = monotonicMs() - hv_vm_create_start;
@@ -352,7 +355,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         if (exec_probe_wake_thread) |thread| thread.join();
     }
 
-    try hvf.check(hvf.hv_vcpu_set_sys_reg(vcpu, .mpidr_el1, 0x8000_0000), "set mpidr"); // aff 0, RES1
+    try hvf.check(hvf.hv_vcpu_set_sys_reg(vcpu, .mpidr_el1, topology.mpidrForIndex(0)), "set mpidr");
     var vcpu_redist_base: hvf.Ipa = 0;
     try hvf.check(hvf.hv_gic_get_redistributor_base(vcpu, &vcpu_redist_base), "gic redist base for vcpu");
     var redist_stride: usize = 0;
@@ -410,18 +413,18 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         try raiseGenerationIrqIfPending(&gen_dev);
         if (restore_stats) |*stats| stats.state_ms = monotonicMs() - state_start;
     } else {
-        // Fresh boot: DTB + kernel. The DTB describes exactly one
-        // redistributor frame, where the framework actually put it.
+        // Fresh boot: DTB + kernel. Backend support is currently gated to one
+        // vCPU, but DTB construction consumes the shared topology contract.
         const boot_start = monotonicMs();
         const initrd_range = if (config.initrd) |initrd| try boot.planInitrd(ram_bytes.len, board.ram_base, config.kernel, initrd.len) else null;
         const dtb = try board.buildDtb(allocator, .{
             .ram_size = config.ram_size,
-            .cpu_count = 1,
+            .cpu_count = config.vcpus,
             .gic = .{
                 .distributor_base = dist_base,
                 .distributor_size = dist_size,
                 .redistributor_base = vcpu_redist_base,
-                .redistributor_size = redist_stride,
+                .redistributor_size = try board.redistributorRegionSize(@intCast(redist_stride), config.vcpus),
             },
             .virtio_count = @intCast(transports.len),
             .bootargs = config.cmdline,

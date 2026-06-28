@@ -26,11 +26,13 @@ const rng = @import("../virtio/rng.zig");
 const virtio_mem = @import("../virtio/mem.zig");
 const platform = @import("../platform.zig");
 const spore = @import("../spore.zig");
+const topology = @import("../topology.zig");
 const vsock = @import("../virtio/vsock.zig");
 
 pub const Config = struct {
     kernel: []const u8,
     ram_size: u64 = 512 * 1024 * 1024,
+    vcpus: topology.VcpuCount = 1,
     virtio_mem_region_size: u64 = 0,
     cmdline: []const u8 = "console=hvc0",
     initrd: ?[]const u8 = null,
@@ -201,6 +203,8 @@ const SpinLock = struct {
 };
 
 pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
+    try topology.requireSingleVcpu(config.vcpus);
+
     var resume_parsed: ?std.json.Parsed(spore.Manifest) = null;
     defer if (resume_parsed) |*parsed| parsed.deinit();
     var lazy_pager: ?lazy_ram.Pager = null;
@@ -353,12 +357,12 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         const initrd_range = if (config.initrd) |initrd| try boot.planInitrd(ram_bytes.len, board.ram_base, config.kernel, initrd.len) else null;
         const dtb = try board.buildDtb(allocator, .{
             .ram_size = config.ram_size,
-            .cpu_count = 1,
+            .cpu_count = config.vcpus,
             .gic = .{
                 .distributor_base = gic_dist_base,
                 .distributor_size = gic_dist_size,
                 .redistributor_base = gic_redist_base,
-                .redistributor_size = gic_redist_size,
+                .redistributor_size = try board.redistributorRegionSize(gic_redist_size, config.vcpus),
             },
             .virtio_count = @intCast(transports.len),
             .bootargs = config.cmdline,

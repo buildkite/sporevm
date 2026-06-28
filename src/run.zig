@@ -24,6 +24,7 @@ const runtime_disk_mod = @import("runtime_disk.zig");
 const run_assets = @import("run_assets");
 const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
+const topology = @import("topology.zig");
 const virtio_net = @import("virtio/net.zig");
 const vsock = @import("virtio/vsock.zig");
 
@@ -130,7 +131,7 @@ pub const Options = struct {
     guest_env: []const []const u8 = &.{},
     guest_working_dir: ?[]const u8 = null,
     memory: memory_config.Config = .{},
-    vcpus: u32 = 1,
+    vcpus: topology.VcpuCount = 1,
     guest_port: u32 = 10700,
     timeout_ms: u64 = 30_000,
     console_log_path: ?[]const u8 = null,
@@ -189,7 +190,7 @@ pub const Result = struct {
     exec_response_ms: u64,
     probe_duration_ms: u64,
     exit_code: i32,
-    vcpus: u32,
+    vcpus: topology.VcpuCount,
     memory_bytes: u64,
     captured: bool = false,
     capture_path: ?[]const u8 = null,
@@ -239,7 +240,7 @@ pub const ExitEvent = struct {
     command: []const u8,
     backend: Backend,
     exit_code: i32,
-    vcpus: u32,
+    vcpus: topology.VcpuCount,
     memory_bytes: u64,
     captured: bool = false,
     capture_path: ?[]const u8 = null,
@@ -542,7 +543,7 @@ pub const EventWriter = struct {
             command: []const u8,
             backend: []const u8,
             exit_code: i32,
-            vcpus: u32,
+            vcpus: topology.VcpuCount,
             memory_bytes: u64,
             captured: bool,
             capture_path: ?[]const u8,
@@ -680,7 +681,7 @@ pub const SharedOptions = struct {
     initrd_path: ?[]const u8 = null,
     memory: memory_config.Config = .{},
     memory_set: bool = false,
-    vcpus: u32 = 1,
+    vcpus: topology.VcpuCount = 1,
     guest_port: u32 = 10700,
     timeout_ms: u64 = 30_000,
     console_log_path: ?[]const u8 = null,
@@ -768,7 +769,7 @@ pub const cli_usage =
     \\  --continue-after-capture
     \\                          Keep running after a signal-triggered capture
     \\  --memory VALUE          Guest memory: auto, 512mb, 2gb, ... (default: auto = 16GiB)
-    \\  --vcpus N               Guest vCPU count; must be 1 today
+    \\  --vcpus N               Guest vCPU count (1-8; current backends accept 1)
     \\  --guest-port N          Guest vsock listen port (default: 10700)
     \\  --timeout-ms N          Probe timeout in milliseconds (default: 30000)
     \\  --console-log PATH      Write guest console output to PATH
@@ -1835,7 +1836,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     errdefer |err| events.emitFailure(err) catch {};
 
     const setup_start = monotonicMs();
-    if (opts.vcpus != 1) return error.UnsupportedVcpuCount;
+    try topology.validateVcpuCount(opts.vcpus);
     try spore.validateAnnotations(opts.annotations);
 
     const backend = try opts.backend.resolveForHost();
@@ -1924,6 +1925,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
             break :blk hvf.vm.run(allocator, .{
                 .kernel = kernel,
                 .ram_size = memory_plan.boot_ram_size,
+                .vcpus = opts.vcpus,
                 .virtio_mem_region_size = memory_plan.virtio_mem_region_size,
                 .cmdline = boot_args,
                 .initrd = initrd,
@@ -1951,6 +1953,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
             break :blk kvm.vm.run(allocator, .{
                 .kernel = kernel,
                 .ram_size = memory_plan.boot_ram_size,
+                .vcpus = opts.vcpus,
                 .virtio_mem_region_size = memory_plan.virtio_mem_region_size,
                 .cmdline = boot_args,
                 .initrd = initrd,
@@ -2049,7 +2052,7 @@ fn runMemoryPlan(memory: memory_config.Config, constraints: RunMemoryConstraints
 }
 
 pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Options, control: vsock.Control) !MonitorResult {
-    if (opts.vcpus != 1) return error.UnsupportedVcpuCount;
+    try topology.validateVcpuCount(opts.vcpus);
     try spore.validateAnnotations(opts.annotations);
 
     const backend = try opts.backend.resolveForHost();
@@ -2084,6 +2087,7 @@ pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Opti
             break :blk try hvf.vm.run(allocator, .{
                 .kernel = kernel,
                 .ram_size = opts.memory.bytes,
+                .vcpus = opts.vcpus,
                 .cmdline = boot_args,
                 .initrd = initrd,
                 .console_sink = consoleSink,
@@ -2104,6 +2108,7 @@ pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Opti
             break :blk try kvm.vm.run(allocator, .{
                 .kernel = kernel,
                 .ram_size = opts.memory.bytes,
+                .vcpus = opts.vcpus,
                 .cmdline = boot_args,
                 .initrd = initrd,
                 .console_sink = consoleSink,
@@ -2428,6 +2433,13 @@ fn parsePositive(comptime T: type, name: []const u8, raw: []const u8) !T {
     return parsed;
 }
 
+pub fn parseVcpuCountOrExit(name: []const u8, raw: []const u8) topology.VcpuCount {
+    return topology.parseVcpuCount(raw) catch {
+        std.debug.print("{s} must be an integer from 1 to {d}\n", .{ name, topology.max_vcpus });
+        std.process.exit(2);
+    };
+}
+
 fn parseGuestPort(name: []const u8, raw: []const u8) !u32 {
     const parsed = std.fmt.parseInt(u32, raw, 10) catch {
         std.debug.print("{s} must be an integer from 1 to {d}\n", .{ name, max_guest_port });
@@ -2469,7 +2481,7 @@ fn parseSharedOption(shared: *SharedOptions, args: []const []const u8, i: *usize
     } else if (std.mem.eql(u8, name, "--memory-mib")) {
         memory_config.rejectMemoryMiBFlag("spore run");
     } else if (std.mem.eql(u8, name, "--vcpus")) {
-        shared.vcpus = try parsePositive(u32, name, takeValue(args, i, name));
+        shared.vcpus = parseVcpuCountOrExit(name, takeValue(args, i, name));
     } else if (std.mem.eql(u8, name, "--guest-port")) {
         shared.guest_port = try parseGuestPort(name, takeValue(args, i, name));
     } else if (std.mem.eql(u8, name, "--timeout-ms")) {
@@ -3102,6 +3114,11 @@ test "run cli parser accepts capture flags" {
     try std.testing.expect(opts.continue_after_capture);
     try std.testing.expectEqual(@as(usize, 1), opts.command.len);
     try std.testing.expectEqualStrings("/bin/sleeper", opts.command[0]);
+}
+
+test "run cli parser accepts bounded vcpu count" {
+    const opts = try parseCliArgs(&.{ "--vcpus", "2", "--", "/bin/true" });
+    try std.testing.expectEqual(@as(topology.VcpuCount, 2), opts.shared.vcpus);
 }
 
 test "run cli parser accepts jsonl events" {
