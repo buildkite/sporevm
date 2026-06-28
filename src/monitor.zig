@@ -18,7 +18,6 @@ const max_control_response = 128 * 1024;
 const max_exec_output = 16 * 1024;
 const max_suspend_path = 4096;
 const stats_write_interval_ms = 250;
-const default_backend = "auto";
 
 const monitor_usage =
     \\Usage:
