@@ -225,8 +225,12 @@ best-effort scans.
   set, which avoids the 16GiB full-RAM scan while preserving coherent
   run-bridge/vsock state for forked children.
 - `spore ls` now includes lifecycle-spec memory policy and configured bytes in
-  human and JSON output. Resident, backing, chunk, and dirty counters remain
-  explicitly unknown until they have cheap runtime metadata or monitor sources.
+  human and JSON output. It derives chunk size and total chunks from the
+  configured memory contract, and reports local `ram.backing` logical and
+  allocated bytes with metadata-only file stats when the lifecycle spec points
+  at a local spore directory. Resident memory, nonzero chunks, and dirty
+  counters remain explicitly unknown until they have cheap runtime metadata or
+  monitor sources.
 
 ## Delivery Strategy
 
@@ -285,12 +289,13 @@ Progress:
   `memory.bytes` from each VM's `spec.json` and emits nullable stat fields
   instead of trying to derive them by walking RAM.
 - The human `spore ls` table now renders populated nullable stats when a cheap
-  runtime source supplies them. Resident, backing, chunk, and dirty collection
-  sources are still pending.
+  runtime or filesystem metadata source supplies them. Resident, nonzero chunk,
+  and dirty collection sources are still pending.
 - Lifecycle list entries now derive `chunk_size` and `chunks_total` from the
-  configured memory contract. Resident bytes, sparse backing allocation,
-  nonzero chunks, and pending dirty chunks still need monitor or platform
-  sources.
+  configured memory contract, and derive sparse backing logical/allocated bytes
+  from no-follow `ram.backing` file stats when a local resume directory is
+  known. Resident bytes, nonzero chunks, and pending dirty chunks still need
+  monitor or platform sources.
 
 ### Slice 4: Measurement Gate for Raising Defaults Further
 

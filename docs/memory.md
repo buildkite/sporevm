@@ -60,8 +60,10 @@ and that tail must stay visible in benchmark and runtime stats.
 
 ## Current Limits
 
-- `spore ls` reports lifecycle memory policy and configured bytes. Resident,
-  sparse backing, chunk, and dirty counters are still nullable until cheap
+- `spore ls` reports lifecycle memory policy, configured bytes, chunk size and
+  total chunks, and local `ram.backing` logical/allocated bytes when a listed VM
+  points at a local spore directory with a backing file. Resident memory,
+  nonzero chunks, and dirty counters are still nullable until cheap
   monitor/runtime sources exist.
 - Resume from chunks is portable; local backing is same-host acceleration only.
 - Linux fs-verity could strengthen backing-file integrity later, but it should
