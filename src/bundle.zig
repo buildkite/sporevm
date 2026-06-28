@@ -1046,7 +1046,7 @@ fn updateHashWithRootfsIndexPayloads(
         defer parsed_index.deinit();
         for (parsed_index.value.chunks) |chunk_entry| {
             const rel_path = try rootfsStorageObjectRelPath(allocator, chunk_entry.digest);
-            if (!try markBundleFileSeen(allocator, &seen_objects, rel_path)) continue;
+            if (!try markBundleFileSeen(&seen_objects, rel_path)) continue;
             try updateHashWithFile(allocator, h, bundle_dir, rel_path);
         }
     }
@@ -1852,7 +1852,7 @@ fn updateHashWithDiskFilesForManifest(
     const disk = manifest.disk orelse return;
     for (disk.layers) |layer_ref| {
         const layer_rel = try diskLayerRelPath(allocator, layer_ref);
-        if (try markBundleFileSeen(allocator, seen, layer_rel)) {
+        if (try markBundleFileSeen(seen, layer_rel)) {
             try updateHashWithFile(allocator, h, bundle_dir, layer_rel);
         }
 
@@ -1861,7 +1861,7 @@ fn updateHashWithDiskFilesForManifest(
         if (parsed_layer.value.disk_size != disk.size) return error.BadManifest;
         for (parsed_layer.value.extents) |extent| {
             const object_rel = try diskObjectRelPath(allocator, extent.digest);
-            if (try markBundleFileSeen(allocator, seen, object_rel)) {
+            if (try markBundleFileSeen(seen, object_rel)) {
                 try updateHashWithFile(allocator, h, bundle_dir, object_rel);
             }
         }
@@ -2165,14 +2165,12 @@ fn appendBundleFileIfMissing(
 }
 
 fn markBundleFileSeen(
-    allocator: std.mem.Allocator,
     seen: *std.StringHashMap(void),
     rel_path: []const u8,
 ) Error!bool {
     try validateBundleRelPath(rel_path);
     if (seen.contains(rel_path)) return false;
-    const copy = allocator.dupe(u8, rel_path) catch return error.OutOfMemory;
-    seen.put(copy, {}) catch return error.OutOfMemory;
+    seen.put(rel_path, {}) catch return error.OutOfMemory;
     return true;
 }
 
@@ -2386,7 +2384,7 @@ fn downloadS3RootfsIndexPayloadFiles(
     var seen = std.StringHashMap(void).init(allocator);
     defer seen.deinit();
     for (index.storages) |storage_entry| {
-        if (try markBundleFileSeen(allocator, &seen, storage_entry.index_path)) {
+        if (try markBundleFileSeen(&seen, storage_entry.index_path)) {
             bytes += try downloadS3BundleFile(allocator, options, location, bundle_dir, storage_entry.index_path);
         }
         const storage = rootfsStorageEntryDescriptor(storage_entry);
@@ -2394,7 +2392,7 @@ fn downloadS3RootfsIndexPayloadFiles(
         defer parsed_index.deinit();
         for (parsed_index.value.chunks) |chunk_entry| {
             const object_rel = try rootfsStorageObjectRelPath(allocator, chunk_entry.digest);
-            if (try markBundleFileSeen(allocator, &seen, object_rel)) {
+            if (try markBundleFileSeen(&seen, object_rel)) {
                 bytes += try downloadS3BundleFile(allocator, options, location, bundle_dir, object_rel);
             }
         }
@@ -2419,7 +2417,7 @@ fn downloadHttpRootfsIndexPayloadFiles(
     var seen = std.StringHashMap(void).init(allocator);
     defer seen.deinit();
     for (index.storages) |storage_entry| {
-        if (try markBundleFileSeen(allocator, &seen, storage_entry.index_path)) {
+        if (try markBundleFileSeen(&seen, storage_entry.index_path)) {
             bytes += try downloadHttpBundleFile(allocator, options, client, location, bundle_dir, storage_entry.index_path);
         }
         const storage = rootfsStorageEntryDescriptor(storage_entry);
@@ -2427,7 +2425,7 @@ fn downloadHttpRootfsIndexPayloadFiles(
         defer parsed_index.deinit();
         for (parsed_index.value.chunks) |chunk_entry| {
             const object_rel = try rootfsStorageObjectRelPath(allocator, chunk_entry.digest);
-            if (try markBundleFileSeen(allocator, &seen, object_rel)) {
+            if (try markBundleFileSeen(&seen, object_rel)) {
                 bytes += try downloadHttpBundleFile(allocator, options, client, location, bundle_dir, object_rel);
             }
         }
@@ -2452,7 +2450,7 @@ fn downloadS3DiskFilesForManifestPath(
     var bytes: u64 = 0;
     for (disk.layers) |layer_ref| {
         const layer_rel = try diskLayerRelPath(allocator, layer_ref);
-        if (try markBundleFileSeen(allocator, seen, layer_rel)) {
+        if (try markBundleFileSeen(seen, layer_rel)) {
             bytes += try downloadS3BundleFile(allocator, options, location, bundle_dir, layer_rel);
         }
         const parsed_layer = disk_layer.loadLayer(allocator, bundle_dir, layer_ref) catch |err| return diskLayerError(err);
@@ -2460,7 +2458,7 @@ fn downloadS3DiskFilesForManifestPath(
         if (parsed_layer.value.disk_size != disk.size) return error.BadManifest;
         for (parsed_layer.value.extents) |extent| {
             const object_rel = try diskObjectRelPath(allocator, extent.digest);
-            if (try markBundleFileSeen(allocator, seen, object_rel)) {
+            if (try markBundleFileSeen(seen, object_rel)) {
                 bytes += try downloadS3BundleFile(allocator, options, location, bundle_dir, object_rel);
             }
         }
@@ -2486,7 +2484,7 @@ fn downloadHttpDiskFilesForManifestPath(
     var bytes: u64 = 0;
     for (disk.layers) |layer_ref| {
         const layer_rel = try diskLayerRelPath(allocator, layer_ref);
-        if (try markBundleFileSeen(allocator, seen, layer_rel)) {
+        if (try markBundleFileSeen(seen, layer_rel)) {
             bytes += try downloadHttpBundleFile(allocator, options, client, location, bundle_dir, layer_rel);
         }
         const parsed_layer = disk_layer.loadLayer(allocator, bundle_dir, layer_ref) catch |err| return diskLayerError(err);
@@ -2494,7 +2492,7 @@ fn downloadHttpDiskFilesForManifestPath(
         if (parsed_layer.value.disk_size != disk.size) return error.BadManifest;
         for (parsed_layer.value.extents) |extent| {
             const object_rel = try diskObjectRelPath(allocator, extent.digest);
-            if (try markBundleFileSeen(allocator, seen, object_rel)) {
+            if (try markBundleFileSeen(seen, object_rel)) {
                 bytes += try downloadHttpBundleFile(allocator, options, client, location, bundle_dir, object_rel);
             }
         }
