@@ -10,6 +10,7 @@ import json
 import math
 import os
 from pathlib import Path
+import shlex
 import shutil
 import statistics
 import subprocess
@@ -67,7 +68,10 @@ def parse_csv_ints(value: str) -> tuple[int, ...]:
 
 
 def parse_shell_words(value: str) -> list[str]:
-    words = [word for word in value.split(" ") if word]
+    try:
+        words = shlex.split(value)
+    except ValueError as err:
+        die(f"--command parse failed: {err}")
     if not words:
         die("--command must contain at least one argv element")
     return words

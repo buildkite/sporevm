@@ -11,6 +11,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import statistics
 import subprocess
@@ -137,9 +138,10 @@ def infer_backend() -> str:
 
 
 def parse_shell_words(value: str) -> list[str]:
-    # Keep command parsing intentionally small: the default and documented
-    # examples are whitespace-delimited argv, not shell programs.
-    words = [word for word in value.split(" ") if word]
+    try:
+        words = shlex.split(value)
+    except ValueError as err:
+        die(f"--command parse failed: {err}")
     if not words:
         die("--command must contain at least one argv element")
     return words
