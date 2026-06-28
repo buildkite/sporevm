@@ -78,17 +78,21 @@ pub const Device = struct {
     }
 
     pub fn capture(self: *const Device, allocator: std.mem.Allocator) Error!State {
-        var end = self.params.len;
-        while (end > 0 and self.params[end - 1] == 0) : (end -= 1) {}
-
+        const payload = self.paramsPayload();
         const enc = std.base64.standard.Encoder;
-        const out = allocator.alloc(u8, enc.calcSize(end)) catch return error.OutOfMemory;
-        _ = enc.encode(out, self.params[0..end]);
+        const out = allocator.alloc(u8, enc.calcSize(payload.len)) catch return error.OutOfMemory;
+        _ = enc.encode(out, payload);
         return .{
             .generation = self.generation,
             .interrupt_status = self.interrupt_status,
             .params_b64 = out,
         };
+    }
+
+    pub fn paramsPayload(self: *const Device) []const u8 {
+        var end = self.params.len;
+        while (end > 0 and self.params[end - 1] == 0) : (end -= 1) {}
+        return self.params[0..end];
     }
 
     pub fn restore(self: *Device, allocator: std.mem.Allocator, state: State) Error!void {
@@ -120,6 +124,47 @@ pub const Device = struct {
 
 fn intByte(comptime T: type, value: T, byte_index: u64) u8 {
     return @truncate(value >> @intCast(8 * byte_index));
+}
+
+pub fn validateFanoutParams(allocator: std.mem.Allocator, params: []const u8) !void {
+    if (params.len == 0 or params.len > params_size) return error.BadGenerationPayload;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, params, .{}) catch return error.BadGenerationPayload;
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.BadGenerationPayload,
+    };
+
+    _ = try requiredJsonString(object, "run_id");
+    _ = try requiredJsonU64(object, "child_id");
+    const parallel_index = try requiredJsonU64(object, "parallel_index");
+    const parallel_count = try requiredJsonU64(object, "parallel_count");
+    const fork_index = try requiredJsonU64(object, "fork_index");
+    const fork_count = try requiredJsonU64(object, "fork_count");
+    _ = try requiredJsonString(object, "fork_batch_id");
+    _ = try requiredJsonString(object, "vm_id");
+
+    if (parallel_count == 0 or fork_count == 0) return error.BadGenerationPayload;
+    if (parallel_index >= parallel_count or fork_index >= fork_count) return error.BadGenerationPayload;
+}
+
+fn requiredJsonU64(object: std.json.ObjectMap, field: []const u8) !u64 {
+    const value = object.get(field) orelse return error.BadGenerationPayload;
+    return switch (value) {
+        .integer => |integer| if (integer >= 0) @intCast(integer) else error.BadGenerationPayload,
+        .number_string => |string| std.fmt.parseInt(u64, string, 10) catch return error.BadGenerationPayload,
+        else => error.BadGenerationPayload,
+    };
+}
+
+fn requiredJsonString(object: std.json.ObjectMap, field: []const u8) ![]const u8 {
+    const value = object.get(field) orelse return error.BadGenerationPayload;
+    const string = switch (value) {
+        .string => |string| string,
+        else => return error.BadGenerationPayload,
+    };
+    if (string.len == 0) return error.BadGenerationPayload;
+    return string;
 }
 
 test "identity registers and empty defaults" {
@@ -164,7 +209,7 @@ test "state capture trims params and restore fails closed" {
     var restored = Device{};
     try restored.restore(allocator, state);
     try std.testing.expectEqual(@as(u64, 9), restored.generation);
-    try std.testing.expectEqualSlices(u8, "params", restored.params[0..6]);
+    try std.testing.expectEqualSlices(u8, "params", restored.paramsPayload());
 
     try std.testing.expectError(error.BadState, restored.restore(allocator, .{
         .generation = 0,
@@ -184,6 +229,21 @@ test "state capture trims params and restore fails closed" {
         .interrupt_status = 0,
         .params_b64 = oversized_b64,
     }));
+}
+
+test "fanout params require shard identity fields" {
+    const allocator = std.testing.allocator;
+    const params =
+        \\{"run_id":"rails-rspec-1","child_id":7,"parallel_index":7,"parallel_count":1000,"fork_index":7,"fork_count":1000,"fork_batch_id":"batch-1","vm_id":"spore-child-7"}
+    ;
+    try validateFanoutParams(allocator, params);
+
+    try std.testing.expectError(error.BadGenerationPayload, validateFanoutParams(allocator,
+        \\{"run_id":"rails-rspec-1","parallel_index":0,"parallel_count":1}
+    ));
+    try std.testing.expectError(error.BadGenerationPayload, validateFanoutParams(allocator,
+        \\{"run_id":"rails-rspec-1","child_id":1,"parallel_index":2,"parallel_count":2,"fork_index":0,"fork_count":1,"fork_batch_id":"batch-1","vm_id":"spore-child-1"}
+    ));
 }
 
 fn fuzzMmio(_: void, s: *std.testing.Smith) !void {
