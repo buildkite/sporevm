@@ -148,23 +148,27 @@ const HotplugMapping = struct {
     }
 
     fn deinit(self: *HotplugMapping) void {
-        if (self.mapped_bytes != 0) {
-            var region = kvm.UserspaceMemoryRegion{
-                .slot = 1,
-                .flags = 0,
-                .guest_phys_addr = self.guest_addr,
-                .memory_size = 0,
-                .userspace_addr = 0,
-            };
-            _ = kvm.ioctl(self.vm_fd, kvm.KVM_SET_USER_MEMORY_REGION, @intFromPtr(&region), "KVM_SET_USER_MEMORY_REGION") catch |err|
-                std.log.warn("failed to unmap virtio-mem hotplug region: {}", .{err});
-        }
+        self.unmapFromGuest() catch |err| std.log.warn("failed to unmap virtio-mem hotplug region: {}", .{err});
         std.posix.munmap(self.bytes);
+    }
+
+    fn unmapFromGuest(self: *HotplugMapping) !void {
+        if (self.mapped_bytes == 0) return;
+        var region = kvm.UserspaceMemoryRegion{
+            .slot = 1,
+            .flags = 0,
+            .guest_phys_addr = self.guest_addr,
+            .memory_size = 0,
+            .userspace_addr = 0,
+        };
+        _ = try kvm.ioctl(self.vm_fd, kvm.KVM_SET_USER_MEMORY_REGION, @intFromPtr(&region), "KVM_SET_USER_MEMORY_REGION");
+        self.mapped_bytes = 0;
     }
 
     fn mapForGuest(self: *HotplugMapping, bytes: u64) !void {
         if (bytes > self.bytes.len) return error.InvalidVirtioMemRequest;
         if (bytes <= self.mapped_bytes) return;
+        try self.unmapFromGuest();
         var region = kvm.UserspaceMemoryRegion{
             .slot = 1,
             .flags = 0,
