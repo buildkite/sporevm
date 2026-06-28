@@ -28,8 +28,6 @@ const platform = @import("../platform.zig");
 const spore = @import("../spore.zig");
 const vsock = @import("../virtio/vsock.zig");
 
-const hotplug_request_chunk: u64 = 1024 * 1024 * 1024;
-
 pub const Config = struct {
     kernel: []const u8,
     ram_size: u64 = 512 * 1024 * 1024,
@@ -457,10 +455,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                 if (new_pressure_events > 0 and probe.state == .connected) {
                     const idx = mem_transport_index.?;
                     const mapping = if (hotplug_mapping) |*m| m else unreachable;
-                    var i: u32 = 0;
-                    while (i < new_pressure_events and requested_hotplug_size < mapping.bytes.len) : (i += 1) {
-                        requested_hotplug_size = @min(mapping.bytes.len, requested_hotplug_size + hotplug_request_chunk);
-                    }
+                    requested_hotplug_size = virtio_mem.requestedSizeAfterPressure(requested_hotplug_size, @intCast(mapping.bytes.len), new_pressure_events);
                     handled_memory_pressure_count = probe.memory_pressure_count;
                     try mem_dev.setRequestedSize(@intCast(requested_hotplug_size));
                     _ = transports_buf[idx].raiseConfigChange();

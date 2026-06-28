@@ -12,6 +12,7 @@ pub const device_id: u32 = 24;
 pub const default_block_size: u64 = 2 * 1024 * 1024;
 const request_queue = 0;
 const max_blocks = 8192;
+const pressure_growth_chunk: u64 = 1024 * 1024 * 1024;
 
 const req_plug: u16 = 0;
 const req_unplug: u16 = 1;
@@ -35,6 +36,18 @@ pub const Config = struct {
     plug_context: ?*anyopaque = null,
     plugFn: ?*const fn (*anyopaque, u64) bool = null,
 };
+
+pub fn requestedSizeAfterPressure(current: u64, capacity: u64, events: u32) u64 {
+    var requested = @min(current, capacity);
+    var i: u32 = 0;
+    while (i < events and requested < capacity) : (i += 1) {
+        requested = if (capacity - requested <= pressure_growth_chunk)
+            capacity
+        else
+            requested + pressure_growth_chunk;
+    }
+    return requested;
+}
 
 pub const Mem = struct {
     block_size: u64,
@@ -258,6 +271,13 @@ test "request header may span readable descriptors" {
 
     try std.testing.expectEqual(@as(u32, 10), mem.handleRequest(&chain));
     try std.testing.expectEqual(resp_ack, std.mem.readInt(u16, resp[0..2], .little));
+}
+
+test "pressure events grow requested size in bounded chunks" {
+    try std.testing.expectEqual(@as(u64, 0), requestedSizeAfterPressure(0, 0, 3));
+    try std.testing.expectEqual(pressure_growth_chunk, requestedSizeAfterPressure(0, pressure_growth_chunk * 4, 1));
+    try std.testing.expectEqual(pressure_growth_chunk * 3, requestedSizeAfterPressure(pressure_growth_chunk, pressure_growth_chunk * 4, 2));
+    try std.testing.expectEqual(pressure_growth_chunk * 4, requestedSizeAfterPressure(pressure_growth_chunk * 3, pressure_growth_chunk * 4, 3));
 }
 
 test "plug callback receives requested size" {
