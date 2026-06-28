@@ -1,7 +1,6 @@
 //! Shared machine-output contracts for the `spore` CLI and future bindings.
 
 const std = @import("std");
-const contracts = @import("contracts.zig");
 const Io = std.Io;
 
 pub const error_schema = "spore.error.v1";
@@ -13,15 +12,6 @@ pub const Mode = enum {
     human,
     json,
 };
-
-pub const DigestRef = contracts.DigestRef;
-pub const CacheState = contracts.CacheState;
-pub const ChunkMaterializationSummary = contracts.ChunkMaterializationSummary;
-pub const RootfsMaterializationSummary = contracts.RootfsMaterializationSummary;
-
-pub fn digestRef(hex: []const u8) DigestRef {
-    return contracts.digestRef(hex);
-}
 
 pub const Scope = enum {
     usage,
