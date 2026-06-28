@@ -2157,8 +2157,10 @@ fn appendBundleFileIfMissing(
     seen: *std.StringHashMap(void),
     rel_path: []const u8,
 ) Error!void {
-    if (!try markBundleFileSeen(allocator, seen, rel_path)) return;
+    try validateBundleRelPath(rel_path);
+    if (seen.contains(rel_path)) return;
     const copy = allocator.dupe(u8, rel_path) catch return error.OutOfMemory;
+    seen.put(copy, {}) catch return error.OutOfMemory;
     files.append(copy) catch return error.OutOfMemory;
 }
 
