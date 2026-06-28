@@ -1,10 +1,10 @@
 //! HVF virtual machine: board assembly and vCPU run loop.
 //!
-//! Single-vCPU bring-up scope: boots the pinned kernel with the SporeVM
-//! board (GICv3 via hv_gic, virtio-mmio console/blk/net/vsock/rng, generation
-//! MMIO), handles MMIO data aborts, PSCI over HVC, vtimer exits, WFI, and HVF
-//! snapshot/resume.
-//! Multi-vCPU and the rest of the device set land in later slices.
+//! Boots the pinned kernel with the SporeVM board (GICv3 via hv_gic,
+//! virtio-mmio console/blk/net/vsock/rng, generation MMIO), handles MMIO data
+//! aborts, PSCI over HVC, vtimer exits, WFI, and HVF snapshot/resume.
+//! Fresh multi-vCPU runs use a reduced path; capture/resume remains
+//! single-vCPU until the manifest format records per-vCPU state.
 
 const std = @import("std");
 const capture = @import("../capture.zig");
@@ -202,13 +202,18 @@ const psci_system_off: u32 = 0x8400_0008;
 const psci_system_reset: u32 = 0x8400_0009;
 const psci_features: u32 = 0x8400_000a;
 const psci_ret_not_supported: u64 = @bitCast(@as(i64, -1));
+const psci_ret_invalid_params: u64 = @bitCast(@as(i64, -2));
+const psci_ret_already_on: u64 = @bitCast(@as(i64, -4));
 
 const ec_wfx: u6 = 0x01;
 const ec_sysreg: u6 = 0x18;
 
 pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     const setup_start = monotonicMs();
-    try topology.requireSingleVcpu(config.vcpus);
+    try topology.validateVcpuCount(config.vcpus);
+    if (config.vcpus != 1 and (config.resume_dir != null or hasFreshCaptureTrigger(config) or config.exec_control != null or config.dirty_tracking.enabled or config.virtio_mem_region_size != 0 or config.exec_probe_initial_rx_delay_ms != 0)) {
+        return error.UnsupportedVcpuCount;
+    }
     const hv_vm_create_start = setup_start;
     try hvf.check(hvf.hv_vm_create(null), "hv_vm_create");
     const hv_vm_create_ms = monotonicMs() - hv_vm_create_start;
@@ -332,6 +337,30 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     const transports = transports_buf[0..transport_count];
     const devices_ms = monotonicMs() - devices_start;
 
+    if (config.vcpus != 1) {
+        return runFreshMultiVcpu(allocator, .{
+            .config = &config,
+            .transports = transports,
+            .transports_buf = &transports_buf,
+            .gen_dev = &gen_dev,
+            .ram = ram,
+            .net_dev = &net_dev,
+            .vsock_dev = &vsock_dev,
+            .net_transport_index = net_transport_index,
+            .vsock_transport_index = vsock_transport_index,
+            .dist_base = dist_base,
+            .dist_size = dist_size,
+            .redist_region_base = redist_base,
+            .redist_region_size = redist_size,
+            .setup_start = setup_start,
+            .hv_vm_create_ms = hv_vm_create_ms,
+            .gic_ms = gic_ms,
+            .map_ram_ms = map_ram_ms,
+            .hv_map_ram_ms = hv_map_ram_ms,
+            .devices_ms = devices_ms,
+        });
+    }
+
     // vCPU. Created before the DTB because the framework assigns the
     // redistributor frame from the vCPU's MPIDR affinity.
     const vcpu_start = monotonicMs();
@@ -360,6 +389,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     try hvf.check(hvf.hv_gic_get_redistributor_base(vcpu, &vcpu_redist_base), "gic redist base for vcpu");
     var redist_stride: usize = 0;
     try hvf.check(hvf.hv_gic_get_redistributor_size(&redist_stride), "gic redist stride");
+
     std.log.debug(
         "gic: dist=0x{x}+0x{x} redist(vcpu0)=0x{x}+0x{x} (region 0x{x}+0x{x})",
         .{ dist_base, dist_size, vcpu_redist_base, redist_stride, redist_base, redist_size },
@@ -679,7 +709,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
                             .dist_size = dist_size,
                             .redist_base = vcpu_redist_base,
                             .redist_size = redist_stride,
-                        });
+                        }, null);
                     },
                     hvf.ec_hvc => {
                         if (try handlePsci(vcpu)) |cause| return cause;
@@ -753,6 +783,671 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             },
         }
     }
+}
+
+const hvf_vcpu_state_off: u8 = 0;
+const hvf_vcpu_state_running: u8 = 1;
+
+const HvfVcpuStartCommand = struct {
+    entry: u64,
+    arg0: u64,
+};
+
+const HvfVcpuGicReadCommand = struct {
+    region: gic.Region,
+    offset: u64,
+    size_log2: u2,
+};
+
+const HvfVcpuGicWriteCommand = struct {
+    region: gic.Region,
+    offset: u64,
+    value: u64,
+};
+
+const HvfVcpuCommand = union(enum) {
+    start: HvfVcpuStartCommand,
+    gic_read: HvfVcpuGicReadCommand,
+    gic_write: HvfVcpuGicWriteCommand,
+};
+
+const HvfVcpuCommandResult = union(enum) {
+    ok,
+    value: u64,
+    err: anyerror,
+};
+
+const HvfVcpuCommandSlot = struct {
+    const State = enum { idle, pending, running, complete };
+
+    lock: SpinLock = .{},
+    state: State = .idle,
+    command: HvfVcpuCommand = undefined,
+    result: HvfVcpuCommandResult = .ok,
+
+    fn submit(self: *HvfVcpuCommandSlot, target: *HvfVcpu, command: HvfVcpuCommand) !?u64 {
+        while (true) {
+            if (!target.ready.load(.acquire)) return error.VcpuCanceled;
+            self.lock.lock();
+            if (self.state == .idle) {
+                self.command = command;
+                self.result = .ok;
+                self.state = .pending;
+                self.lock.unlock();
+                target.wake();
+                break;
+            }
+            self.lock.unlock();
+            sleepMs(1);
+        }
+
+        while (true) {
+            if (!target.ready.load(.acquire)) return error.VcpuCanceled;
+            self.lock.lock();
+            if (self.state == .complete) {
+                const result = self.result;
+                self.state = .idle;
+                self.lock.unlock();
+                return switch (result) {
+                    .ok => null,
+                    .value => |value| value,
+                    .err => |err| err,
+                };
+            }
+            self.lock.unlock();
+            sleepMs(1);
+        }
+    }
+
+    fn take(self: *HvfVcpuCommandSlot) ?HvfVcpuCommand {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (self.state != .pending) return null;
+        self.state = .running;
+        return self.command;
+    }
+
+    fn finish(self: *HvfVcpuCommandSlot, result: HvfVcpuCommandResult) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.result = result;
+        self.state = .complete;
+    }
+};
+
+const HvfVcpu = struct {
+    index: topology.VcpuIndex = 0,
+    handle: hvf.VcpuHandle = 0,
+    exit: *hvf.VcpuExit = undefined,
+    redist_base: u64 = 0,
+    created: bool = false,
+    ready: std.atomic.Value(bool) = .init(false),
+    creation_error: ?anyerror = null,
+    thread: ?std.Thread = null,
+    run_state: std.atomic.Value(u8) = .init(hvf_vcpu_state_off),
+    command_slot: HvfVcpuCommandSlot = .{},
+
+    fn initEmpty(self: *HvfVcpu, index: topology.VcpuIndex) void {
+        self.* = .{ .index = index };
+    }
+
+    fn createOnOwnerThread(self: *HvfVcpu) !void {
+        try hvf.check(hvf.hv_vcpu_create(&self.handle, &self.exit, null), "hv_vcpu_create");
+        self.created = true;
+        try hvf.check(hvf.hv_vcpu_set_sys_reg(self.handle, .mpidr_el1, topology.mpidrForIndex(self.index)), "set mpidr");
+        try hvf.check(hvf.hv_gic_get_redistributor_base(self.handle, &self.redist_base), "gic redist base for vcpu");
+    }
+
+    fn destroyOnOwnerThread(self: *HvfVcpu) void {
+        if (self.created) {
+            _ = hvf.hv_vcpu_destroy(self.handle);
+            self.created = false;
+        }
+        self.ready.store(false, .release);
+    }
+
+    fn setRunning(self: *HvfVcpu) void {
+        self.run_state.store(hvf_vcpu_state_running, .release);
+    }
+
+    fn park(self: *HvfVcpu) void {
+        self.run_state.store(hvf_vcpu_state_off, .release);
+    }
+
+    fn isRunning(self: *const HvfVcpu) bool {
+        return self.run_state.load(.acquire) == hvf_vcpu_state_running;
+    }
+
+    fn startAt(self: *HvfVcpu, entry: u64, context_id: u64) !void {
+        try hvf.check(hvf.hv_vcpu_set_reg(self.handle, .cpsr, 0x3c5), "psci set cpsr");
+        try hvf.check(hvf.hv_vcpu_set_reg(self.handle, .pc, entry), "psci set pc");
+        try hvf.check(hvf.hv_vcpu_set_reg(self.handle, .x0, context_id), "psci set x0");
+        self.setRunning();
+    }
+
+    fn submit(self: *HvfVcpu, command: HvfVcpuCommand) !?u64 {
+        return self.command_slot.submit(self, command);
+    }
+
+    fn wake(self: *const HvfVcpu) void {
+        if (!self.ready.load(.acquire)) return;
+        var handles = [_]hvf.VcpuHandle{self.handle};
+        _ = hvf.hv_vcpus_exit(&handles, handles.len);
+    }
+};
+
+fn validateContiguousRedistributors(vcpus: []const HvfVcpu, stride: u64) !void {
+    if (vcpus.len == 0 or stride == 0) return error.UnsupportedVcpuCount;
+    const base = vcpus[0].redist_base;
+    for (vcpus, 0..) |vcpu_entry, index| {
+        const offset = std.math.mul(u64, stride, @intCast(index)) catch return error.UnsupportedVcpuCount;
+        const expected = std.math.add(u64, base, offset) catch return error.UnsupportedVcpuCount;
+        if (vcpu_entry.redist_base != expected) {
+            std.log.err(
+                "unsupported HVF GIC redistributor layout: vcpu={d} got=0x{x} expected=0x{x} stride=0x{x}",
+                .{ index, vcpu_entry.redist_base, expected, stride },
+            );
+            return error.UnsupportedVcpuCount;
+        }
+    }
+}
+
+const HvfVcpuWakeSet = struct {
+    vcpus: []const HvfVcpu,
+
+    fn wakeAll(self: *HvfVcpuWakeSet) void {
+        var handles: [topology.max_vcpus]hvf.VcpuHandle = undefined;
+        var count: usize = 0;
+        for (self.vcpus) |vcpu_entry| {
+            if (!vcpu_entry.ready.load(.acquire)) continue;
+            handles[count] = vcpu_entry.handle;
+            count += 1;
+        }
+        if (count != 0) _ = hvf.hv_vcpus_exit(handles[0..count].ptr, @intCast(count));
+    }
+};
+
+const MultiHvfResult = union(enum) {
+    exit: ExitCause,
+    err: anyerror,
+};
+
+const MultiHvfRunState = struct {
+    mutex: SpinLock = .{},
+    stop: std.atomic.Value(bool) = .init(false),
+    result_value: ?MultiHvfResult = null,
+
+    fn stopped(self: *MultiHvfRunState) bool {
+        return self.stop.load(.acquire);
+    }
+
+    fn finish(self: *MultiHvfRunState, new_result: MultiHvfResult) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.result_value == null) self.result_value = new_result;
+        self.stop.store(true, .release);
+    }
+
+    fn result(self: *MultiHvfRunState) ?MultiHvfResult {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.result_value;
+    }
+};
+
+const MultiHvfRunOptions = struct {
+    config: *const Config,
+    transports: []mmio.Transport,
+    transports_buf: *[6]mmio.Transport,
+    gen_dev: *generation.Device,
+    ram: guestmem.GuestRam,
+    net_dev: *net.Net,
+    vsock_dev: *vsock.Vsock,
+    net_transport_index: usize,
+    vsock_transport_index: usize,
+    dist_base: u64,
+    dist_size: u64,
+    redist_region_base: u64,
+    redist_region_size: u64,
+    setup_start: u64,
+    hv_vm_create_ms: u64,
+    gic_ms: u64,
+    map_ram_ms: u64,
+    hv_map_ram_ms: u64,
+    devices_ms: u64,
+};
+
+const MultiHvfThreadContext = struct {
+    vcpu: *HvfVcpu,
+    vcpus: []HvfVcpu,
+    wake_set: *HvfVcpuWakeSet,
+    state: *MultiHvfRunState,
+    device_lock: *SpinLock,
+    network: net.Runtime,
+    transports: []mmio.Transport,
+    gen_dev: *generation.Device,
+    ram: guestmem.GuestRam,
+    net_dev: *net.Net,
+    net_transport_index: usize,
+    gic_windows: GicWindows,
+};
+
+fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) !ExitCause {
+    const vcpu_count: usize = @intCast(options.config.vcpus);
+    var vcpus = try allocator.alloc(HvfVcpu, vcpu_count);
+    defer allocator.free(vcpus);
+    for (vcpus, 0..) |*vcpu, index| vcpu.initEmpty(@intCast(index));
+
+    var state = MultiHvfRunState{};
+    var device_lock = SpinLock{};
+    var exec_probe_done = false;
+    var wake_set = HvfVcpuWakeSet{ .vcpus = vcpus };
+    options.config.network.setWake(.{ .context = &wake_set, .wakeFn = wakeNetworkVcpuSet });
+    defer options.config.network.clearWake();
+
+    const contexts = try allocator.alloc(MultiHvfThreadContext, vcpus.len);
+    defer allocator.free(contexts);
+    defer joinHvfVcpuThreads(vcpus, &wake_set);
+    errdefer {
+        state.finish(.{ .err = error.HvfThreadStartFailed });
+        wake_set.wakeAll();
+    }
+
+    for (vcpus, contexts) |*vcpu_entry, *ctx| {
+        ctx.* = .{
+            .vcpu = vcpu_entry,
+            .vcpus = vcpus,
+            .wake_set = &wake_set,
+            .state = &state,
+            .device_lock = &device_lock,
+            .network = options.config.network,
+            .transports = options.transports,
+            .gen_dev = options.gen_dev,
+            .ram = options.ram,
+            .net_dev = options.net_dev,
+            .net_transport_index = options.net_transport_index,
+            .gic_windows = .{
+                .dist_base = options.dist_base,
+                .dist_size = options.dist_size,
+                .redist_base = 0,
+                .redist_size = 0,
+            },
+        };
+        vcpu_entry.thread = try std.Thread.spawn(.{}, hvfVcpuThreadMain, .{ctx});
+    }
+
+    try waitHvfVcpusReady(vcpus, &state);
+
+    const vcpu_start = monotonicMs();
+    var redist_stride: usize = 0;
+    try hvf.check(hvf.hv_gic_get_redistributor_size(&redist_stride), "gic redist stride");
+    try validateContiguousRedistributors(vcpus, @intCast(redist_stride));
+    const redist_region_size = try board.redistributorRegionSize(@intCast(redist_stride), options.config.vcpus);
+    if (redist_region_size > options.redist_region_size) return error.UnsupportedVcpuCount;
+    const vcpu_ms = monotonicMs() - vcpu_start;
+    const gic_windows = GicWindows{
+        .dist_base = options.dist_base,
+        .dist_size = options.dist_size,
+        .redist_base = vcpus[0].redist_base,
+        .redist_size = redist_region_size,
+        .redist_stride = @intCast(redist_stride),
+        .redist_vcpus = vcpus,
+    };
+    for (contexts) |*ctx| ctx.gic_windows = gic_windows;
+    std.log.debug(
+        "gic: dist=0x{x}+0x{x} redist(vcpu0)=0x{x}+0x{x} count={d} (region 0x{x}+0x{x})",
+        .{ options.dist_base, options.dist_size, vcpus[0].redist_base, redist_stride, vcpus.len, options.redist_region_base, options.redist_region_size },
+    );
+
+    const boot_start = monotonicMs();
+    const initrd_range = if (options.config.initrd) |initrd| try boot.planInitrd(options.ram.bytes.len, board.ram_base, options.config.kernel, initrd.len) else null;
+    const dtb = try board.buildDtb(allocator, .{
+        .ram_size = options.config.ram_size,
+        .cpu_count = options.config.vcpus,
+        .gic = .{
+            .distributor_base = options.dist_base,
+            .distributor_size = options.dist_size,
+            .redistributor_base = vcpus[0].redist_base,
+            .redistributor_size = redist_region_size,
+        },
+        .virtio_count = @intCast(options.transports.len),
+        .bootargs = options.config.cmdline,
+        .initrd = if (initrd_range) |r| .{ .start = r.start, .end = r.end } else null,
+    });
+    defer allocator.free(dtb);
+    const layout = try boot.load(options.ram.bytes, board.ram_base, options.config.kernel, options.config.initrd, dtb);
+    _ = try vcpus[0].submit(.{ .start = .{ .entry = layout.entry, .arg0 = layout.dtb } });
+    const boot_ms = monotonicMs() - boot_start;
+
+    var attach_probe_ms: u64 = 0;
+    if (options.config.exec_probe) |probe| {
+        const attach_probe_start = monotonicMs();
+        try options.vsock_dev.attachHostStream(probe);
+        probe.markStarted();
+        try flushVsockRx(options.vsock_dev, &options.transports_buf[options.vsock_transport_index], options.ram, @intCast(options.vsock_transport_index));
+        attach_probe_ms = monotonicMs() - attach_probe_start;
+    }
+    const start_ms = monotonicMs();
+    std.log.debug(
+        "hvf cold setup timing: total_ms={d} hv_vm_create_ms={d} gic_ms={d} mmap_ram_ms={d} hv_map_ram_ms={d} devices_ms={d} vcpu_ms={d} boot_ms={d} attach_probe_ms={d} ram_mib={d}",
+        .{
+            start_ms - options.setup_start,
+            options.hv_vm_create_ms,
+            options.gic_ms,
+            options.map_ram_ms,
+            options.hv_map_ram_ms,
+            options.devices_ms,
+            vcpu_ms,
+            boot_ms,
+            attach_probe_ms,
+            options.config.ram_size / 1024 / 1024,
+        },
+    );
+
+    while (true) {
+        if (state.result()) |result| {
+            wake_set.wakeAll();
+            return finishMultiHvfResult(result);
+        }
+        if (options.config.network.failed()) {
+            state.finish(.{ .err = error.NetworkGatewayFailed });
+            continue;
+        }
+        if (options.config.exec_probe) |probe| {
+            if (!exec_probe_done) {
+                if (probe.state == .failed) {
+                    if (options.config.exec_probe_failure_fatal) {
+                        state.finish(.{ .err = error.VsockProbeFailed });
+                        continue;
+                    }
+                    exec_probe_done = true;
+                }
+                if (probe.state == .complete) {
+                    std.log.debug("hvf multi-vcpu probe completion timing: observed_ms={d}", .{probe.elapsedMs()});
+                    if (options.config.exec_probe_completes_run) {
+                        state.finish(.{ .exit = .probe_complete });
+                        continue;
+                    }
+                    exec_probe_done = true;
+                }
+                if (!exec_probe_done and probe.elapsedMs() > options.config.exec_probe_timeout_ms) {
+                    if (options.config.exec_probe_failure_fatal) {
+                        state.finish(.{ .err = error.VsockProbeTimedOut });
+                        continue;
+                    }
+                    exec_probe_done = true;
+                }
+            }
+        }
+        const elapsed_ms = monotonicMs() -| start_ms;
+        if (options.config.snapshot_after_ms) |after_ms| {
+            if (elapsed_ms >= after_ms) {
+                state.finish(.{ .err = error.UnsupportedVcpuCount });
+                continue;
+            }
+        }
+        sleepMs(1);
+    }
+}
+
+fn finishMultiHvfResult(result: MultiHvfResult) !ExitCause {
+    return switch (result) {
+        .exit => |cause| cause,
+        .err => |err| err,
+    };
+}
+
+fn waitHvfVcpusReady(vcpus: []HvfVcpu, state: *MultiHvfRunState) !void {
+    while (true) {
+        if (state.result()) |result| switch (result) {
+            .err => |err| return err,
+            .exit => return error.UnexpectedExit,
+        };
+        var ready_count: usize = 0;
+        for (vcpus) |*vcpu| {
+            if (!vcpu.ready.load(.acquire)) break;
+            if (vcpu.creation_error) |err| return err;
+            ready_count += 1;
+        }
+        if (ready_count == vcpus.len) return;
+        sleepMs(1);
+    }
+}
+
+fn joinHvfVcpuThreads(vcpus: []HvfVcpu, wake_set: *HvfVcpuWakeSet) void {
+    wake_set.wakeAll();
+    for (vcpus) |*vcpu_entry| {
+        if (vcpu_entry.thread) |thread| {
+            thread.join();
+            vcpu_entry.thread = null;
+        }
+    }
+}
+
+const MultiHvfPsciAction = union(enum) {
+    none,
+    exit: ExitCause,
+    park_current,
+};
+
+const MultiHvfPsciContext = struct {
+    current: *HvfVcpu,
+    vcpus: []HvfVcpu,
+    wake_set: *HvfVcpuWakeSet,
+};
+
+fn hvfVcpuThreadMain(ctx: *MultiHvfThreadContext) void {
+    ctx.vcpu.createOnOwnerThread() catch |err| {
+        ctx.vcpu.creation_error = err;
+        ctx.vcpu.ready.store(true, .release);
+        ctx.state.finish(.{ .err = err });
+        return;
+    };
+    ctx.vcpu.ready.store(true, .release);
+    defer ctx.vcpu.destroyOnOwnerThread();
+
+    while (!ctx.state.stopped()) {
+        if (ctx.vcpu.command_slot.take()) |command| {
+            processHvfVcpuCommand(ctx.vcpu, command);
+            continue;
+        }
+        if (!ctx.vcpu.isRunning()) {
+            sleepMs(1);
+            continue;
+        }
+        hvf.check(hvf.hv_vcpu_run(ctx.vcpu.handle), "hv_vcpu_run") catch |err| {
+            ctx.state.finish(.{ .err = err });
+            return;
+        };
+        if (ctx.state.stopped()) continue;
+
+        if (ctx.network.failed()) {
+            ctx.state.finish(.{ .err = error.NetworkGatewayFailed });
+            continue;
+        }
+        var flushed_network = false;
+        ctx.device_lock.lock();
+        if (ctx.network.consumeWake()) {
+            flushNetworkRxHvf(ctx.net_dev, &ctx.transports[ctx.net_transport_index], ctx.ram, null, ctx.net_transport_index) catch |err| {
+                ctx.device_lock.unlock();
+                ctx.state.finish(.{ .err = err });
+                return;
+            };
+            flushed_network = true;
+        }
+        ctx.device_lock.unlock();
+        if (flushed_network) continue;
+
+        switch (ctx.vcpu.exit.reason) {
+            .exception => {
+                const ec = ctx.vcpu.exit.exception.exceptionClass();
+                switch (ec) {
+                    hvf.ec_instruction_abort => {
+                        std.log.err(
+                            "unhandled instruction abort on vcpu {d}: syndrome=0x{x} va=0x{x} ipa=0x{x}",
+                            .{ ctx.vcpu.index, ctx.vcpu.exit.exception.syndrome, ctx.vcpu.exit.exception.virtual_address, ctx.vcpu.exit.exception.physical_address },
+                        );
+                        ctx.state.finish(.{ .err = error.UnhandledGuestException });
+                    },
+                    hvf.ec_data_abort => {
+                        ctx.device_lock.lock();
+                        handleMmio(ctx.vcpu.handle, ctx.vcpu.exit, ctx.transports, ctx.gen_dev, ctx.ram, null, ctx.gic_windows, ctx.vcpu) catch |err| {
+                            ctx.device_lock.unlock();
+                            ctx.state.finish(.{ .err = err });
+                            return;
+                        };
+                        ctx.device_lock.unlock();
+                    },
+                    hvf.ec_hvc => {
+                        var psci_context = MultiHvfPsciContext{
+                            .current = ctx.vcpu,
+                            .vcpus = ctx.vcpus,
+                            .wake_set = ctx.wake_set,
+                        };
+                        const action = handlePsciMulti(&psci_context) catch |err| {
+                            ctx.state.finish(.{ .err = err });
+                            return;
+                        };
+                        applyMultiHvfPsciAction(ctx, action);
+                    },
+                    hvf.ec_smc => {
+                        var psci_context = MultiHvfPsciContext{
+                            .current = ctx.vcpu,
+                            .vcpus = ctx.vcpus,
+                            .wake_set = ctx.wake_set,
+                        };
+                        const action = handlePsciMulti(&psci_context) catch |err| {
+                            ctx.state.finish(.{ .err = err });
+                            return;
+                        };
+                        advancePc(ctx.vcpu.handle) catch |err| {
+                            ctx.state.finish(.{ .err = err });
+                            return;
+                        };
+                        applyMultiHvfPsciAction(ctx, action);
+                    },
+                    ec_wfx => {
+                        advancePc(ctx.vcpu.handle) catch |err| {
+                            ctx.state.finish(.{ .err = err });
+                            return;
+                        };
+                        sleepMs(1);
+                    },
+                    ec_sysreg => {
+                        handleUnknownSysreg(ctx.vcpu.handle, ctx.vcpu.exit) catch |err| {
+                            ctx.state.finish(.{ .err = err });
+                            return;
+                        };
+                    },
+                    else => {
+                        std.log.err(
+                            "unhandled exception class 0x{x} on vcpu {d}: syndrome=0x{x} va=0x{x} ipa=0x{x}",
+                            .{ ec, ctx.vcpu.index, ctx.vcpu.exit.exception.syndrome, ctx.vcpu.exit.exception.virtual_address, ctx.vcpu.exit.exception.physical_address },
+                        );
+                        ctx.state.finish(.{ .err = error.UnhandledGuestException });
+                    },
+                }
+            },
+            .vtimer_activated => {
+                hvf.check(hvf.hv_vcpu_set_vtimer_mask(ctx.vcpu.handle, false), "vtimer unmask") catch |err| {
+                    ctx.state.finish(.{ .err = err });
+                    return;
+                };
+            },
+            .canceled => continue,
+            else => {
+                std.log.err("unhandled HVF exit reason {} on vcpu {d}", .{ ctx.vcpu.exit.reason, ctx.vcpu.index });
+                ctx.state.finish(.{ .err = error.UnhandledExit });
+            },
+        }
+    }
+}
+
+fn processHvfVcpuCommand(vcpu: *HvfVcpu, command: HvfVcpuCommand) void {
+    const result: HvfVcpuCommandResult = switch (command) {
+        .start => |start| blk: {
+            vcpu.startAt(start.entry, start.arg0) catch |err| break :blk .{ .err = err };
+            break :blk .ok;
+        },
+        .gic_read => |read| .{ .value = gic.mmioRead(read.region, vcpu.handle, read.offset, read.size_log2) },
+        .gic_write => |write| blk: {
+            gic.mmioWrite(write.region, vcpu.handle, write.offset, write.value);
+            break :blk .ok;
+        },
+    };
+    vcpu.command_slot.finish(result);
+}
+
+fn applyMultiHvfPsciAction(ctx: *MultiHvfThreadContext, action: MultiHvfPsciAction) void {
+    switch (action) {
+        .none => {},
+        .exit => |cause| ctx.state.finish(.{ .exit = cause }),
+        .park_current => {},
+    }
+}
+
+fn handlePsciMulti(ctx: *MultiHvfPsciContext) !MultiHvfPsciAction {
+    var x0: u64 = undefined;
+    try hvf.check(hvf.hv_vcpu_get_reg(ctx.current.handle, .x0, &x0), "psci get x0");
+    const fid: u32 = @truncate(x0);
+    const ret: u64 = switch (fid) {
+        psci_version => 0x0001_0001,
+        psci_migrate_info_type => 2,
+        psci_system_off => return .{ .exit = .guest_off },
+        psci_system_reset => return .{ .exit = .guest_reset },
+        psci_features => blk: {
+            var x1: u64 = undefined;
+            try hvf.check(hvf.hv_vcpu_get_reg(ctx.current.handle, .x1, &x1), "psci get x1");
+            const queried: u32 = @truncate(x1);
+            break :blk switch (queried) {
+                psci_version, psci_cpu_off, psci_cpu_on_32, psci_cpu_on_64, psci_system_off, psci_system_reset, psci_features => 0,
+                else => psci_ret_not_supported,
+            };
+        },
+        psci_cpu_off => {
+            ctx.current.park();
+            return .park_current;
+        },
+        psci_cpu_on_32, psci_cpu_on_64 => blk: {
+            var target_mpidr: u64 = undefined;
+            var entry: u64 = undefined;
+            var context_id: u64 = undefined;
+            try hvf.check(hvf.hv_vcpu_get_reg(ctx.current.handle, .x1, &target_mpidr), "psci get target");
+            try hvf.check(hvf.hv_vcpu_get_reg(ctx.current.handle, .x2, &entry), "psci get entry");
+            try hvf.check(hvf.hv_vcpu_get_reg(ctx.current.handle, .x3, &context_id), "psci get context");
+            break :blk try psciCpuOn(ctx, target_mpidr, entry, context_id);
+        },
+        else => psci_ret_not_supported,
+    };
+    try hvf.check(hvf.hv_vcpu_set_reg(ctx.current.handle, .x0, ret), "psci set x0");
+    return .none;
+}
+
+fn psciCpuOn(ctx: *MultiHvfPsciContext, target_mpidr: u64, entry: u64, context_id: u64) !u64 {
+    const target_index = psciTargetIndex(ctx.vcpus.len, target_mpidr) orelse return psci_ret_invalid_params;
+    const target = &ctx.vcpus[target_index];
+    if (target.isRunning()) return psci_ret_already_on;
+    _ = try target.submit(.{ .start = .{ .entry = entry, .arg0 = context_id } });
+    ctx.wake_set.wakeAll();
+    return 0;
+}
+
+fn psciTargetIndex(vcpu_count: usize, target_mpidr: u64) ?usize {
+    if (((target_mpidr >> 32) & 0xff) != 0) return null;
+    const affinity = target_mpidr & 0x00ff_ffff;
+    if (affinity >= vcpu_count) return null;
+    return @intCast(affinity);
+}
+
+fn handleUnknownSysreg(vcpu: hvf.VcpuHandle, exit: *hvf.VcpuExit) !void {
+    const iss: u32 = @truncate(exit.exception.syndrome & 0x1ff_ffff);
+    if (iss & 1 != 0) {
+        const rt: hvf.Reg = @enumFromInt(@as(u32, @truncate((iss >> 5) & 0x1f)));
+        if (@intFromEnum(rt) < 31) {
+            try hvf.check(hvf.hv_vcpu_set_reg(vcpu, rt, 0), "sysreg raz");
+        }
+    }
+    try advancePc(vcpu);
 }
 
 fn monotonicMs() u64 {
@@ -1322,6 +2017,11 @@ fn wakeNetworkVcpu(context: ?*anyopaque) void {
     _ = hvf.hv_vcpus_exit(@ptrCast(vcpu), 1);
 }
 
+fn wakeNetworkVcpuSet(context: ?*anyopaque) void {
+    const wake_set: *HvfVcpuWakeSet = @ptrCast(@alignCast(context orelse return));
+    wake_set.wakeAll();
+}
+
 fn flushNetworkRxHvf(
     net_dev: *net.Net,
     transport: *mmio.Transport,
@@ -1388,7 +2088,98 @@ const GicWindows = struct {
     dist_size: u64,
     redist_base: u64,
     redist_size: u64,
+    redist_stride: u64 = 0,
+    redist_vcpus: ?[]HvfVcpu = null,
 };
+
+const GicMmioTarget = struct {
+    region: gic.Region,
+    offset: u64,
+    vcpu: hvf.VcpuHandle,
+    owner: ?*HvfVcpu = null,
+};
+
+const RedistributorFrame = struct {
+    index: usize,
+    offset: u64,
+};
+
+fn redistributorFrame(offset: u64, stride: u64, count: usize) ?RedistributorFrame {
+    if (stride == 0) return null;
+    const index = offset / stride;
+    if (index >= count) return null;
+    return .{ .index = @intCast(index), .offset = offset % stride };
+}
+
+fn gicMmioTarget(current_vcpu: hvf.VcpuHandle, ipa: u64, windows: GicWindows) !?GicMmioTarget {
+    if (ipa >= windows.dist_base and ipa < windows.dist_base + windows.dist_size) {
+        return .{ .region = .distributor, .offset = ipa - windows.dist_base, .vcpu = current_vcpu };
+    }
+    if (ipa < windows.redist_base or ipa >= windows.redist_base + windows.redist_size) return null;
+
+    const offset = ipa - windows.redist_base;
+    if (windows.redist_vcpus) |vcpus| {
+        const frame = redistributorFrame(offset, windows.redist_stride, vcpus.len) orelse return error.UnhandledMmio;
+        return .{ .region = .redistributor, .offset = frame.offset, .vcpu = vcpus[frame.index].handle, .owner = &vcpus[frame.index] };
+    }
+    return .{ .region = .redistributor, .offset = offset, .vcpu = current_vcpu };
+}
+
+fn gicTargetOwnerForCommand(current_owner: ?*HvfVcpu, target: GicMmioTarget) ?*HvfVcpu {
+    if (target.region != .redistributor) return null;
+    const current = current_owner orelse return null;
+    const owner = target.owner orelse return null;
+    if (owner.index == current.index) return null;
+    return owner;
+}
+
+fn readGicMmioTarget(current_owner: ?*HvfVcpu, target: GicMmioTarget, size_log2: u2) !u64 {
+    if (gicTargetOwnerForCommand(current_owner, target)) |owner| {
+        return (try owner.submit(.{ .gic_read = .{ .region = target.region, .offset = target.offset, .size_log2 = size_log2 } })) orelse 0;
+    }
+    return gic.mmioRead(target.region, target.vcpu, target.offset, size_log2);
+}
+
+fn writeGicMmioTarget(current_owner: ?*HvfVcpu, target: GicMmioTarget, value: u64) !void {
+    if (gicTargetOwnerForCommand(current_owner, target)) |owner| {
+        _ = try owner.submit(.{ .gic_write = .{ .region = target.region, .offset = target.offset, .value = value } });
+        return;
+    }
+    gic.mmioWrite(target.region, target.vcpu, target.offset, value);
+}
+
+test "psci target index accepts normalized mpidr affinity" {
+    try std.testing.expectEqual(@as(?usize, 1), psciTargetIndex(2, 1));
+    try std.testing.expectEqual(@as(?usize, 1), psciTargetIndex(2, topology.mpidrForIndex(1)));
+    try std.testing.expectEqual(@as(?usize, null), psciTargetIndex(2, 2));
+    try std.testing.expectEqual(@as(?usize, null), psciTargetIndex(2, 1 << 32));
+}
+
+test "redistributor frame helper maps offsets by stride" {
+    const frame = redistributorFrame(0x2_0000 + 0xc, 0x2_0000, 2).?;
+    try std.testing.expectEqual(@as(usize, 1), frame.index);
+    try std.testing.expectEqual(@as(u64, 0xc), frame.offset);
+    try std.testing.expectEqual(@as(?RedistributorFrame, null), redistributorFrame(0x4_0000, 0x2_0000, 2));
+    try std.testing.expectEqual(@as(?RedistributorFrame, null), redistributorFrame(0, 0, 2));
+}
+
+test "gic target routes redistributor frame to matching hvf vcpu" {
+    var vcpus = [_]HvfVcpu{
+        .{ .handle = 11 },
+        .{ .handle = 22 },
+    };
+    const target = (try gicMmioTarget(11, 0x0802_0000 + 0x2_0000 + 0xc, .{
+        .dist_base = 0x0800_0000,
+        .dist_size = 0x1_0000,
+        .redist_base = 0x0802_0000,
+        .redist_size = 0x4_0000,
+        .redist_stride = 0x2_0000,
+        .redist_vcpus = vcpus[0..],
+    })).?;
+    try std.testing.expectEqual(gic.Region.redistributor, target.region);
+    try std.testing.expectEqual(@as(u64, 0xc), target.offset);
+    try std.testing.expectEqual(@as(hvf.VcpuHandle, 22), target.vcpu);
+}
 
 /// Decode a data-abort exit into an MMIO access and dispatch it to the
 /// GIC frames or virtio-mmio windows. ESR ISS layout per Arm ARM D17.2.37.
@@ -1400,6 +2191,7 @@ fn handleMmio(
     ram: guestmem.GuestRam,
     lazy_pager: ?*lazy_ram.Pager,
     gic_windows: GicWindows,
+    current_owner: ?*HvfVcpu,
 ) !void {
     const syndrome = exit.exception.syndrome;
     const isv = syndrome & (1 << 24) != 0;
@@ -1413,22 +2205,15 @@ fn handleMmio(
     const ipa = exit.exception.physical_address;
 
     // GIC distributor / redistributor frames.
-    const gic_region: ?struct { region: gic.Region, offset: u64 } = blk: {
-        if (ipa >= gic_windows.dist_base and ipa < gic_windows.dist_base + gic_windows.dist_size)
-            break :blk .{ .region = .distributor, .offset = ipa - gic_windows.dist_base };
-        if (ipa >= gic_windows.redist_base and ipa < gic_windows.redist_base + gic_windows.redist_size)
-            break :blk .{ .region = .redistributor, .offset = ipa - gic_windows.redist_base };
-        break :blk null;
-    };
-    if (gic_region) |g| {
+    if (try gicMmioTarget(vcpu, ipa, gic_windows)) |g| {
         if (is_write) {
             var value: u64 = 0;
             if (srt < 31) {
                 try hvf.check(hvf.hv_vcpu_get_reg(vcpu, @enumFromInt(@as(u32, srt)), &value), "gic read xt");
             }
-            gic.mmioWrite(g.region, vcpu, g.offset, value);
+            try writeGicMmioTarget(current_owner, g, value);
         } else if (srt < 31) {
-            const value = gic.mmioRead(g.region, vcpu, g.offset, sas);
+            const value = try readGicMmioTarget(current_owner, g, sas);
             const masked: u64 = switch (sas) {
                 0 => value & 0xff,
                 1 => value & 0xffff,

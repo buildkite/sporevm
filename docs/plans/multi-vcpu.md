@@ -253,13 +253,17 @@ limit.
   fresh non-capture, non-monitor multi-vCPU guests with one host thread per
   vCPU. KVM capture/resume/monitor paths and transient virtio-mem still fail
   closed for `vcpus != 1`.
-- HVF backend configs carry `vcpus`, feed it into DTB construction, and still
-  fail closed for counts other than 1 before VM creation.
+- HVF backend configs carry `vcpus`, feed it into DTB construction, and can run
+  fresh non-capture, non-monitor multi-vCPU guests with one owner thread per
+  vCPU. HVF capture/resume/monitor paths and transient virtio-mem still fail
+  closed for `vcpus != 1`.
 - Lifecycle metadata records `vcpus`; named create/monitor, named resume, and
   named fork reject unsupported multi-vCPU lifecycle state before guest boot.
 - `board.buildDtb` emits one CPU node per `cpu_count`, and DTB tests cover
   multi-node CPU topology plus redistributor region sizing.
-- HVF still creates exactly one vCPU.
+- HVF single-vCPU capture/resume still creates one main-thread-owned vCPU; the
+  fresh multi-vCPU path creates vCPUs on their owning host threads and uses
+  owner-thread commands for PSCI starts and cross-redistributor MMIO.
 - KVM snapshot code captures and restores one vCPU fd plus vCPU0 GIC attrs.
 - HVF snapshot code captures and restores one vCPU handle plus HVF-private GIC
   state.
@@ -313,12 +317,21 @@ handling. Keep capture disabled for `vcpus != 1` in this slice.
 
 Done when:
 
-- `spore run --backend hvf --vcpus 2 -- nproc` reports at least 2 on Apple
+- `spore run --backend hvf --vcpus 2 --image docker.io/library/alpine:3.20 --
+  /bin/sh -lc "grep -c '^processor' /proc/cpuinfo"` reports `2` on Apple
   Silicon;
 - secondary vCPUs start only through PSCI and shut down cleanly;
 - redistributor MMIO for every exposed CPU frame is routed to the matching HVF
-  vCPU handle;
-- `--capture` with `--vcpus 2` fails with the planned unsupported-capture error.
+  vCPU owner thread;
+- `--capture` with `--vcpus 2` fails with `UnsupportedVcpuCount`.
+
+Status: implemented for fresh HVF runs. Validation on Apple Silicon:
+`zig-out/bin/spore run --backend hvf --vcpus 2 -- /bin/true`,
+`zig-out/bin/spore run --backend hvf --vcpus 2 --image
+docker.io/library/alpine:3.20 -- /bin/sh -lc "grep -c '^processor'
+/proc/cpuinfo"` returned `2`, and `zig-out/bin/spore run --backend hvf
+--vcpus 2 --capture <dir>/base.spore -- /bin/true` failed before guest boot
+with `UnsupportedVcpuCount`.
 
 ### Slice 4: Manifest v1 Data Model and Validators
 

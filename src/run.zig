@@ -769,7 +769,7 @@ pub const cli_usage =
     \\  --continue-after-capture
     \\                          Keep running after a signal-triggered capture
     \\  --memory VALUE          Guest memory: auto, 512mb, 2gb, ... (default: auto = 16GiB)
-    \\  --vcpus N               Guest vCPU count (1-8; current backends accept 1)
+    \\  --vcpus N               Guest vCPU count (1-8; capture/resume currently require 1)
     \\  --guest-port N          Guest vsock listen port (default: 10700)
     \\  --timeout-ms N          Probe timeout in milliseconds (default: 30000)
     \\  --console-log PATH      Write guest console output to PATH
