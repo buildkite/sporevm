@@ -74,7 +74,7 @@ static int64_t t_request_decode = 0;
 static int64_t t_command_start = 0;
 static int64_t t_command_exit = 0;
 static int sigchld_pipe[2] = { -1, -1 };
-static const uint64_t memory_high_step_bytes = 268435456ULL;
+static const uint64_t memory_high_step_bytes = 1073741824ULL;
 static const char memory_high_limit[] = "268435456\n";
 
 static int path_is_dir(const char *path);
