@@ -33,7 +33,7 @@ pub const Config = struct {
     requested_size: u64,
     block_size: u64 = default_block_size,
     plug_context: ?*anyopaque = null,
-    plugFn: ?*const fn (*anyopaque) bool = null,
+    plugFn: ?*const fn (*anyopaque, u64) bool = null,
 };
 
 pub const Mem = struct {
@@ -45,7 +45,7 @@ pub const Mem = struct {
     plugged_size: u64 = 0,
     plugged: std.StaticBitSet(max_blocks) = .initEmpty(),
     plug_context: ?*anyopaque = null,
-    plugFn: ?*const fn (*anyopaque) bool = null,
+    plugFn: ?*const fn (*anyopaque, u64) bool = null,
 
     pub fn init(config: Config) Mem {
         std.debug.assert(config.block_size != 0);
@@ -144,7 +144,7 @@ pub const Mem = struct {
         }
         if (self.plugFn) |f| {
             const ctx = self.plug_context orelse return resp_busy;
-            if (!f(ctx)) return resp_busy;
+            if (!f(ctx, self.requested_size)) return resp_busy;
         }
         i = range.start;
         while (i < range.end) : (i += 1) self.plugged.set(i);
@@ -247,6 +247,37 @@ test "plug and state requests update plugged size" {
     try std.testing.expectEqual(@as(u32, 10), mem.handleRequest(&chain));
     try std.testing.expectEqual(resp_ack, std.mem.readInt(u16, resp[0..2], .little));
     try std.testing.expectEqual(state_mixed, std.mem.readInt(u16, resp[8..10], .little));
+}
+
+test "plug callback receives requested size" {
+    const Context = struct {
+        requested_size: u64 = 0,
+
+        fn plug(ctx: *anyopaque, requested_size: u64) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.requested_size = requested_size;
+            return true;
+        }
+    };
+
+    var context = Context{};
+    var mem = Mem.init(.{
+        .addr = 0x1000_0000,
+        .region_size = default_block_size * 4,
+        .requested_size = default_block_size * 3,
+        .plug_context = &context,
+        .plugFn = Context.plug,
+    });
+    var req: [24]u8 = @splat(0);
+    var resp: [10]u8 = @splat(0);
+
+    std.mem.writeInt(u16, req[0..2], req_plug, .little);
+    std.mem.writeInt(u64, req[8..16], 0x1000_0000, .little);
+    std.mem.writeInt(u16, req[16..18], 1, .little);
+    var chain = makeChain(&req, &resp);
+
+    try std.testing.expectEqual(@as(u32, 10), mem.handleRequest(&chain));
+    try std.testing.expectEqual(default_block_size * 3, context.requested_size);
 }
 
 fn fuzzMemQueue(_: void, s: *std.testing.Smith) !void {

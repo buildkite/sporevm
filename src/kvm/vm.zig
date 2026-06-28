@@ -28,7 +28,7 @@ const platform = @import("../platform.zig");
 const spore = @import("../spore.zig");
 const vsock = @import("../virtio/vsock.zig");
 
-const hotplug_request_chunk: u64 = 2 * 1024 * 1024 * 1024;
+const hotplug_request_chunk: u64 = 1024 * 1024 * 1024;
 
 pub const Config = struct {
     kernel: []const u8,
@@ -137,7 +137,7 @@ const HotplugMapping = struct {
     bytes: []align(std.heap.page_size_min) u8,
     guest_addr: u64,
     vm_fd: std.c.fd_t,
-    mapped: bool = false,
+    mapped_bytes: u64 = 0,
 
     fn init(size: u64, guest_addr: u64, vm_fd: std.c.fd_t) !HotplugMapping {
         return .{
@@ -148,7 +148,7 @@ const HotplugMapping = struct {
     }
 
     fn deinit(self: *HotplugMapping) void {
-        if (self.mapped) {
+        if (self.mapped_bytes != 0) {
             var region = kvm.UserspaceMemoryRegion{
                 .slot = 1,
                 .flags = 0,
@@ -162,23 +162,24 @@ const HotplugMapping = struct {
         std.posix.munmap(self.bytes);
     }
 
-    fn mapForGuest(self: *HotplugMapping) !void {
-        if (self.mapped) return;
+    fn mapForGuest(self: *HotplugMapping, bytes: u64) !void {
+        if (bytes > self.bytes.len) return error.InvalidVirtioMemRequest;
+        if (bytes <= self.mapped_bytes) return;
         var region = kvm.UserspaceMemoryRegion{
             .slot = 1,
             .flags = 0,
             .guest_phys_addr = self.guest_addr,
-            .memory_size = self.bytes.len,
+            .memory_size = bytes,
             .userspace_addr = @intFromPtr(self.bytes.ptr),
         };
         _ = try kvm.ioctl(self.vm_fd, kvm.KVM_SET_USER_MEMORY_REGION, @intFromPtr(&region), "KVM_SET_USER_MEMORY_REGION");
-        self.mapped = true;
-        std.log.debug("virtio-mem mapped hotplug region: addr=0x{x} bytes={d}", .{ self.guest_addr, self.bytes.len });
+        self.mapped_bytes = bytes;
+        std.log.debug("virtio-mem mapped hotplug region: addr=0x{x} bytes={d}", .{ self.guest_addr, bytes });
     }
 
-    fn plug(ctx: *anyopaque) bool {
+    fn plug(ctx: *anyopaque, requested_size: u64) bool {
         const self: *HotplugMapping = @ptrCast(@alignCast(ctx));
-        self.mapForGuest() catch return false;
+        self.mapForGuest(requested_size) catch return false;
         return true;
     }
 };

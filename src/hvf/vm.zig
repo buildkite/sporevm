@@ -28,7 +28,7 @@ const platform_contract = @import("../platform.zig");
 const spore = @import("../spore.zig");
 const snapshot = @import("snapshot.zig");
 
-const hotplug_request_chunk: u64 = 2 * 1024 * 1024 * 1024;
+const hotplug_request_chunk: u64 = 1024 * 1024 * 1024;
 
 pub const Config = struct {
     kernel: []const u8,
@@ -144,7 +144,7 @@ const RamMapping = struct {
 const HotplugMapping = struct {
     bytes: []align(std.heap.page_size_min) u8,
     guest_addr: u64,
-    mapped: bool = false,
+    mapped_bytes: u64 = 0,
 
     fn init(size: u64, guest_addr: u64) !HotplugMapping {
         return .{
@@ -154,23 +154,26 @@ const HotplugMapping = struct {
     }
 
     fn deinit(self: *HotplugMapping) void {
-        if (self.mapped) _ = hvf.hv_vm_unmap(self.guest_addr, self.bytes.len);
+        if (self.mapped_bytes != 0) _ = hvf.hv_vm_unmap(self.guest_addr, self.mapped_bytes);
         std.posix.munmap(self.bytes);
     }
 
-    fn mapForGuest(self: *HotplugMapping) !void {
-        if (self.mapped) return;
+    fn mapForGuest(self: *HotplugMapping, bytes: u64) !void {
+        if (bytes > self.bytes.len) return error.InvalidVirtioMemRequest;
+        if (bytes <= self.mapped_bytes) return;
+        const offset: usize = @intCast(self.mapped_bytes);
+        const len: usize = @intCast(bytes - self.mapped_bytes);
         try hvf.check(
-            hvf.hv_vm_map(self.bytes.ptr, self.guest_addr, self.bytes.len, hvf.MemoryFlags.rwx),
+            hvf.hv_vm_map(self.bytes[offset..][0..len].ptr, self.guest_addr + self.mapped_bytes, len, hvf.MemoryFlags.rwx),
             "hv_vm_map virtio-mem",
         );
-        self.mapped = true;
-        std.log.debug("virtio-mem mapped hotplug region: addr=0x{x} bytes={d}", .{ self.guest_addr, self.bytes.len });
+        self.mapped_bytes = bytes;
+        std.log.debug("virtio-mem mapped hotplug region: addr=0x{x} bytes={d}", .{ self.guest_addr, bytes });
     }
 
-    fn plug(ctx: *anyopaque) bool {
+    fn plug(ctx: *anyopaque, requested_size: u64) bool {
         const self: *HotplugMapping = @ptrCast(@alignCast(ctx));
-        self.mapForGuest() catch return false;
+        self.mapForGuest(requested_size) catch return false;
         return true;
     }
 };
