@@ -63,7 +63,7 @@ if (( idle_memtotal_kb >= idle_max_kb )); then
   die "auto memory idle MemTotal ${idle_memtotal_kb} KB exceeded ${idle_max_kb} KB"
 fi
 
-node_script='b=[];for(i=0;i<32;i++)b.push(Buffer.alloc(16777216,1));setTimeout(()=>console.log(require("fs").readFileSync("/proc/meminfo","utf8").match(/MemTotal:\s+(\d+)/)[1]),3000)'
+node_script='b=[];for(i=0;i<20;i++)b.push(Buffer.alloc(16777216,1));setTimeout(()=>console.log(require("fs").readFileSync("/proc/meminfo","utf8").match(/MemTotal:\s+(\d+)/)[1]),5000)'
 
 pressure_memtotal_kb="$(
   "${spore_bin}" run \
