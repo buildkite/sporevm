@@ -35,9 +35,8 @@ showing configured memory next to resident memory, sparse backing allocation,
 chunk counts, and pending dirty work.
 
 The product memory contract, sparse fresh-boot seeding, caught-up suspend path,
-and first grow-only virtio-mem prototype have landed. The remaining
-automatic-memory work is observability and evidence: cheap resident/process
-accounting, nonzero and dirty chunk counters, and real-host measurements that
+first grow-only virtio-mem prototype, and `spore ls` accounting have landed.
+The remaining automatic-memory work is evidence: real-host measurements that
 prove the 16GiB default stays sparse in normal product flows.
 
 ## Problem
@@ -291,6 +290,8 @@ Done when:
 
 ### Slice 3: `spore ls` Human and JSON Memory Stats
 
+Status: landed.
+
 Extend monitor/runtime metadata with cheap memory accounting and teach
 `spore ls` to render a table by default plus full JSON under global `--json`.
 
@@ -421,7 +422,6 @@ Done when:
 
 ## Open Questions
 
-No blocking questions for the landed slices. Remaining work needs
-platform-specific choices for exact resident-memory accounting, especially on
-macOS, but unknown values can be represented explicitly until a cheap source is
-proven.
+No blocking questions for the landed slices. Remaining work is measurement
+evidence; unsupported or missing accounting sources already render explicitly as
+unknown.
