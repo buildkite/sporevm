@@ -93,7 +93,8 @@ spawned. `mise run smoke:monitor-jail` covers the denied-operation path.
 ## Limits
 
 - No stdin streaming, TTY, or interactive terminal.
-- No multi-vCPU lifecycle support until the run path supports it.
+- No multi-vCPU named lifecycle support yet; one-shot run support is
+  backend-dependent.
 - No disk-backed or networked named live fork yet.
 - No live network-flow checkpointing.
 - No OCI `Entrypoint`, `Cmd`, or `User` semantics. Callers pass explicit argv.

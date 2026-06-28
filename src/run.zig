@@ -769,7 +769,7 @@ pub const cli_usage =
     \\  --continue-after-capture
     \\                          Keep running after a signal-triggered capture
     \\  --memory VALUE          Guest memory: auto, 512mb, 2gb, ... (default: auto = 16GiB)
-    \\  --vcpus N               Guest vCPU count (1-8; capture/resume currently require 1)
+    \\  --vcpus N               Guest vCPU count (1-8; capture/resume backend-dependent)
     \\  --guest-port N          Guest vsock listen port (default: 10700)
     \\  --timeout-ms N          Probe timeout in milliseconds (default: 30000)
     \\  --console-log PATH      Write guest console output to PATH
@@ -976,16 +976,32 @@ pub fn manifestNetworkFromOptions(allocator: std.mem.Allocator, network: Network
 }
 
 pub fn resumeRootfsForRun(allocator: std.mem.Allocator, manifest: spore.Manifest) !?spore.Rootfs {
-    const disk_count = spore.countBlockDevices(manifest.devices);
+    return resumeRootfsForRunParts(allocator, manifest.devices, manifest.rootfs);
+}
+
+pub fn resumeRootfsForRunV1(allocator: std.mem.Allocator, manifest: spore.ManifestV1) !?spore.Rootfs {
+    return resumeRootfsForRunParts(allocator, manifest.devices, manifest.rootfs);
+}
+
+fn resumeRootfsForRunParts(allocator: std.mem.Allocator, devices: []const spore.TransportState, rootfs_opt: ?spore.Rootfs) !?spore.Rootfs {
+    const disk_count = spore.countBlockDevices(devices);
     if (disk_count == 0) return null;
     if (disk_count != 1) return error.UnsupportedRootfsDeviceCount;
-    const rootfs = manifest.rootfs orelse return error.MissingRootfsArtifact;
-    try spore.validateRootfs(rootfs, manifest.devices);
+    const rootfs = rootfs_opt orelse return error.MissingRootfsArtifact;
+    try spore.validateRootfs(rootfs, devices);
     return try cloneRootfs(allocator, rootfs);
 }
 
 pub fn resumeDiskForRun(allocator: std.mem.Allocator, manifest: spore.Manifest) !?spore.Disk {
-    if (manifest.disk) |disk| {
+    return resumeDiskForRunParts(allocator, manifest.disk);
+}
+
+pub fn resumeDiskForRunV1(allocator: std.mem.Allocator, manifest: spore.ManifestV1) !?spore.Disk {
+    return resumeDiskForRunParts(allocator, manifest.disk);
+}
+
+fn resumeDiskForRunParts(allocator: std.mem.Allocator, disk_opt: ?spore.Disk) !?spore.Disk {
+    if (disk_opt) |disk| {
         return try disk_layer.cloneDisk(allocator, disk);
     }
     return null;
@@ -2140,9 +2156,19 @@ fn openRunLocalMemoryBacking(
     ram_size: u64,
 ) !spore.LocalBackingPlan {
     const dir = resume_dir orelse return .{};
-    const parsed = try spore.loadManifest(allocator, dir);
-    defer parsed.deinit();
-    const local_backing = try spore.openProvenLocalMemoryBacking(allocator, environ, dir, parsed.value.memory, ram_size);
+    var parsed = spore.loadManifest(allocator, dir) catch |err| switch (err) {
+        error.BadManifest => null,
+        else => |e| return e,
+    };
+    if (parsed) |*manifest| {
+        defer manifest.deinit();
+        const local_backing = try spore.openProvenLocalMemoryBacking(allocator, environ, dir, manifest.value.memory, ram_size);
+        std.log.info("run --from memory restore source={s} reason={s}", .{ @tagName(local_backing.source), @tagName(local_backing.reason) });
+        return local_backing;
+    }
+    var manifest = try spore.loadManifestV1(allocator, dir);
+    defer manifest.deinit();
+    const local_backing = try spore.openProvenLocalMemoryBacking(allocator, environ, dir, manifest.value.memory, ram_size);
     std.log.info("run --from memory restore source={s} reason={s}", .{ @tagName(local_backing.source), @tagName(local_backing.reason) });
     return local_backing;
 }

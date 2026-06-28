@@ -1,9 +1,9 @@
 # Spore Format
 
 **Status:** manifest format v0 implemented (`src/spore.zig`), single-vCPU,
-same-host HVF and KVM producers/consumers. Manifest format v1 has data structs
-and validators for multi-vCPU state; capture, restore, and bundle production for
-v1 land in later slices.
+same-host HVF and KVM producers/consumers. Manifest format v1 has data structs,
+validators, and KVM capture/restore for multi-vCPU state; HVF capture/restore
+and bundle production for v1 land in later slices.
 
 Format v0 is still the current SporeVM 1.x manifest and artifact contract.
 Do not rename version or kind strings to v1 for release-label symmetry; use a
@@ -247,9 +247,9 @@ under `rootfs.cache`.
 ## Manifest Format v1
 
 Manifest v1 is the incompatible multi-vCPU machine-state shape. Existing v0
-loaders reject it through the normal unknown-version path; current runtime and
-bundle commands still use the v0 loader until the backend capture/restore and
-distribution slices land.
+loaders reject it through the normal unknown-version path. The KVM runtime uses
+v1 for multi-vCPU capture and restore; bundle commands still use the v0 loader
+until the distribution slice lands.
 
 V1 keeps the v0 memory, device, generation, rootfs, disk, network, and
 annotation contracts. The platform object adds:
@@ -280,9 +280,8 @@ records, PPIs without a known owner, and SPIs with an owner.
 - Access traces: the KVM and HVF lazy-restore harnesses can write local
   first-touch traces for measurement, but manifest v0 does not persist access
   traces or prefetch hints.
-- Multi-vCPU machine state.
-- Manifest v1 multi-vCPU machine state is defined but not yet produced by
-  capture or consumed by restore.
+- Multi-vCPU machine state in manifest v0. Manifest v1 carries this state for
+  KVM capture/restore; HVF and bundle paths are still later slices.
 - Kernel identity in the platform contract (pinned-build enforcement).
 - Durable disk/device identity fixup beyond the current diskless helper. The
   product initrd consumes generation params for hostname and applies

@@ -250,8 +250,9 @@ limit.
 - `run.execute` and `run.executeMonitor` validate the cap and pass `vcpus` into
   backend configs.
 - KVM backend configs carry `vcpus`, feed it into DTB construction, and can run
-  fresh non-capture, non-monitor multi-vCPU guests with one host thread per
-  vCPU. KVM capture/resume/monitor paths and transient virtio-mem still fail
+  fresh multi-vCPU guests with one host thread per vCPU. KVM multi-vCPU
+  capture/resume now uses manifest v1 for fixed-RAM run paths; monitor,
+  `--continue-after-capture`, exec-control, and transient virtio-mem still fail
   closed for `vcpus != 1`.
 - HVF backend configs carry `vcpus`, feed it into DTB construction, and can run
   fresh non-capture, non-monitor multi-vCPU guests with one owner thread per
@@ -264,11 +265,15 @@ limit.
 - HVF single-vCPU capture/resume still creates one main-thread-owned vCPU; the
   fresh multi-vCPU path creates vCPUs on their owning host threads and uses
   owner-thread commands for PSCI starts and cross-redistributor MMIO.
-- KVM snapshot code captures and restores one vCPU fd plus vCPU0 GIC attrs.
+- KVM snapshot code keeps manifest v0 for single-vCPU captures and captures or
+  restores manifest v1 per-vCPU CPU, ICC/timer, redistributor, and line-level
+  state for multi-vCPU captures.
 - HVF snapshot code captures and restores one vCPU handle plus HVF-private GIC
   state.
 - Manifest v0 and the state portability docs explicitly define one-vCPU
-  topology and list multi-vCPU machine state as not captured.
+  topology. Manifest v1 now has KVM producers/consumers for multi-vCPU machine
+  state; HVF, lifecycle, fork/fan-out, and bundle production remain later
+  slices.
 
 ## Delivery Strategy
 
@@ -368,6 +373,10 @@ Done when:
 - `spore resume` can resume an active multi-vCPU capture on a compatible KVM
   host;
 - stale or incompatible vCPU topology fails at manifest/platform validation.
+
+Status: implemented in this branch slice on 2026-06-28. Validation: `git diff
+--check`, `mise run test`, and `mise run build`. Live KVM smoke remains pending
+because this validation host does not expose `/dev/kvm`.
 
 ### Slice 6: HVF Multi-vCPU Capture and Resume
 

@@ -1,7 +1,7 @@
 # Spore State Portability Contract
 
-**Status:** current implementation for manifest format v0, plus manifest-v1
-data-model validation for future multi-vCPU captures. This document records what
+**Status:** current implementation for manifest format v0, plus KVM
+manifest-v1 capture/restore for multi-vCPU state. This document records what
 SporeVM can capture, map, translate, and reject when restoring an aarch64 spore
 across the KVM and Hypervisor.framework backends.
 
@@ -34,14 +34,14 @@ Manifest-format-v0 portability is deliberately narrow:
   rootfs artifacts, layer indexes, and disk objects. General block devices are
   still outside the portable contract.
 
-Cross-ISA restore, multi-vCPU restore, persisted access traces, general volumes,
-and broader disk/device fixups are later slices.
+Cross-ISA restore, HVF multi-vCPU restore, persisted access traces, general
+volumes, and broader disk/device fixups are later slices.
 
 Manifest format v1 is now reserved for multi-vCPU machine state. It records a
 bounded `vcpu_count`, per-vCPU normalized aarch64 state keyed by stable
 `index`/`mpidr`, and portable `gicv3_multi` state with global distributor,
 per-MPIDR redistributors, and owner-tagged PPI line levels. Current capture and
-restore paths do not produce or consume v1 yet.
+restore paths produce and consume v1 on KVM only.
 
 ## Platform contract
 
@@ -86,7 +86,7 @@ block identical-host fork/fan-out.
 | GIC redistributor/register state | GICv3 MMIO offsets | yes | yes | no | partial apply | producer gap on HVF |
 | GIC line levels | INTID plus asserted bit | PPI/SPI | yes | no | SPI only; asserted PPI rejected | asymmetric |
 | GIC CPU interface | ICC register names and values | yes | yes | yes | yes | portable |
-| Multi-vCPU machine state | manifest v1 per-vCPU arrays plus `gicv3_multi` | planned | planned | planned | planned | validators only |
+| Multi-vCPU machine state | manifest v1 per-vCPU arrays plus `gicv3_multi` | yes | yes | planned | planned | KVM only |
 | HVF GIC blob | tagged `backend_private` escape hatch | no | reject | same-HVF only | same-HVF only | not portable |
 | Virtio-mmio transport | device ID, feature selectors, negotiated features, status, interrupt status, queue addresses/indices | yes | yes | yes | yes | portable |
 | Virtqueue descriptors and buffers | guest RAM | yes | yes | yes | yes | portable through RAM |
@@ -199,7 +199,7 @@ KVM can currently:
 
 - produce portable distributor register values;
 - produce portable redistributor register values;
-- produce PPI/SPI line levels for the current single-vCPU INTID range;
+- produce PPI/SPI line levels for the current INTID range;
 - consume portable distributor/redistributor values;
 - consume line levels;
 - produce and consume ICC registers through the VGIC CPU-system-register API.
@@ -227,7 +227,7 @@ Current HVF gaps:
 
 | Direction | Current status | Gate before declaring green |
 | --- | --- | --- |
-| KVM→KVM | Passes same-host smoke on the `m7g.metal` KVM host. | Keep as regression coverage. |
+| KVM→KVM | Manifest v0 passes same-host smoke on the `m7g.metal` KVM host. Manifest v1 multi-vCPU producer/consumer code is implemented; live smoke is still pending. | Run KVM v1 `--vcpus 2 --capture`, `run --from`, and `resume` on an aarch64 KVM host. |
 | HVF→HVF | Passes same-host smoke locally, including HVF lazy RAM and file-backed fork smokes. | Keep as regression coverage. |
 | KVM→HVF | Portable vCPU, virtio, generation, GIC apply, and CPU profile machinery exist. `m7g.metal` and `a1.metal` spores fail closed on counter-frequency mismatch. | Need a KVM producer whose guest counter frequency matches HVF's 24MHz, or a designed cross-frequency timer contract. |
 | HVF→KVM | Blocked because HVF still produces backend-private GIC state. Timer compatibility still applies. | Make HVF produce portable GICv3 state, then run with compatible counter frequency. |
