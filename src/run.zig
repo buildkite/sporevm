@@ -41,8 +41,8 @@ const max_guest_working_dir_len = 255;
 const max_guest_request_len = 8191;
 const max_guest_port = 65535;
 const embedded_run_initrd = run_assets.minimal_exec_initrd;
-const default_kernel_repository = "buildkite/sporevm-kernels";
-const default_kernel_release = "v0.6.1";
+const default_kernel_repository = "sporevm/kernels";
+const default_kernel_release = "v0.6.2";
 const default_kernel_version = "6.1.155";
 const managed_run_kernel_required_config_symbols = [_][]const u8{
     "CONFIG_CGROUPS",
@@ -59,10 +59,17 @@ const managed_run_kernel_required_config_symbols = [_][]const u8{
     "CONFIG_CGROUP_PIDS",
     "CONFIG_CPUSETS",
     "CONFIG_CGROUP_DEVICE",
+    "CONFIG_MEMORY_HOTPLUG",
+    "CONFIG_MEMORY_HOTPLUG_DEFAULT_ONLINE",
+    "CONFIG_MEMORY_HOTREMOVE",
+    "CONFIG_CONTIG_ALLOC",
+    "CONFIG_EXCLUSIVE_SYSTEM_RAM",
+    "CONFIG_VIRTIO_MEM",
 };
 const direct_image_platform = rootfs_mod.Platform{};
 const max_rootfs_metadata_bytes = 1024 * 1024;
 const rootfs_trace_env = "SPOREVM_ROOTFS_TRACE";
+const auto_boot_memory_bytes: u64 = 512 * 1024 * 1024;
 
 pub const MemoryConfig = memory_config.Config;
 pub const CaptureTrigger = capture.Trigger;
@@ -98,6 +105,7 @@ pub const Options = struct {
     backend: Backend = .auto,
     kernel_path: []const u8,
     initrd_path: ?[]const u8 = null,
+    auto_memory_hotplug_capable: bool = false,
     rootfs_path: ?[]const u8 = null,
     rootfs: ?spore.Rootfs = null,
     disk: ?spore.Disk = null,
@@ -944,6 +952,8 @@ fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parse
         .command_name = "run",
         .record_artifact = parsed.capture_path != null,
     });
+    const default_kernel = parsed.shared.kernel_path == null and init.environ_map.get("SPOREVM_KERNEL_IMAGE") == null;
+    const default_initrd = parsed.shared.initrd_path == null and init.environ_map.get("SPOREVM_RUN_INITRD") == null;
     const kernel_path = parsed.shared.kernel_path orelse resolveDefaultKernelPath(init, allocator) catch |err| {
         failRunSetup("spore run: managed run kernel resolution failed: {s}; pass --kernel or set SPOREVM_KERNEL_IMAGE", .{@errorName(err)});
     };
@@ -953,6 +963,7 @@ fn resolveCliOptions(init: std.process.Init, allocator: std.mem.Allocator, parse
     var opts = parsed.shared.completeWithAssets(parsed.backend, kernel_path, initrd_path, rootfs.path, rootfs.rootfs, parsed.command, true);
     opts.guest_env = rootfs.guest_env;
     opts.guest_working_dir = rootfs.guest_working_dir;
+    opts.auto_memory_hotplug_capable = default_kernel and default_initrd;
     opts.capture_path = parsed.capture_path;
     opts.capture_trigger = parsed.capture_trigger;
     opts.continue_after_capture = parsed.continue_after_capture;
@@ -2073,8 +2084,12 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     const network_manifest = try manifestNetworkFromOptions(allocator, opts.network, &opts.network_policy);
 
     const resuming = opts.resume_dir != null;
+    const memory_plan = runMemoryPlan(opts.memory, .{
+        .fixed_ram = resuming or opts.capture_path != null,
+        .auto_hotplug_capable = opts.auto_memory_hotplug_capable,
+    });
     const local_backing_start = monotonicMs();
-    const local_backing = try openRunLocalMemoryBacking(allocator, context.environ_map, opts.resume_dir, opts.memory.bytes);
+    const local_backing = try openRunLocalMemoryBacking(allocator, context.environ_map, opts.resume_dir, memory_plan.boot_ram_size);
     const local_backing_ms = monotonicMs() -| local_backing_start;
     defer if (local_backing.fd) |fd| {
         _ = std.c.close(fd);
@@ -2097,7 +2112,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     defer runtime_disk.deinit();
     const boot_args = if (resuming) "" else try cmdline(allocator, opts.guest_port, opts.rootfs_path != null, rootfsWritable(opts), opts.network);
     const request_start = monotonicMs();
-    const request = try execRequestForRun(context, allocator, opts);
+    const request = try execRequestForRun(context, allocator, opts, memory_plan.virtio_mem_region_size != 0);
     var stream = try vsock.HostStream.init(opts.guest_port, request);
     const request_ms = monotonicMs() -| request_start;
     if (resuming) stream.host_port = vsock.HostStream.deriveHostPort(request);
@@ -2121,7 +2136,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
         signal_registration = capture.SignalRegistration.install(signal, capture_plan.request.?);
     }
     std.log.debug(
-        "run host setup timing: total_ms={d} local_backing_ms={d} kernel_ms={d} initrd_ms={d} disk_ms={d} request_ms={d} ram_mib={d}",
+        "run host setup timing: total_ms={d} local_backing_ms={d} kernel_ms={d} initrd_ms={d} disk_ms={d} request_ms={d} ram_mib={d} virtio_mem_mib={d}",
         .{
             monotonicMs() -| setup_start,
             local_backing_ms,
@@ -2129,7 +2144,8 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
             initrd_ms,
             disk_ms,
             request_ms,
-            opts.memory.bytes / 1024 / 1024,
+            memory_plan.boot_ram_size / 1024 / 1024,
+            memory_plan.virtio_mem_region_size / 1024 / 1024,
         },
     );
 
@@ -2140,7 +2156,8 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
             if (comptime !(builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)) return error.UnsupportedBackend;
             break :blk hvf.vm.run(allocator, .{
                 .kernel = kernel,
-                .ram_size = opts.memory.bytes,
+                .ram_size = memory_plan.boot_ram_size,
+                .virtio_mem_region_size = memory_plan.virtio_mem_region_size,
                 .cmdline = boot_args,
                 .initrd = initrd,
                 .console_sink = consoleSink,
@@ -2166,7 +2183,8 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
             if (comptime !(builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)) return error.UnsupportedBackend;
             break :blk kvm.vm.run(allocator, .{
                 .kernel = kernel,
-                .ram_size = opts.memory.bytes,
+                .ram_size = memory_plan.boot_ram_size,
+                .virtio_mem_region_size = memory_plan.virtio_mem_region_size,
                 .cmdline = boot_args,
                 .initrd = initrd,
                 .console_sink = consoleSink,
@@ -2232,6 +2250,33 @@ pub fn finishGatewayNetworkEvents(gateway: *net_gateway.Process, gateway_active:
     while (gateway.popNetworkEvent()) |event| {
         events.emitNetworkEventBestEffort(event);
     }
+}
+
+const RunMemoryPlan = struct {
+    boot_ram_size: u64,
+    virtio_mem_region_size: u64,
+};
+
+const RunMemoryConstraints = struct {
+    fixed_ram: bool = false,
+    auto_hotplug_capable: bool = false,
+};
+
+fn runMemoryPlan(memory: memory_config.Config, constraints: RunMemoryConstraints) RunMemoryPlan {
+    if (!constraints.fixed_ram and
+        constraints.auto_hotplug_capable and
+        memory.policy == .auto and
+        memory.bytes > auto_boot_memory_bytes)
+    {
+        return .{
+            .boot_ram_size = auto_boot_memory_bytes,
+            .virtio_mem_region_size = memory.bytes - auto_boot_memory_bytes,
+        };
+    }
+    return .{
+        .boot_ram_size = memory.bytes,
+        .virtio_mem_region_size = 0,
+    };
 }
 
 pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Options, control: vsock.Control) !MonitorResult {
@@ -2516,12 +2561,13 @@ pub fn execRequest(allocator: std.mem.Allocator, argv: []const []const u8) ![]co
     return execRequestWithSession(allocator, argv, "default");
 }
 
-fn execRequestForRun(context: Context, allocator: std.mem.Allocator, opts: Options) ![]const u8 {
+fn execRequestForRun(context: Context, allocator: std.mem.Allocator, opts: Options, memory_pressure: bool) ![]const u8 {
     const resume_time_unix_ns: u64 = @intCast(Io.Clock.real.now(context.io).nanoseconds);
     if (opts.resume_dir == null) return execRequestWithSessionOptions(allocator, opts.command, "default", .{
         .env = opts.guest_env,
         .working_dir = opts.guest_working_dir,
         .resume_time_unix_ns = resume_time_unix_ns,
+        .memory_pressure = memory_pressure,
     });
 
     const now = Io.Clock.real.now(context.io).nanoseconds;
@@ -2531,6 +2577,7 @@ fn execRequestForRun(context: Context, allocator: std.mem.Allocator, opts: Optio
     const session_id = try std.fmt.allocPrint(allocator, "run-{x}-{x}", .{ now, nonce });
     return execRequestWithSessionOptions(allocator, opts.command, session_id, .{
         .resume_time_unix_ns = resume_time_unix_ns,
+        .memory_pressure = memory_pressure,
     });
 }
 
@@ -2542,6 +2589,7 @@ const GuestExecOptions = struct {
     env: []const []const u8 = &.{},
     working_dir: ?[]const u8 = null,
     resume_time_unix_ns: u64 = 0,
+    memory_pressure: bool = false,
 };
 
 fn execRequestWithSessionOptions(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, options: GuestExecOptions) ![]const u8 {
@@ -2554,6 +2602,7 @@ fn execRequestWithSessionOptions(allocator: std.mem.Allocator, argv: []const []c
         argv: []const []const u8,
         env: []const []const u8,
         working_dir: []const u8,
+        memory_pressure: bool,
         closed_env: bool = true,
     }{
         .session_id = session_id,
@@ -2561,6 +2610,7 @@ fn execRequestWithSessionOptions(allocator: std.mem.Allocator, argv: []const []c
         .argv = argv,
         .env = options.env,
         .working_dir = options.working_dir orelse "",
+        .memory_pressure = options.memory_pressure,
     };
     const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(json);
@@ -2781,13 +2831,13 @@ fn takeValue(args: []const []const u8, i: *usize, name: []const u8) []const u8 {
 test "run request encodes argv" {
     const request = try execRequest(std.testing.allocator, &.{ "/bin/echo", "hello world" });
     defer std.testing.allocator.free(request);
-    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"default\",\"resume_time_unix_ns\":0,\"argv\":[\"/bin/echo\",\"hello world\"],\"env\":[],\"working_dir\":\"\",\"closed_env\":true}\n", request);
+    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"default\",\"resume_time_unix_ns\":0,\"argv\":[\"/bin/echo\",\"hello world\"],\"env\":[],\"working_dir\":\"\",\"memory_pressure\":false,\"closed_env\":true}\n", request);
 }
 
 test "run request can encode explicit session id" {
     const request = try execRequestWithSession(std.testing.allocator, &.{"/bin/true"}, "lifecycle-42");
     defer std.testing.allocator.free(request);
-    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"lifecycle-42\",\"resume_time_unix_ns\":0,\"argv\":[\"/bin/true\"],\"env\":[],\"working_dir\":\"\",\"closed_env\":true}\n", request);
+    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"lifecycle-42\",\"resume_time_unix_ns\":0,\"argv\":[\"/bin/true\"],\"env\":[],\"working_dir\":\"\",\"memory_pressure\":false,\"closed_env\":true}\n", request);
 }
 
 test "run request encodes image env and working directory" {
@@ -2795,9 +2845,10 @@ test "run request encodes image env and working directory" {
         .env = &.{ "GEM_HOME=/usr/local/bundle", "RUBYOPT=--yjit" },
         .working_dir = "/app",
         .resume_time_unix_ns = 123,
+        .memory_pressure = true,
     });
     defer std.testing.allocator.free(request);
-    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"default\",\"resume_time_unix_ns\":123,\"argv\":[\"/bin/sh\",\"-lc\",\"env && pwd\"],\"env\":[\"GEM_HOME=/usr/local/bundle\",\"RUBYOPT=--yjit\"],\"working_dir\":\"/app\",\"closed_env\":true}\n", request);
+    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"default\",\"resume_time_unix_ns\":123,\"argv\":[\"/bin/sh\",\"-lc\",\"env && pwd\"],\"env\":[\"GEM_HOME=/usr/local/bundle\",\"RUBYOPT=--yjit\"],\"working_dir\":\"/app\",\"memory_pressure\":true,\"closed_env\":true}\n", request);
 }
 
 test "image rootfs metadata supplies run env and working directory" {
@@ -3079,6 +3130,26 @@ test "run cli parser accepts memory policy" {
     try std.testing.expectEqual(memory_config.Policy.explicit, explicit_opts.shared.memory.policy);
     try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024 * 1024), explicit_opts.shared.memory.bytes);
     try std.testing.expect(explicit_opts.shared.memory_set);
+}
+
+test "run memory plan selects virtio-mem only for capable fresh auto runs" {
+    const auto = memory_config.Config{};
+    const hotplug = runMemoryPlan(auto, .{ .auto_hotplug_capable = true });
+    try std.testing.expectEqual(auto_boot_memory_bytes, hotplug.boot_ram_size);
+    try std.testing.expectEqual(memory_config.auto_bytes - auto_boot_memory_bytes, hotplug.virtio_mem_region_size);
+
+    const custom_assets = runMemoryPlan(auto, .{});
+    try std.testing.expectEqual(memory_config.auto_bytes, custom_assets.boot_ram_size);
+    try std.testing.expectEqual(@as(u64, 0), custom_assets.virtio_mem_region_size);
+
+    const capture_or_resume = runMemoryPlan(auto, .{ .fixed_ram = true, .auto_hotplug_capable = true });
+    try std.testing.expectEqual(memory_config.auto_bytes, capture_or_resume.boot_ram_size);
+    try std.testing.expectEqual(@as(u64, 0), capture_or_resume.virtio_mem_region_size);
+
+    const explicit = memory_config.Config{ .policy = .explicit, .bytes = 1024 * 1024 * 1024 };
+    const explicit_plan = runMemoryPlan(explicit, .{ .auto_hotplug_capable = true });
+    try std.testing.expectEqual(explicit.bytes, explicit_plan.boot_ram_size);
+    try std.testing.expectEqual(@as(u64, 0), explicit_plan.virtio_mem_region_size);
 }
 
 test "run cli parser accepts rootfs path" {
@@ -3632,12 +3703,12 @@ test "managed run kernel asset names validate input" {
 
 test "managed kernel repository cache name validates owner and repo" {
     const allocator = std.testing.allocator;
-    const cache = try managedKernelRepositoryCacheName(allocator, "buildkite/sporevm-kernels");
+    const cache = try managedKernelRepositoryCacheName(allocator, "sporevm/kernels");
     defer allocator.free(cache);
-    try std.testing.expectEqualStrings("buildkite-sporevm-kernels", cache);
+    try std.testing.expectEqualStrings("sporevm-kernels", cache);
 
     try std.testing.expectError(error.BadManagedKernelRepository, managedKernelRepositoryCacheName(allocator, "buildkite"));
-    try std.testing.expectError(error.BadManagedKernelRepository, managedKernelRepositoryCacheName(allocator, "../cleanroom-kernels"));
+    try std.testing.expectError(error.BadManagedKernelRepository, managedKernelRepositoryCacheName(allocator, "../sporevm-kernels"));
 }
 
 test "managed kernel checksum parser reads sha256 sidecar" {
@@ -3694,7 +3765,13 @@ test "managed kernel cache hit trusts read-only image with checksum sidecar" {
             "CONFIG_MEMCG=y\n" ++
             "CONFIG_CGROUP_PIDS=y\n" ++
             "CONFIG_CPUSETS=y\n" ++
-            "CONFIG_CGROUP_DEVICE=y\n",
+            "CONFIG_CGROUP_DEVICE=y\n" ++
+            "CONFIG_MEMORY_HOTPLUG=y\n" ++
+            "CONFIG_MEMORY_HOTPLUG_DEFAULT_ONLINE=y\n" ++
+            "CONFIG_MEMORY_HOTREMOVE=y\n" ++
+            "CONFIG_CONTIG_ALLOC=y\n" ++
+            "CONFIG_EXCLUSIVE_SYSTEM_RAM=y\n" ++
+            "CONFIG_VIRTIO_MEM=y\n",
     });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = bad_sha_path, .data = "not-a-sha\n" });
 
@@ -3715,7 +3792,7 @@ test "managed kernel cache hit trusts read-only image with checksum sidecar" {
     try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, bad_sha_path, config_path));
 }
 
-test "managed run kernel config requires Docker runtime and entropy symbols" {
+test "managed run kernel config requires Docker and virtio-mem runtime symbols" {
     const allocator = std.testing.allocator;
     const good_config =
         "# CONFIG_DEVMEM is not set\n" ++
@@ -3732,7 +3809,13 @@ test "managed run kernel config requires Docker runtime and entropy symbols" {
         "CONFIG_MEMCG=y\n" ++
         "CONFIG_CGROUP_PIDS=y\n" ++
         "CONFIG_CPUSETS=y\n" ++
-        "CONFIG_CGROUP_DEVICE=y\n";
+        "CONFIG_CGROUP_DEVICE=y\n" ++
+        "CONFIG_MEMORY_HOTPLUG=y\n" ++
+        "CONFIG_MEMORY_HOTPLUG_DEFAULT_ONLINE=y\n" ++
+        "CONFIG_MEMORY_HOTREMOVE=y\n" ++
+        "CONFIG_CONTIG_ALLOC=y\n" ++
+        "CONFIG_EXCLUSIVE_SYSTEM_RAM=y\n" ++
+        "CONFIG_VIRTIO_MEM=y\n";
 
     try std.testing.expect(try missingManagedRunKernelConfigSymbol(allocator, good_config) == null);
 
@@ -3750,7 +3833,13 @@ test "managed run kernel config requires Docker runtime and entropy symbols" {
         "CONFIG_MEMCG=y\n" ++
         "CONFIG_CGROUP_PIDS=y\n" ++
         "CONFIG_CPUSETS=y\n" ++
-        "CONFIG_CGROUP_DEVICE=y\n";
+        "CONFIG_CGROUP_DEVICE=y\n" ++
+        "CONFIG_MEMORY_HOTPLUG=y\n" ++
+        "CONFIG_MEMORY_HOTPLUG_DEFAULT_ONLINE=y\n" ++
+        "CONFIG_MEMORY_HOTREMOVE=y\n" ++
+        "CONFIG_CONTIG_ALLOC=y\n" ++
+        "CONFIG_EXCLUSIVE_SYSTEM_RAM=y\n" ++
+        "CONFIG_VIRTIO_MEM=y\n";
     const missing = (try missingManagedRunKernelConfigSymbol(allocator, missing_file_locking)).?;
     defer allocator.free(missing);
     try std.testing.expectEqualStrings("CONFIG_FILE_LOCKING", missing);
@@ -3767,7 +3856,13 @@ test "managed run kernel config requires Docker runtime and entropy symbols" {
         "CONFIG_MEMCG=y\n" ++
         "CONFIG_CGROUP_PIDS=y\n" ++
         "CONFIG_CPUSETS=y\n" ++
-        "CONFIG_CGROUP_DEVICE=y\n";
+        "CONFIG_CGROUP_DEVICE=y\n" ++
+        "CONFIG_MEMORY_HOTPLUG=y\n" ++
+        "CONFIG_MEMORY_HOTPLUG_DEFAULT_ONLINE=y\n" ++
+        "CONFIG_MEMORY_HOTREMOVE=y\n" ++
+        "CONFIG_CONTIG_ALLOC=y\n" ++
+        "CONFIG_EXCLUSIVE_SYSTEM_RAM=y\n" ++
+        "CONFIG_VIRTIO_MEM=y\n";
     const module_missing = (try missingManagedRunKernelConfigSymbol(allocator, module_value)).?;
     defer allocator.free(module_missing);
     try std.testing.expectEqualStrings("CONFIG_FILE_LOCKING", module_missing);
