@@ -29,9 +29,9 @@ fi
 [[ "${pressure_min_kb}" =~ ^[0-9]+$ ]] || die "SPORE_AUTO_MEMORY_PRESSURE_MIN_KB must be numeric"
 
 workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-smoke-run-auto-memory.XXXXXX")"
-export SPOREVM_ROOTFS_CACHE="${SPOREVM_ROOTFS_CACHE:-${workdir}/rootfs-cache}"
-export SPOREVM_BUNDLE_CACHE="${SPOREVM_BUNDLE_CACHE:-${workdir}/bundle-cache}"
-mkdir -p "${SPOREVM_ROOTFS_CACHE}" "${SPOREVM_BUNDLE_CACHE}"
+export SPOREVM_ROOTFS_CACHE_DIR="${SPOREVM_ROOTFS_CACHE_DIR:-${workdir}/rootfs-cache}"
+export SPOREVM_BUNDLE_CACHE_DIR="${SPOREVM_BUNDLE_CACHE_DIR:-${workdir}/bundle-cache}"
+mkdir -p "${SPOREVM_ROOTFS_CACHE_DIR}" "${SPOREVM_BUNDLE_CACHE_DIR}"
 
 cleanup() {
   local rc="$?"

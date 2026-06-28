@@ -57,6 +57,22 @@ choose_benchmark_scratch_root() {
 }
 
 benchmark_scratch_dir=""
+benchmark_rootfs_cache_dir="${SPOREVM_BENCHMARK_ROOTFS_CACHE_DIR:-${SPOREVM_ROOTFS_CACHE_DIR:-}}"
+
+default_rootfs_cache_dir() {
+  if [[ -n "${XDG_CACHE_HOME:-}" ]]; then
+    printf '%s\n' "${XDG_CACHE_HOME%/}/sporevm/rootfs"
+    return 0
+  fi
+  case "$(uname -s)" in
+    Darwin)
+      printf '%s\n' "${HOME%/}/Library/Caches/sporevm/rootfs"
+      ;;
+    *)
+      printf '%s\n' "${HOME%/}/.cache/sporevm/rootfs"
+      ;;
+  esac
+}
 
 prepare_benchmark_scratch() {
   local root
@@ -92,12 +108,20 @@ trap finish_benchmark_step EXIT
 mise install
 mise run build
 prepare_benchmark_scratch
+if [[ -z "${benchmark_rootfs_cache_dir}" ]]; then
+  benchmark_rootfs_cache_dir="$(default_rootfs_cache_dir)"
+fi
+export SPOREVM_ROOTFS_CACHE_DIR="${benchmark_rootfs_cache_dir}"
+mkdir -p "${benchmark_rootfs_cache_dir}"
 if [[ "$(uname -s)" == "Linux" ]]; then
   scripts/smoke-run-auto-memory.sh
 fi
 benchmark_args=(--profile "${SPOREVM_BENCHMARK_PROFILE:-comparison}" --no-build)
 if [[ -n "${benchmark_scratch_dir}" ]]; then
   benchmark_args+=(--scratch-dir "${benchmark_scratch_dir}")
+fi
+if [[ -n "${benchmark_rootfs_cache_dir}" ]]; then
+  benchmark_args+=(--rootfs-cache-dir "${benchmark_rootfs_cache_dir}")
 fi
 scripts/benchmark-sporevm-suite.py "${benchmark_args[@]}"
 scripts/export-sporevm-benchmark-data.py zig-cache/sporevm-benchmarks/latest-summary.json
