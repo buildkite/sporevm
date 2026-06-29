@@ -352,10 +352,17 @@ Progress:
   pressure run reported guest `MemTotal` of 1556284 KiB and host peak RSS of
   444860 KiB. This validates the KVM default-kernel/default-initrd grow-only
   virtio-mem path and records host resident cost for the 16GiB product memory
-  contract. The same build's benchmark `memory_economics` row used the smoke
-  profile's fixed 512MiB benchmark memory, so KVM lifecycle backing allocation
-  and suspend-pause evidence still require a named lifecycle run if this slice
-  needs to close the full backing/suspend gate.
+  contract.
+- 2026-06-29 Buildkite Linux ARM64 KVM named lifecycle boundary check:
+  `scripts/smoke-lifecycle-auto-memory.sh` passed on build 151 for commit
+  `66aea21` on the `sporevm-linux-arm64` queue. `spore create --memory auto`,
+  two `spore exec` calls, `spore --json ls`, and `spore suspend` completed with
+  a 16GiB manifest (`8192` 2MiB chunks). Create wall time was 121ms; suspend
+  wall time was 68.244s; `spore ls` reported `resident_bytes=null` because no
+  live process resident source was available at list time; the suspended
+  manifest had 154 nonzero chunks and a 16GiB `ram.backing` allocated at
+  55442944 bytes. Together with the local HVF lifecycle check above, this closes
+  the current 16GiB backing/suspend measurement gate.
 
 Done when:
 

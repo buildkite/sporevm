@@ -119,6 +119,7 @@ export SPOREVM_ROOTFS_CACHE_DIR="${benchmark_rootfs_cache_dir}"
 mkdir -p "${benchmark_rootfs_cache_dir}"
 if [[ "$(uname -s)" == "Linux" ]]; then
   scripts/smoke-run-auto-memory.sh
+  scripts/smoke-lifecycle-auto-memory.sh
 fi
 if [[ -z "${benchmark_profile}" ]]; then
   if [[ "${BUILDKITE_BRANCH:-}" == "main" ]]; then
