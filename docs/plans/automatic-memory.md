@@ -354,14 +354,14 @@ Progress:
   virtio-mem path and records host resident cost for the 16GiB product memory
   contract.
 - 2026-06-29 Buildkite Linux ARM64 KVM named lifecycle boundary check:
-  `scripts/smoke-lifecycle-auto-memory.sh` passed on build 150 for commit
-  `15cb1e4` on the `sporevm-linux-arm64` queue. `spore create --memory auto`,
+  `scripts/smoke-lifecycle-auto-memory.sh` passed on build 151 for commit
+  `66aea21` on the `sporevm-linux-arm64` queue. `spore create --memory auto`,
   two `spore exec` calls, `spore --json ls`, and `spore suspend` completed with
-  a 16GiB manifest (`8192` 2MiB chunks). Create wall time was 122ms; suspend
-  wall time was 68.406s; `spore ls` reported `resident_bytes=null` because no
+  a 16GiB manifest (`8192` 2MiB chunks). Create wall time was 121ms; suspend
+  wall time was 68.244s; `spore ls` reported `resident_bytes=null` because no
   live process resident source was available at list time; the suspended
   manifest had 154 nonzero chunks and a 16GiB `ram.backing` allocated at
-  8314368 bytes. Together with the local HVF lifecycle check above, this closes
+  55442944 bytes. Together with the local HVF lifecycle check above, this closes
   the current 16GiB backing/suspend measurement gate.
 
 Done when:
