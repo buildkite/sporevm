@@ -2162,13 +2162,13 @@ fn openRunLocalMemoryBacking(
     };
     if (parsed) |*manifest| {
         defer manifest.deinit();
-        const local_backing = try spore.openProvenLocalMemoryBacking(allocator, environ, dir, manifest.value.memory, ram_size);
+        const local_backing = try spore.openProvenLocalMemoryBackingForVcpuCount(allocator, environ, dir, manifest.value.memory, ram_size, 1);
         std.log.info("run --from memory restore source={s} reason={s}", .{ @tagName(local_backing.source), @tagName(local_backing.reason) });
         return local_backing;
     }
     var manifest = try spore.loadManifestV1(allocator, dir);
     defer manifest.deinit();
-    const local_backing = try spore.openProvenLocalMemoryBacking(allocator, environ, dir, manifest.value.memory, ram_size);
+    const local_backing = try spore.openProvenLocalMemoryBackingForVcpuCount(allocator, environ, dir, manifest.value.memory, ram_size, manifest.value.platform.vcpu_count);
     std.log.info("run --from memory restore source={s} reason={s}", .{ @tagName(local_backing.source), @tagName(local_backing.reason) });
     return local_backing;
 }

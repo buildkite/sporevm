@@ -179,6 +179,7 @@ pub const LocalBackingRestoreSource = enum {
 pub const LocalBackingRestoreReason = enum {
     not_attempted,
     no_backing,
+    unsupported_topology,
     bad_backing_metadata,
     backing_unavailable,
     backing_stat_failed,
@@ -928,6 +929,20 @@ pub fn openProvenLocalMemoryBacking(
     }
     handoff_fd = true;
     return .{ .fd = fd, .source = .local_backing, .reason = .proof_valid };
+}
+
+pub fn openProvenLocalMemoryBackingForVcpuCount(
+    allocator: std.mem.Allocator,
+    environ: *const std.process.Environ.Map,
+    dir: []const u8,
+    memory: MemoryManifest,
+    expected_size: u64,
+    vcpu_count: topology.VcpuCount,
+) Error!LocalBackingPlan {
+    // ponytail: multi-vCPU MAP_PRIVATE backing restore currently stalls HVF;
+    // keep the proven chunk path until backend smoke covers local backing.
+    if (vcpu_count != 1) return localBackingChunksPlan(.unsupported_topology);
+    return openProvenLocalMemoryBacking(allocator, environ, dir, memory, expected_size);
 }
 
 pub fn validateMemoryBacking(backing: MemoryBacking, expected_size: u64) Error!void {
@@ -2016,6 +2031,22 @@ test "local memory backing proof opens local fd and falls back safely" {
     try std.testing.expectEqual(LocalBackingRestoreSource.chunks, symlink_plan.source);
     try std.testing.expect(symlink_plan.fd == null);
     try std.testing.expectEqual(LocalBackingRestoreReason.proof_unavailable, symlink_plan.reason);
+}
+
+test "multi-vCPU restore falls back from local backing to chunks" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+
+    var chunks = [_]?[]const u8{null};
+    const plan = try openProvenLocalMemoryBackingForVcpuCount(allocator, &env, "/definitely/missing", .{
+        .chunk_size = chunk_size,
+        .chunks = &chunks,
+        .backing = .{ .kind = ram_backing_kind, .path = ram_backing_path, .size = chunk_size },
+    }, chunk_size, 2);
+    try std.testing.expectEqual(LocalBackingRestoreSource.chunks, plan.source);
+    try std.testing.expect(plan.fd == null);
+    try std.testing.expectEqual(LocalBackingRestoreReason.unsupported_topology, plan.reason);
 }
 
 test "local memory backing proof rejects foreign key and manifest mismatch" {

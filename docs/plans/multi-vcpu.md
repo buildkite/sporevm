@@ -260,7 +260,8 @@ limit.
   dirty-tracked capture, `--continue-after-capture`, and transient virtio-mem
   still fail closed for `vcpus != 1`.
 - Lifecycle metadata records `vcpus`; named create and named resume support
-  manifest v1 multi-vCPU captures on supported backends, continue-after named
+  manifest v1 multi-vCPU captures on supported backends, multi-vCPU restore
+  materializes from chunks instead of local RAM backing, continue-after named
   snapshots fail before monitor mutation, and named fork rejects multi-vCPU
   live fork before child state is written.
 - `board.buildDtb` emits one CPU node per `cpu_count`, and DTB tests cover
@@ -410,7 +411,7 @@ Status: implemented in this branch slice on 2026-06-28 with same-HVF
 Remove named lifecycle guards once both fresh boot and restore support the
 manifest shapes they can encounter. Extend fork/fan-out helpers to preserve
 multi-vCPU topology, rewrite only generation/device identity fields, and keep
-local RAM backing proof behavior unchanged.
+local RAM backing proof behavior fail-closed.
 
 Done when:
 
@@ -427,7 +428,9 @@ test`, `mise run build`, `git diff --check`, and live Apple Silicon smoke with
 manifest v1 inspection, named `spore resume --name`, and post-resume `spore
 exec`. Named live fork keeps the product-level multi-vCPU rejection before
 child state is written; direct `spore.fork` now rejects manifest v1 before
-creating the output directory.
+creating the output directory. Multi-vCPU product restore uses verified chunks
+rather than the same-host `ram.backing` acceleration until local backing has
+explicit backend smoke coverage.
 
 ### Slice 8: Documentation, Release Notes, and Runtime Evidence
 

@@ -175,7 +175,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
     const ram_size = if (parsed) |manifest| manifest.value.platform.ram_size else parsed_v1.?.value.platform.ram_size;
     const vcpu_count = if (parsed) |_| @as(u32, 1) else parsed_v1.?.value.platform.vcpu_count;
     const memory = if (parsed) |manifest| manifest.value.memory else parsed_v1.?.value.memory;
-    const local_backing = try spore.openProvenLocalMemoryBacking(allocator, context.environ_map, opts.spore_dir, memory, ram_size);
+    const local_backing = try spore.openProvenLocalMemoryBackingForVcpuCount(allocator, context.environ_map, opts.spore_dir, memory, ram_size, vcpu_count);
     defer if (local_backing.fd) |fd| {
         _ = std.c.close(fd);
     };
