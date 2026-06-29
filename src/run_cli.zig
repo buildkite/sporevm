@@ -106,10 +106,7 @@ fn isAttachValueOption(arg: []const u8) bool {
 }
 
 fn isAttachEqualsOption(arg: []const u8) bool {
-    return std.mem.startsWith(u8, arg, "--backend=") or
-        std.mem.startsWith(u8, arg, "--timeout-ms=") or
-        std.mem.startsWith(u8, arg, "--guest-port=") or
-        std.mem.startsWith(u8, arg, "--events=");
+    return std.mem.startsWith(u8, arg, "--events=");
 }
 
 fn runParsedCli(init: std.process.Init, arena: std.mem.Allocator, parsed: run_mod.CliOptions, stdout: *Io.Writer) !void {
@@ -305,6 +302,7 @@ test "attach args adapt to commandless run from" {
 
 test "attach args reject commands and separators" {
     try std.testing.expectError(error.UnexpectedArgument, attachRunArgs(std.testing.allocator, &.{ "live.spore", "echo hi" }));
+    try std.testing.expectError(error.UnexpectedArgument, attachRunArgs(std.testing.allocator, &.{ "--backend=hvf", "live.spore" }));
     try std.testing.expectError(error.UnexpectedSeparator, attachRunArgs(std.testing.allocator, &.{ "--", "live.spore" }));
     try std.testing.expectError(error.MissingSporeDir, attachRunArgs(std.testing.allocator, &.{}));
 }
