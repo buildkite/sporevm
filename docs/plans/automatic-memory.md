@@ -345,13 +345,24 @@ Progress:
   `ram.backing` allocated at 331350016 bytes. Dirty counters were unavailable
   before suspend because this named lifecycle fixed-RAM path does not use the
   fresh managed virtio-mem path.
-- KVM product-path evidence remains outstanding for this slice.
+- 2026-06-29 Buildkite Linux ARM64 KVM fresh managed product smoke:
+  `scripts/smoke-run-auto-memory.sh` passed on build 148 for commit
+  `d7ea1a8` on the `sporevm-linux-arm64` queue. Idle `spore run --memory auto`
+  reported guest `MemTotal` of 507708 KiB and host peak RSS of 42548 KiB. The
+  pressure run reported guest `MemTotal` of 1556284 KiB and host peak RSS of
+  444860 KiB. This validates the KVM default-kernel/default-initrd grow-only
+  virtio-mem path and records host resident cost for the 16GiB product memory
+  contract. The same build's benchmark `memory_economics` row used the smoke
+  profile's fixed 512MiB benchmark memory, so KVM lifecycle backing allocation
+  and suspend-pause evidence still require a named lifecycle run if this slice
+  needs to close the full backing/suspend gate.
 
 Done when:
 
-- KVM and HVF have representative 16GiB product-path runs in `docs/memory.md`
-  or this plan's progress snapshot.
-- The results distinguish configured RAM from resident/private memory.
+- KVM and HVF have representative 16GiB fresh managed product smokes in
+  `docs/memory.md` or this plan's progress snapshot.
+- KVM and HVF named lifecycle runs distinguish configured RAM from
+  resident/private memory, sparse backing allocation, and suspend cost.
 
 ## Verification
 
