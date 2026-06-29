@@ -78,6 +78,7 @@ Useful focused checks:
 
 ```bash
 scripts/smoke-run-auto-memory.sh
+scripts/smoke-lifecycle-auto-memory.sh
 mise run smoke:counter-fanout
 scripts/smoke-run-capture.sh
 scripts/benchmark-kvm-dirty-tracking.sh --backend hvf --modes write-protect

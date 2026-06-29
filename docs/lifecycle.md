@@ -104,6 +104,7 @@ Useful focused checks:
 
 ```bash
 mise run smoke:lifecycle
+mise run smoke:lifecycle-auto-memory
 mise run smoke:monitor-jail
 mise run smoke:monitor-failure-modes
 scripts/benchmark-sporevm-lifecycle.sh
