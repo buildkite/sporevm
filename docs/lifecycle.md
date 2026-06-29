@@ -30,7 +30,13 @@ spore --json ls
 and `-- <argv...>` for exact argv. A command passed to `spore create` is
 started in the guest and detached; stdout and stderr are discarded so the named
 VM is immediately available for `fork`, `exec`, `suspend`, and `rm`. `spore
-exec` forwards guest stdout and stderr as workload streams.
+exec` forwards guest stdout and stderr as workload streams. Pass `-i` to stream
+host stdin through the monitor to the guest process, and pass `-t` to request a
+guest terminal for the exec. The usual shell spelling is:
+
+```bash
+spore exec -it bench-1 -- /bin/sh
+```
 
 ## Runtime State
 
@@ -99,8 +105,10 @@ spawned. `mise run smoke:monitor-jail` covers the denied-operation path.
   output stream; JSONL emits it as `event:"terminal"`.
 - `spore run -i --from` and `spore run -t --from` can attach to captured live
   sessions only when that session was originally started with interactive stdin
-  or a PTY. `spore run -t --from <command>` and named interactive
-  `spore exec -it` are not implemented yet.
+  or a PTY. `spore run -t --from <command>` is not implemented yet.
+- `spore exec -i/-t` uses a streaming monitor request. The public bounded
+  `execNamed` embedding API rejects interactive flags until a streaming
+  embedding API exists.
 - No multi-vCPU named live fork yet.
 - No disk-backed or networked named live fork yet.
 - No live network-flow checkpointing.
@@ -112,6 +120,7 @@ Useful focused checks:
 
 ```bash
 mise run smoke:lifecycle
+mise run smoke:lifecycle-tty
 mise run smoke:lifecycle-auto-memory
 mise run smoke:monitor-jail
 mise run smoke:monitor-failure-modes

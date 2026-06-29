@@ -12,6 +12,7 @@ const memory_config = @import("memory.zig");
 const run_mod = @import("run.zig");
 const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
+const spore_stream = @import("spore_stream.zig");
 const topology = @import("topology.zig");
 
 pub const runtime_dir_env = local_paths.runtime_dir_env;
@@ -89,10 +90,12 @@ const create_usage =
 
 const exec_usage =
     \\Usage:
-    \\  spore exec NAME 'shell command'
-    \\  spore exec NAME -- <argv...>
+    \\  spore exec [options] NAME 'shell command'
+    \\  spore exec [options] NAME -- <argv...>
     \\
     \\Options:
+    \\  -i, --interactive       Keep stdin open and forward it to the guest process
+    \\  -t, --tty               Allocate a guest terminal for the process
     \\  -- <argv...>            Run exact argv instead of /bin/sh -lc
     \\  -h, --help              Show this help
     \\
@@ -306,6 +309,8 @@ const ExecOptions = struct {
     name: []const u8,
     command_mode: run_mod.CommandMode = .shell,
     command: []const []const u8,
+    interactive: bool = false,
+    tty: bool = false,
 };
 
 const SuspendOptions = struct {
@@ -373,6 +378,8 @@ pub const ExecNamedOptions = struct {
     name: []const u8,
     command: []const []const u8,
     network_policy: ?spore_net_policy.NetworkPolicy = null,
+    interactive: bool = false,
+    tty: bool = false,
 };
 
 pub const SnapshotNamedOptions = struct {
@@ -623,6 +630,7 @@ pub fn execNamed(
     options: ExecNamedOptions,
 ) !ExecNamedResult {
     if (options.command.len == 0) return error.InvalidGuestCommand;
+    if (options.interactive or options.tty) return error.UnsupportedInteractiveExec;
     if (options.network_policy != null) return error.UnsupportedNetworkPolicyUpdate;
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -638,12 +646,34 @@ pub fn execNamed(
     return parseExecNamedResponse(allocator, arena, response);
 }
 
+fn execNamedStreaming(
+    context: Context,
+    allocator: std.mem.Allocator,
+    options: ExecNamedOptions,
+) !u8 {
+    if (options.command.len == 0) return error.InvalidGuestCommand;
+    if (!options.interactive and !options.tty) return error.InvalidGuestCommand;
+    if (options.network_policy != null) return error.UnsupportedNetworkPolicyUpdate;
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const paths = try apiPaths(context, arena, options.name);
+    const state = try classifyVmState(arena, context.io, paths, pidAlive);
+    if (state != .ready) return error.NamedVmNotReady;
+    var ready = try readReady(arena, context.io, paths);
+    defer ready.deinit();
+    return execStreamControl(context, arena, ready.value.control_socket_path, options);
+}
+
 fn startNamed(
     context: Context,
     allocator: std.mem.Allocator,
     options: ExecNamedOptions,
 ) !ExecNamedResult {
     if (options.command.len == 0) return error.InvalidGuestCommand;
+    if (options.interactive or options.tty) return error.UnsupportedInteractiveExec;
     if (options.network_policy != null) return error.UnsupportedNetworkPolicyUpdate;
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -1021,6 +1051,34 @@ pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         },
         else => return err,
     };
+    if (parsed.interactive or parsed.tty) {
+        validateExecTerminalPolicy(parsed);
+        const exit_code = execNamedStreaming(.{
+            .io = init.io,
+            .environ_map = init.environ_map,
+        }, allocator, .{
+            .name = parsed.name,
+            .command = command,
+            .interactive = parsed.interactive,
+            .tty = parsed.tty,
+        }) catch |err| switch (err) {
+            error.InvalidRuntimeDir, error.InsecureRuntimeDir => cliRuntimePathExit("exec", err),
+            error.NamedVmNotReady => {
+                std.debug.print("spore exec: VM is not ready: {s}\n", .{parsed.name});
+                std.process.exit(2);
+            },
+            error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse => {
+                switch (err) {
+                    error.MonitorUnavailable => std.debug.print("spore exec: monitor is unavailable for VM: {s}\n", .{parsed.name}),
+                    else => std.debug.print("spore exec: monitor request failed for VM {s}: {s}\n", .{ parsed.name, @errorName(err) }),
+                }
+                std.process.exit(1);
+            },
+            else => |e| return e,
+        };
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
     const result = execNamed(.{
         .io = init.io,
         .environ_map = init.environ_map,
@@ -1045,6 +1103,18 @@ pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
     defer deinitExecNamedResult(allocator, result);
     try writeExecNamedResult(stdout, result);
     if (result.exit_code != 0) std.process.exit(result.exit_code);
+}
+
+fn validateExecTerminalPolicy(parsed: ExecOptions) void {
+    if (!parsed.tty) return;
+    if (std.c.isatty(1) == 0) {
+        std.debug.print("spore exec: -t requires stdout to be a terminal\n", .{});
+        std.process.exit(2);
+    }
+    if (parsed.interactive and std.c.isatty(0) == 0) {
+        std.debug.print("spore exec: -it requires stdin to be a terminal\n", .{});
+        std.process.exit(2);
+    }
 }
 
 pub fn rmCli(
@@ -1921,14 +1991,44 @@ fn parseCreateArgs(
 
 fn parseExecArgs(args: []const []const u8) ExecOptions {
     if (args.len < 2) usageExit(exec_usage);
-    validateNameOrExit("exec", args[0]) catch unreachable;
+    var name: ?[]const u8 = null;
     var command_mode: run_mod.CommandMode = .shell;
-    const command = if (std.mem.eql(u8, args[1], "--")) blk: {
-        command_mode = .argv;
-        break :blk args[2..];
-    } else args[1..];
+    var command: []const []const u8 = &.{};
+    var interactive = false;
+    var tty = false;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--")) {
+            command_mode = .argv;
+            command = args[i + 1 ..];
+            break;
+        } else if (name != null) {
+            command = args[i..];
+            break;
+        } else if (std.mem.eql(u8, args[i], "-i") or std.mem.eql(u8, args[i], "--interactive")) {
+            interactive = true;
+        } else if (std.mem.eql(u8, args[i], "-t") or std.mem.eql(u8, args[i], "--tty")) {
+            tty = true;
+        } else if (std.mem.eql(u8, args[i], "-it") or std.mem.eql(u8, args[i], "-ti")) {
+            interactive = true;
+            tty = true;
+        } else if (std.mem.startsWith(u8, args[i], "-")) {
+            usageExit(exec_usage);
+        } else {
+            validateNameOrExit("exec", args[i]) catch unreachable;
+            name = args[i];
+        }
+    }
+    const vm_name = name orelse usageExit(exec_usage);
     if (command.len == 0) usageExit(exec_usage);
-    return .{ .name = args[0], .command_mode = command_mode, .command = command };
+    return .{
+        .name = vm_name,
+        .command_mode = command_mode,
+        .command = command,
+        .interactive = interactive,
+        .tty = tty,
+    };
 }
 
 fn parseRmArgs(args: []const []const u8, allocator: std.mem.Allocator, stderr: *Io.Writer, mode: machine_output.Mode) []const u8 {
@@ -2404,6 +2504,52 @@ fn sendExecRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const u8
     return sendControlJson(allocator, io, socket_path, json);
 }
 
+fn execStreamControl(context: Context, allocator: std.mem.Allocator, socket_path: []const u8, options: ExecNamedOptions) !u8 {
+    const terminal_size = terminalSizeOrDefault(terminalSizeFd());
+    const payload = struct {
+        type: []const u8 = "exec-stream-v1",
+        argv: []const []const u8,
+        stdio: []const u8,
+        interactive: bool,
+        term: []const u8,
+        terminal_rows: u16,
+        terminal_cols: u16,
+    }{
+        .argv = options.command,
+        .stdio = if (options.tty) "tty" else "pipe",
+        .interactive = options.interactive,
+        .term = terminalName(context.environ_map),
+        .terminal_rows = terminal_size.rows,
+        .terminal_cols = terminal_size.cols,
+    };
+    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+    defer allocator.free(json);
+
+    const address = try net.UnixAddress.init(socket_path);
+    const stream = address.connect(context.io) catch return error.MonitorUnavailable;
+    defer stream.close(context.io);
+    writeAll(context.io, stream, json) catch return error.MonitorUnavailable;
+    writeAll(context.io, stream, "\n") catch return error.MonitorUnavailable;
+
+    var raw_terminal: ?ExecRawTerminal = null;
+    if (options.tty and options.interactive) raw_terminal = try ExecRawTerminal.enable();
+    defer if (raw_terminal) |*raw| raw.deinit();
+
+    var resize_registration: ?ExecResizeRegistration = null;
+    if (options.tty) {
+        resize_registration = ExecResizeRegistration.install();
+        execResizeNotify();
+    }
+    defer if (resize_registration) |*registration| registration.deinit();
+
+    var pump = ExecStreamPump{
+        .fd = stream.socket.handle,
+        .interactive = options.interactive,
+        .tty = options.tty,
+    };
+    return pump.run();
+}
+
 fn sendStartRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, argv: []const []const u8) ![]const u8 {
     const payload = struct {
         type: []const u8 = "start",
@@ -2450,6 +2596,232 @@ fn sendControlJson(allocator: std.mem.Allocator, io: Io, socket_path: []const u8
     var reader = stream.reader(io, &read_buffer);
     const line = reader.interface.takeDelimiterExclusive('\n') catch return error.MonitorUnavailable;
     return allocator.dupe(u8, line);
+}
+
+const ExecStreamPump = struct {
+    fd: std.c.fd_t,
+    interactive: bool,
+    tty: bool,
+    stdin_closed: bool = false,
+    stdin_offset: u64 = 0,
+    terminal_input_offset: u64 = 0,
+    stdout_offset: u64 = 0,
+    stderr_offset: u64 = 0,
+    terminal_offset: u64 = 0,
+    resize_seen: u32 = 0,
+    payload: [spore_stream.max_payload_len]u8 = undefined,
+
+    fn run(self: *ExecStreamPump) !u8 {
+        while (true) {
+            try self.maybeSendResize();
+            var fds = [_]std.posix.pollfd{
+                .{ .fd = self.fd, .events = std.c.POLL.IN | std.c.POLL.HUP | std.c.POLL.ERR, .revents = 0 },
+                .{ .fd = if (self.interactive) 0 else -1, .events = std.c.POLL.IN | std.c.POLL.HUP | std.c.POLL.ERR, .revents = 0 },
+            };
+            const ready = std.posix.poll(&fds, 100) catch return error.MonitorUnavailable;
+            if (ready == 0) continue;
+            if ((fds[0].revents & std.c.POLL.IN) != 0) {
+                if (try self.readOutputFrame()) |exit_code| return exit_code;
+            }
+            if ((fds[0].revents & (std.c.POLL.HUP | std.c.POLL.ERR | std.c.POLL.NVAL)) != 0) return error.MonitorUnavailable;
+            if (self.interactive and (fds[1].revents & (std.c.POLL.IN | std.c.POLL.HUP)) != 0) {
+                try self.forwardStdin();
+            }
+            if (self.interactive and (fds[1].revents & (std.c.POLL.ERR | std.c.POLL.NVAL)) != 0) return error.MonitorUnavailable;
+        }
+    }
+
+    fn readOutputFrame(self: *ExecStreamPump) !?u8 {
+        var header_buf: [spore_stream.header_len]u8 = undefined;
+        try readFdExact(self.fd, &header_buf);
+        const header = try spore_stream.readHeader(&header_buf);
+        if (header.flags != 0 or header.payload_len > self.payload.len) return error.BadMonitorResponse;
+        const payload = self.payload[0..header.payload_len];
+        if (payload.len > 0) try readFdExact(self.fd, payload);
+        switch (header.frame_type) {
+            .data => {
+                const expected = switch (header.stream_id) {
+                    .stdout => self.stdout_offset,
+                    .stderr => self.stderr_offset,
+                    .terminal => self.terminal_offset,
+                    else => return error.BadMonitorResponse,
+                };
+                if (header.offset != expected) return error.BadMonitorResponse;
+                const out_fd: std.c.fd_t = switch (header.stream_id) {
+                    .stderr => 2,
+                    else => 1,
+                };
+                try writeFdAll(out_fd, payload);
+                const len: u64 = @intCast(payload.len);
+                switch (header.stream_id) {
+                    .stdout => self.stdout_offset += len,
+                    .stderr => self.stderr_offset += len,
+                    .terminal => self.terminal_offset += len,
+                    else => unreachable,
+                }
+                return null;
+            },
+            .exit => {
+                if (header.stream_id != .control or header.offset != 0) return error.BadMonitorResponse;
+                const code = try spore_stream.readExitPayload(payload);
+                if (code > 255) return error.BadMonitorResponse;
+                return @intCast(code);
+            },
+            .err => {
+                if (header.stream_id != .control) return error.BadMonitorResponse;
+                try writeFdAll(2, payload);
+                if (payload.len != 0 and payload[payload.len - 1] != '\n') try writeFdAll(2, "\n");
+                return error.MonitorRequestFailed;
+            },
+            .event => return null,
+            else => return error.BadMonitorResponse,
+        }
+    }
+
+    fn forwardStdin(self: *ExecStreamPump) !void {
+        if (self.stdin_closed) return;
+        var buf: [4096]u8 = undefined;
+        const n = std.c.read(0, &buf, buf.len);
+        if (n < 0) {
+            switch (std.c.errno(n)) {
+                .INTR => return,
+                else => return error.MonitorUnavailable,
+            }
+        }
+        const input_stream: spore_stream.StreamId = if (self.tty) .terminal else .stdin;
+        if (n == 0) {
+            try self.writeInputFrame(.close, input_stream, "");
+            self.stdin_closed = true;
+            return;
+        }
+        try self.writeInputData(input_stream, buf[0..@intCast(n)]);
+    }
+
+    fn maybeSendResize(self: *ExecStreamPump) !void {
+        if (!self.tty) return;
+        const count = exec_resize_count.load(.acquire);
+        if (count == self.resize_seen) return;
+        self.resize_seen = count;
+        var payload: [4]u8 = undefined;
+        spore_stream.writeResizePayload(&payload, terminalSizeOrDefault(terminalSizeFd()));
+        try self.writeInputFrame(.resize, .terminal, &payload);
+    }
+
+    fn writeInputData(self: *ExecStreamPump, stream_id: spore_stream.StreamId, bytes: []const u8) !void {
+        var remaining = bytes;
+        while (remaining.len > 0) {
+            const take = @min(remaining.len, spore_stream.max_payload_len);
+            try self.writeInputFrame(.data, stream_id, remaining[0..take]);
+            remaining = remaining[take..];
+        }
+    }
+
+    fn writeInputFrame(self: *ExecStreamPump, frame_type: spore_stream.FrameType, stream_id: spore_stream.StreamId, payload: []const u8) !void {
+        const offset = switch (stream_id) {
+            .stdin => self.stdin_offset,
+            .terminal => self.terminal_input_offset,
+            else => 0,
+        };
+        var frame_buf: [spore_stream.max_frame_len]u8 = undefined;
+        const frame = try spore_stream.writeFrame(&frame_buf, .{
+            .frame_type = frame_type,
+            .stream_id = stream_id,
+            .offset = if (frame_type == .resize) 0 else offset,
+        }, payload);
+        try writeFdAll(self.fd, frame);
+        if (frame_type == .data) {
+            const len: u64 = @intCast(payload.len);
+            switch (stream_id) {
+                .stdin => self.stdin_offset += len,
+                .terminal => self.terminal_input_offset += len,
+                else => {},
+            }
+        }
+    }
+};
+
+const ExecRawTerminal = struct {
+    saved: std.c.termios,
+    active: bool = true,
+
+    fn enable() !ExecRawTerminal {
+        var current: std.c.termios = undefined;
+        if (std.c.tcgetattr(0, &current) != 0) return error.TerminalRawModeFailed;
+        var raw = current;
+        raw.iflag.ICRNL = false;
+        raw.iflag.IXON = false;
+        raw.lflag.ICANON = false;
+        raw.lflag.ECHO = false;
+        raw.lflag.ISIG = false;
+        raw.oflag.OPOST = false;
+        if (std.c.tcsetattr(0, .NOW, &raw) != 0) return error.TerminalRawModeFailed;
+        return .{ .saved = current };
+    }
+
+    fn deinit(self: *ExecRawTerminal) void {
+        if (!self.active) return;
+        var saved = self.saved;
+        _ = std.c.tcsetattr(0, .NOW, &saved);
+        self.active = false;
+    }
+};
+
+var exec_resize_count: std.atomic.Value(u32) = .init(0);
+
+const ExecResizeRegistration = struct {
+    old_action: std.posix.Sigaction,
+    active: bool = true,
+
+    fn install() ExecResizeRegistration {
+        var old_action: std.posix.Sigaction = undefined;
+        const action = std.posix.Sigaction{
+            .handler = .{ .sigaction = handleExecResize },
+            .mask = std.posix.sigemptyset(),
+            .flags = std.posix.SA.SIGINFO,
+        };
+        std.posix.sigaction(.WINCH, &action, &old_action);
+        return .{ .old_action = old_action };
+    }
+
+    fn deinit(self: *ExecResizeRegistration) void {
+        if (!self.active) return;
+        std.posix.sigaction(.WINCH, &self.old_action, null);
+        self.active = false;
+    }
+};
+
+fn handleExecResize(_: std.posix.SIG, _: *const std.posix.siginfo_t, _: ?*anyopaque) callconv(.c) void {
+    execResizeNotify();
+}
+
+fn execResizeNotify() void {
+    _ = exec_resize_count.fetchAdd(1, .acq_rel);
+}
+
+fn terminalName(environ: *const std.process.Environ.Map) []const u8 {
+    return environ.get("TERM") orelse "xterm";
+}
+
+fn ioctlRequest(comptime request: anytype) c_int {
+    const raw: u32 = @truncate(@as(usize, request));
+    return @bitCast(raw);
+}
+
+fn terminalSizeOrDefault(fd: std.c.fd_t) spore_stream.Resize {
+    var size: std.posix.winsize = .{
+        .row = 0,
+        .col = 0,
+        .xpixel = 0,
+        .ypixel = 0,
+    };
+    if (std.c.ioctl(fd, ioctlRequest(std.posix.T.IOCGWINSZ), &size) == 0 and size.row > 0 and size.col > 0) {
+        return .{ .rows = size.row, .cols = size.col };
+    }
+    return .{ .rows = 24, .cols = 80 };
+}
+
+fn terminalSizeFd() std.c.fd_t {
+    return if (std.c.isatty(1) != 0) 1 else if (std.c.isatty(0) != 0) 0 else 1;
 }
 
 const ControlResponse = struct {
@@ -2577,6 +2949,36 @@ fn writeAll(io: Io, stream: net.Stream, bytes: []const u8) !void {
     var writer = stream.writer(io, &write_buffer);
     try writer.interface.writeAll(bytes);
     try writer.interface.flush();
+}
+
+fn readFdExact(fd: std.c.fd_t, buf: []u8) !void {
+    var remaining = buf;
+    while (remaining.len > 0) {
+        const n = std.c.read(fd, remaining.ptr, remaining.len);
+        if (n < 0) {
+            switch (std.c.errno(n)) {
+                .INTR => continue,
+                else => return error.MonitorUnavailable,
+            }
+        }
+        if (n == 0) return error.MonitorUnavailable;
+        remaining = remaining[@intCast(n)..];
+    }
+}
+
+fn writeFdAll(fd: std.c.fd_t, bytes: []const u8) !void {
+    var remaining = bytes;
+    while (remaining.len > 0) {
+        const n = std.c.write(fd, remaining.ptr, remaining.len);
+        if (n < 0) {
+            switch (std.c.errno(n)) {
+                .INTR => continue,
+                else => return error.MonitorUnavailable,
+            }
+        }
+        if (n == 0) return error.MonitorUnavailable;
+        remaining = remaining[@intCast(n)..];
+    }
 }
 
 fn decodeControlOutput(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
@@ -3066,12 +3468,34 @@ test "exec parser accepts shell and exact commands" {
     try std.testing.expectEqual(run_mod.CommandMode.shell, shell_opts.command_mode);
     try std.testing.expectEqual(@as(usize, 1), shell_opts.command.len);
     try std.testing.expectEqualStrings("cat /tick", shell_opts.command[0]);
+    try std.testing.expect(!shell_opts.interactive);
+    try std.testing.expect(!shell_opts.tty);
 
     const argv_opts = parseExecArgs(&.{ "counter", "--", "/bin/cat", "/tick" });
     try std.testing.expectEqual(run_mod.CommandMode.argv, argv_opts.command_mode);
     try std.testing.expectEqual(@as(usize, 2), argv_opts.command.len);
     try std.testing.expectEqualStrings("/bin/cat", argv_opts.command[0]);
     try std.testing.expectEqualStrings("/tick", argv_opts.command[1]);
+
+    const hyphen_shell_opts = parseExecArgs(&.{ "counter", "-c test" });
+    try std.testing.expectEqual(run_mod.CommandMode.shell, hyphen_shell_opts.command_mode);
+    try std.testing.expectEqualStrings("-c test", hyphen_shell_opts.command[0]);
+}
+
+test "exec parser accepts interactive and tty flags" {
+    const combined_opts = parseExecArgs(&.{ "-it", "box", "--", "/bin/sh" });
+    try std.testing.expectEqualStrings("box", combined_opts.name);
+    try std.testing.expectEqual(run_mod.CommandMode.argv, combined_opts.command_mode);
+    try std.testing.expect(combined_opts.interactive);
+    try std.testing.expect(combined_opts.tty);
+    try std.testing.expectEqualStrings("/bin/sh", combined_opts.command[0]);
+
+    const long_opts = parseExecArgs(&.{ "--interactive", "--tty", "box", "cat" });
+    try std.testing.expectEqualStrings("box", long_opts.name);
+    try std.testing.expectEqual(run_mod.CommandMode.shell, long_opts.command_mode);
+    try std.testing.expect(long_opts.interactive);
+    try std.testing.expect(long_opts.tty);
+    try std.testing.expectEqualStrings("cat", long_opts.command[0]);
 }
 
 test "create parser accepts bounded vcpu count" {

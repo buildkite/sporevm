@@ -122,7 +122,8 @@ different. It must be explicit.
   for one-shot PTY allocation.
 - `docs/lifecycle.md` now documents `spore run -i` pipe-style stdin,
   `spore run -t/-it` one-shot TTY mode, and input/TTY attach for captured live
-  `spore run --from` sessions. Named interactive exec remains future work.
+  `spore run --from` sessions. It also documents the streaming
+  `spore exec -i/-t` named lifecycle path.
 
 ## Progress Snapshot
 
@@ -131,14 +132,23 @@ different. It must be explicit.
 - Slice 2 is implemented and committed. `spore run -t` requests `stdio:"tty"`,
   allocates a guest PTY, streams terminal output on SPIO stream 4, emits JSONL
   `terminal` events, applies resize frames, and uses raw host stdin for `-it`.
-- Slice 3 is implemented locally. `spore run --from` still uses legacy
+- Slice 3 is implemented and committed. `spore run --from` still uses legacy
   output-only attach by default; `-i` or `-t` selects `attach-v1`, validates the
   restored guest session capability, and starts host attachment state fresh for
   each restored spore or forked child.
-- Validation passed with `mise run test`, `mise run build`, `git diff --check`,
+- Slice 4 is implemented and validated locally. `spore exec -i/-t` uses a
+  streaming monitor control request over the local Unix socket, while regular
+  `spore exec NAME 'command'` stays on the bounded request/response path. The
+  streaming path proxies SPIO stdin, terminal bytes, resize, and exit between
+  the CLI and the existing guest `HostStream`.
+- Validation for Slices 1-3 passed with `mise run test`, `mise run build`, `git diff --check`,
   `mise run smoke:run`, `mise run smoke:run-stdin`, `mise run smoke:run-tty`,
   and `mise run smoke:run-attach`.
-- Streaming named exec and public `spore attach` remain future slices.
+- Slice 4 validation passed with `mise run test`, `mise run build`, `git diff --check`,
+  `mise run smoke:lifecycle`, `mise run smoke:lifecycle-tty`, `mise run
+  smoke:run-stdin`, `mise run smoke:run-tty`, `mise run smoke:run-attach`, and
+  a manual `expect` check for `spore exec -it box -- /bin/sh`.
+- Public `spore attach` remains a future slice.
 
 ## Target User Model
 
@@ -605,7 +615,7 @@ mise run smoke:lifecycle
 scripts/smoke-run-stdin.sh
 scripts/smoke-run-tty.sh
 scripts/smoke-run-attach.sh
-scripts/smoke-lifecycle-tty.sh
+mise run smoke:lifecycle-tty
 ```
 
 Manual checks for TTY slices:

@@ -547,6 +547,7 @@ pub const HostStream = struct {
     fn enqueueOutboundBlocking(self: *HostStream, frame: []const u8, stop: *const std.atomic.Value(bool)) !bool {
         if (frame.len > max_payload) return error.PacketTooLarge;
         while (!stop.load(.acquire)) {
+            if (self.state == .complete or self.state == .failed) return false;
             self.enqueueOutbound(frame) catch |err| switch (err) {
                 error.OutboundFull => {
                     var ts = std.c.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };

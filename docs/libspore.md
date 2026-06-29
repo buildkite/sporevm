@@ -214,6 +214,9 @@ The named surface is:
 `snapshotNamed` currently supports snapshot-and-continue only. Use
 `deinitNamedLifecycleResult`, `deinitExecNamedResult`,
 `deinitNamedForkResult`, and `deinitNamedList` for owned results.
+`execNamed` returns a bounded stdout/stderr result, so `.interactive = true` or
+`.tty = true` returns `error.UnsupportedInteractiveExec` in this slice. Use the
+CLI for streaming named exec until a streaming embedder API is added.
 
 ## Networking
 

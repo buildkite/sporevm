@@ -199,6 +199,13 @@ spore exec child-0 'cat /tick; sleep 1; cat /tick'
 spore exec child-1 'cat /tick; sleep 1; cat /tick'
 ```
 
+Named exec can also be interactive when you opt in to input or a terminal:
+
+```bash
+printf 'hello\n' | spore exec -i child-0 -- /bin/cat
+spore exec -it child-0 -- /bin/sh
+```
+
 `spore create`, `spore run`, and `spore exec` run shell commands as
 `/bin/sh -lc`. Use `-- <argv...>` when you need exact argv.
 
@@ -331,6 +338,7 @@ mise run smoke:run-stdin
 mise run smoke:run-tty
 mise run smoke:run-attach
 mise run smoke:run-capture
+mise run smoke:lifecycle-tty
 mise run smoke:rootfs-fanout
 mise run smoke:writable-rootfs
 mise run smoke:run-net-dns

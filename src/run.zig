@@ -2643,6 +2643,22 @@ pub fn execRequestWithSession(allocator: std.mem.Allocator, argv: []const []cons
     return execRequestWithSessionOptions(allocator, argv, session_id, .{});
 }
 
+pub const InteractiveExecRequestOptions = struct {
+    interactive: bool = false,
+    tty: bool = false,
+    terminal_name: []const u8 = "xterm",
+    terminal_size: spore_stream.Resize = .{ .rows = 24, .cols = 80 },
+};
+
+pub fn interactiveExecRequestWithSession(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, options: InteractiveExecRequestOptions) ![]const u8 {
+    return execRequestWithSessionOptions(allocator, argv, session_id, .{
+        .interactive = options.interactive,
+        .tty = options.tty,
+        .terminal_name = options.terminal_name,
+        .terminal_size = options.terminal_size,
+    });
+}
+
 pub fn detachedExecRequestWithSession(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8) ![]const u8 {
     try validateGuestArgv(argv);
     const payload = struct {
