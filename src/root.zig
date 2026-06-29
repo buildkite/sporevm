@@ -48,6 +48,7 @@ pub const spore_net = @import("spore_net.zig");
 pub const spore_net_policy = @import("spore_net_policy.zig");
 pub const spore_netd = @import("spore_netd.zig");
 pub const spore_netd_tcp = @import("spore_netd_tcp.zig");
+pub const spore_stream = @import("spore_stream.zig");
 pub const spore = @import("spore.zig");
 pub const system = @import("system.zig");
 pub const kvm = if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)
@@ -104,6 +105,7 @@ test {
     testing.refAllDecls(spore_net_policy);
     testing.refAllDecls(spore_netd);
     testing.refAllDecls(spore_netd_tcp);
+    testing.refAllDecls(spore_stream);
     testing.refAllDecls(system);
     testing.refAllDecls(virtio.queue);
     testing.refAllDecls(virtio.mmio);

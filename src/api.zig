@@ -192,6 +192,7 @@ pub const RunOptions = struct {
     command: []const []const u8,
     guest_env: []const []const u8 = &.{},
     guest_working_dir: ?[]const u8 = null,
+    interactive: bool = false,
     memory: MemoryConfig = .{},
     vcpus: u32 = 1,
     guest_port: u32 = 10700,
@@ -222,6 +223,7 @@ pub const ManagedRunOptions = struct {
     image_pull_policy: ImagePullPolicy = .missing,
     /// Guest command and arguments. The first element is the executable.
     command: []const []const u8,
+    interactive: bool = false,
     memory: MemoryConfig = .{},
     vcpus: u32 = 1,
     guest_port: u32 = 10700,
@@ -249,6 +251,7 @@ pub const RunFromSporeOptions = struct {
     /// Guest command and arguments. The first element is the executable.
     /// Leave empty to attach to the captured default session.
     command: []const []const u8,
+    interactive: bool = false,
     vcpus: u32 = 1,
     guest_port: u32 = 10700,
     timeout_ms: u64 = 30_000,
@@ -724,6 +727,7 @@ pub fn run(
         .command = options.command,
         .guest_env = options.guest_env,
         .guest_working_dir = options.guest_working_dir,
+        .interactive = options.interactive,
         .memory = options.memory,
         .vcpus = options.vcpus,
         .guest_port = options.guest_port,
@@ -777,6 +781,7 @@ pub fn runManaged(
         .rootfs_path = rootfs.path,
         .rootfs = rootfs.rootfs,
         .command = options.command,
+        .interactive = options.interactive,
         .guest_env = rootfs.guest_env,
         .guest_working_dir = rootfs.guest_working_dir,
         .memory = options.memory,
@@ -837,6 +842,7 @@ pub fn runFromSpore(
         .disk = disk,
         .resume_dir = options.spore_dir,
         .command = options.command,
+        .interactive = options.interactive,
         .memory = try memory_config.fromManifestBytes(if (manifest) |parsed| parsed.value.platform.ram_size else manifest_v1.?.value.platform.ram_size),
         .vcpus = manifest_vcpus,
         .guest_port = options.guest_port,

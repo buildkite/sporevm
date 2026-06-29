@@ -110,6 +110,14 @@ spore run -- /bin/writeout
 `spore run` uses the managed SporeVM run kernel and the embedded minimal exec
 initrd.
 
+Forward host stdin explicitly with `-i` when the guest process should read
+input. Without `-i`, runs keep the script-friendly default and do not attach
+host stdin:
+
+```bash
+printf 'hello\n' | spore run -i -- /bin/cat
+```
+
 Override boot assets when needed:
 
 ```bash
@@ -300,6 +308,7 @@ Useful focused checks:
 
 ```bash
 mise run smoke:run
+mise run smoke:run-stdin
 mise run smoke:run-capture
 mise run smoke:rootfs-fanout
 mise run smoke:writable-rootfs

@@ -130,6 +130,7 @@ pub const Options = struct {
     command: []const []const u8,
     guest_env: []const []const u8 = &.{},
     guest_working_dir: ?[]const u8 = null,
+    interactive: bool = false,
     memory: memory_config.Config = .{},
     vcpus: topology.VcpuCount = 1,
     guest_port: u32 = 10700,
@@ -663,6 +664,13 @@ pub const EventWriter = struct {
 };
 
 pub fn classifyFailure(err: anyerror) ClassifiedFailure {
+    if (err == error.InteractiveStreamProtocolFailed) {
+        return machine_output.CliError.init(
+            .runtime_start_failed,
+            "spore run: interactive stream protocol failed; ensure the guest initrd supports start-v1 or omit -i",
+            @errorName(err),
+        );
+    }
     return machine_output.fromZigError(err);
 }
 
@@ -729,6 +737,7 @@ pub const CliOptions = struct {
     network_requested: bool = false,
     network_policy: spore_net_policy.Config = .{},
     event_mode: EventMode = .none,
+    interactive: bool = false,
     command_mode: CommandMode = .argv,
     command: []const []const u8,
 };
@@ -774,6 +783,7 @@ pub const cli_usage =
     \\  --timeout-ms N          Probe timeout in milliseconds (default: 30000)
     \\  --console-log PATH      Write guest console output to PATH
     \\  --events=jsonl          Emit lifecycle and guest output events as JSONL on stdout
+    \\  -i, --interactive       Keep stdin open and forward it to the guest process
     \\  -- <argv...>            Run exact argv instead of /bin/sh -lc
     \\  -h, --help              Show this help
     \\
@@ -794,6 +804,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     var network_requested = false;
     var network_policy = spore_net_policy.Config{};
     var event_mode: EventMode = .none;
+    var interactive = false;
     var command_mode: CommandMode = .shell;
     var command_had_delimiter = false;
     var command: ?[]const []const u8 = null;
@@ -852,6 +863,8 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
                 std.debug.print("--events must be jsonl\n", .{});
                 std.process.exit(2);
             };
+        } else if (std.mem.eql(u8, args[i], "-i") or std.mem.eql(u8, args[i], "--interactive")) {
+            interactive = true;
         } else if (std.mem.eql(u8, args[i], "--net")) {
             network = .spore;
             network_requested = true;
@@ -946,6 +959,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         .network_requested = network_requested,
         .network_policy = network_policy,
         .event_mode = event_mode,
+        .interactive = interactive,
         .command_mode = command_mode,
         .command = argv,
     };
@@ -1846,6 +1860,168 @@ fn failRunSetup(comptime fmt: []const u8, args: anytype) noreturn {
     std.process.exit(2);
 }
 
+const SpinLock = struct {
+    locked: std.atomic.Value(bool) = .init(false),
+
+    fn lock(self: *SpinLock) void {
+        while (self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+            std.Thread.yield() catch {};
+        }
+    }
+
+    fn unlock(self: *SpinLock) void {
+        self.locked.store(false, .release);
+    }
+};
+
+const RunStdinControl = struct {
+    stream: *vsock.HostStream,
+    thread: ?std.Thread = null,
+    stop_pipe: [2]std.c.fd_t = .{ -1, -1 },
+    stop: std.atomic.Value(bool) = .init(false),
+    failed: std.atomic.Value(bool) = .init(false),
+    wake_lock: SpinLock = .{},
+    wake: ?vsock.Wake = null,
+
+    fn init(stream: *vsock.HostStream) RunStdinControl {
+        return .{ .stream = stream };
+    }
+
+    fn start(self: *RunStdinControl) !void {
+        if (std.c.pipe(&self.stop_pipe) != 0) return error.StdinPumpStartFailed;
+        errdefer self.closeStopPipe();
+        self.thread = try std.Thread.spawn(.{}, stdinThreadMain, .{self});
+    }
+
+    fn deinit(self: *RunStdinControl) void {
+        self.stop.store(true, .release);
+        if (self.stop_pipe[1] >= 0) {
+            const byte = [_]u8{1};
+            _ = std.c.write(self.stop_pipe[1], &byte, byte.len);
+        }
+        if (self.thread) |thread| {
+            thread.join();
+            self.thread = null;
+        }
+        self.closeStopPipe();
+    }
+
+    fn control(self: *RunStdinControl) vsock.Control {
+        return .{
+            .context = self,
+            .pollFn = pollThunk,
+            .setWakeFn = setWakeThunk,
+            .completeSnapshotFn = completeSnapshotThunk,
+            .reportStatsFn = reportStatsThunk,
+        };
+    }
+
+    fn closeStopPipe(self: *RunStdinControl) void {
+        if (self.stop_pipe[0] >= 0) {
+            _ = std.c.close(self.stop_pipe[0]);
+            self.stop_pipe[0] = -1;
+        }
+        if (self.stop_pipe[1] >= 0) {
+            _ = std.c.close(self.stop_pipe[1]);
+            self.stop_pipe[1] = -1;
+        }
+    }
+
+    fn stdinThreadMain(self: *RunStdinControl) void {
+        var buf: [4096]u8 = undefined;
+        while (!self.stop.load(.acquire)) {
+            var fds = [_]std.posix.pollfd{
+                .{ .fd = 0, .events = std.c.POLL.IN | std.c.POLL.HUP | std.c.POLL.ERR, .revents = 0 },
+                .{ .fd = self.stop_pipe[0], .events = std.c.POLL.IN, .revents = 0 },
+            };
+            const ready = std.posix.poll(&fds, -1) catch {
+                self.markFailed();
+                return;
+            };
+            if (ready == 0) continue;
+            if ((fds[1].revents & std.c.POLL.IN) != 0 or self.stop.load(.acquire)) return;
+            if ((fds[0].revents & (std.c.POLL.ERR | std.c.POLL.NVAL)) != 0) {
+                self.markFailed();
+                return;
+            }
+            if ((fds[0].revents & (std.c.POLL.IN | std.c.POLL.HUP)) == 0) continue;
+            const n = std.c.read(0, &buf, buf.len);
+            if (n < 0) {
+                switch (std.c.errno(n)) {
+                    .INTR => continue,
+                    else => {
+                        self.markFailed();
+                        return;
+                    },
+                }
+            }
+            if (n == 0) {
+                _ = self.stream.enqueueStdinCloseBlocking(&self.stop) catch {
+                    self.markFailed();
+                    return;
+                };
+                self.wakeBackend();
+                return;
+            }
+            const bytes = buf[0..@intCast(n)];
+            const queued = self.stream.enqueueStdinDataBlocking(bytes, &self.stop) catch {
+                self.markFailed();
+                return;
+            };
+            if (!queued) return;
+            self.wakeBackend();
+        }
+    }
+
+    fn markFailed(self: *RunStdinControl) void {
+        self.failed.store(true, .release);
+        self.wakeBackend();
+    }
+
+    fn wakeBackend(self: *RunStdinControl) void {
+        self.wake_lock.lock();
+        const wake = self.wake;
+        self.wake_lock.unlock();
+        if (wake) |target| target.wake();
+    }
+
+    fn poll(self: *RunStdinControl, dev: *vsock.Vsock) !vsock.ControlAction {
+        if (self.failed.load(.acquire)) self.stream.fail();
+        _ = try dev.flushHostStreamOutbound();
+        return .keep_running;
+    }
+
+    fn setWake(self: *RunStdinControl, wake: vsock.Wake) void {
+        self.wake_lock.lock();
+        defer self.wake_lock.unlock();
+        self.wake = wake;
+    }
+
+    fn completeSnapshot(_: *RunStdinControl, _: []const u8) !void {}
+
+    fn reportStats(_: *RunStdinControl, _: vsock.ControlStats) void {}
+
+    fn pollThunk(context: *anyopaque, dev: *vsock.Vsock) !vsock.ControlAction {
+        const self: *RunStdinControl = @ptrCast(@alignCast(context));
+        return self.poll(dev);
+    }
+
+    fn setWakeThunk(context: *anyopaque, wake: vsock.Wake) void {
+        const self: *RunStdinControl = @ptrCast(@alignCast(context));
+        self.setWake(wake);
+    }
+
+    fn completeSnapshotThunk(context: *anyopaque, dir: []const u8) !void {
+        const self: *RunStdinControl = @ptrCast(@alignCast(context));
+        try self.completeSnapshot(dir);
+    }
+
+    fn reportStatsThunk(context: *anyopaque, stats: vsock.ControlStats) void {
+        const self: *RunStdinControl = @ptrCast(@alignCast(context));
+        self.reportStats(stats);
+    }
+};
+
 pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !Result {
     var events = EventEmitter.init(opts.events, "run");
     try events.emitStart(opts.backend);
@@ -1897,7 +2073,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     const boot_args = if (resuming) "" else try cmdline(allocator, opts.guest_port, opts.rootfs_path != null, rootfsWritable(opts), opts.network);
     const request_start = monotonicMs();
     const request = try execRequestForRun(context, allocator, opts, memory_plan.virtio_mem_region_size != 0);
-    var stream = try vsock.HostStream.init(opts.guest_port, request);
+    var stream = try vsock.HostStream.initWithProtocol(opts.guest_port, request, if (opts.interactive) .spore_stream_v1 else .legacy_text);
     const request_ms = monotonicMs() -| request_start;
     if (resuming) stream.host_port = vsock.HostStream.deriveHostPort(request);
     if (opts.events != null) {
@@ -1906,6 +2082,10 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     } else if (opts.stream_output) {
         stream.setOutputSink(null, runOutputSink);
     }
+    var stdin_control = if (opts.interactive) RunStdinControl.init(&stream) else null;
+    if (stdin_control) |*control| try control.start();
+    defer if (stdin_control) |*control| control.deinit();
+    const exec_control = if (stdin_control) |*control| control.control() else null;
     var capture_request = capture.Request{};
     var signal_registration: ?capture.SignalRegistration = null;
     defer if (signal_registration) |*registration| registration.deinit();
@@ -1954,6 +2134,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
                 .resume_dir = opts.resume_dir,
                 .ram_backing_fd = local_backing.fd,
                 .exec_probe = &stream,
+                .exec_control = exec_control,
                 .exec_probe_timeout_ms = opts.timeout_ms,
                 .snapshot_dir = capture_plan.snapshot_dir,
                 .snapshot_on_probe_complete = capture_plan.snapshot_on_probe_complete,
@@ -1982,6 +2163,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
                 .resume_dir = opts.resume_dir,
                 .ram_backing_fd = local_backing.fd,
                 .exec_probe = &stream,
+                .exec_control = exec_control,
                 .exec_probe_timeout_ms = opts.timeout_ms,
                 .snapshot_dir = capture_plan.snapshot_dir,
                 .snapshot_on_probe_complete = capture_plan.snapshot_on_probe_complete,
@@ -1993,6 +2175,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
             });
         },
     }) catch |err| {
+        if (opts.interactive and err == error.VsockProbeFailed) return error.InteractiveStreamProtocolFailed;
         if (capture_plan.isSignalCapture() and capture_request.isCompleted() and isCaptureAborted(err)) {
             var result = resultFromAbortedSignalCapture(backend, opts, &stream);
             if (resuming) result = result.withMemoryRestore(local_backing);
@@ -2235,6 +2418,7 @@ fn execRequestForRun(context: Context, allocator: std.mem.Allocator, opts: Optio
         .working_dir = opts.guest_working_dir,
         .resume_time_unix_ns = resume_time_unix_ns,
         .memory_pressure = memory_pressure,
+        .interactive = opts.interactive,
     });
 
     const now = Io.Clock.real.now(context.io).nanoseconds;
@@ -2245,6 +2429,7 @@ fn execRequestForRun(context: Context, allocator: std.mem.Allocator, opts: Optio
     return execRequestWithSessionOptions(allocator, opts.command, session_id, .{
         .resume_time_unix_ns = resume_time_unix_ns,
         .memory_pressure = memory_pressure,
+        .interactive = opts.interactive,
     });
 }
 
@@ -2291,11 +2476,14 @@ const GuestExecOptions = struct {
     working_dir: ?[]const u8 = null,
     resume_time_unix_ns: u64 = 0,
     memory_pressure: bool = false,
+    interactive: bool = false,
 };
 
 fn execRequestWithSessionOptions(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, options: GuestExecOptions) ![]const u8 {
     try validateGuestArgv(argv);
     try validateGuestExecOptions(options);
+    if (options.interactive) return execV1RequestWithSessionOptions(allocator, argv, session_id, options);
+
     const payload = struct {
         type: []const u8 = "start",
         session_id: []const u8,
@@ -2303,6 +2491,31 @@ fn execRequestWithSessionOptions(allocator: std.mem.Allocator, argv: []const []c
         argv: []const []const u8,
         env: []const []const u8,
         working_dir: []const u8,
+        memory_pressure: bool,
+        closed_env: bool = true,
+    }{
+        .session_id = session_id,
+        .resume_time_unix_ns = options.resume_time_unix_ns,
+        .argv = argv,
+        .env = options.env,
+        .working_dir = options.working_dir orelse "",
+        .memory_pressure = options.memory_pressure,
+    };
+    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+    defer allocator.free(json);
+    if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
+    return std.fmt.allocPrint(allocator, "{s}\n", .{json});
+}
+
+fn execV1RequestWithSessionOptions(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, options: GuestExecOptions) ![]const u8 {
+    const payload = struct {
+        type: []const u8 = "start-v1",
+        session_id: []const u8,
+        resume_time_unix_ns: u64,
+        argv: []const []const u8,
+        env: []const []const u8,
+        working_dir: []const u8,
+        stdio: []const u8 = "pipe",
         memory_pressure: bool,
         closed_env: bool = true,
     }{
@@ -2696,6 +2909,13 @@ test "event writer emits exactly one terminal failure" {
     try expectNestedJsonStringField(allocator, failure_line, "error", "code", "cache.integrity_failed");
 }
 
+test "interactive stream protocol failure has a clear public message" {
+    const classified = classifyFailure(error.InteractiveStreamProtocolFailed);
+    try std.testing.expectEqual(machine_output.ErrorCode.runtime_start_failed, classified.code);
+    try std.testing.expect(std.mem.indexOf(u8, classified.message, "start-v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, classified.message, "omit -i") != null);
+}
+
 test "event writer emits network denied events" {
     const allocator = std.testing.allocator;
     var out: Io.Writer.Allocating = .init(allocator);
@@ -2755,6 +2975,14 @@ test "run request rejects encoded line overflow" {
     var env: [max_guest_envc][]const u8 = undefined;
     for (&env) |*slot| slot.* = env_entry[0..];
     try std.testing.expectError(error.RunRequestTooLarge, execRequestWithSessionOptions(std.testing.allocator, &.{"/bin/true"}, "default", .{ .env = &env }));
+}
+
+test "interactive run request uses start v1 pipe stdio" {
+    const request = try execRequestWithSessionOptions(std.testing.allocator, &.{"/bin/cat"}, "default", .{ .interactive = true });
+    defer std.testing.allocator.free(request);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"type\":\"start-v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"stdio\":\"pipe\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"argv\":[\"/bin/cat\"]") != null);
 }
 
 fn testDiskGuardManifest(with_disk: bool) spore.Manifest {
@@ -2819,6 +3047,14 @@ test "run cli parser accepts command after separator" {
     try std.testing.expectEqual(CommandMode.argv, opts.command_mode);
     try std.testing.expectEqual(@as(usize, 1), opts.command.len);
     try std.testing.expectEqualStrings("/bin/true", opts.command[0]);
+}
+
+test "run cli parser accepts interactive stdin" {
+    const opts = try parseCliArgs(&.{ "-i", "--image", "docker.io/library/alpine:3.20", "--", "/bin/cat" });
+    try std.testing.expect(opts.interactive);
+    try std.testing.expectEqual(CommandMode.argv, opts.command_mode);
+    try std.testing.expectEqual(@as(usize, 1), opts.command.len);
+    try std.testing.expectEqualStrings("/bin/cat", opts.command[0]);
 }
 
 test "run cli parser accepts shell command without separator" {
