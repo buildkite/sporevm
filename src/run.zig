@@ -24,6 +24,7 @@ const runtime_disk_mod = @import("runtime_disk.zig");
 const run_assets = @import("run_assets");
 const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
+const spore_stream = @import("spore_stream.zig");
 const topology = @import("topology.zig");
 const virtio_net = @import("virtio/net.zig");
 const vsock = @import("virtio/vsock.zig");
@@ -131,6 +132,7 @@ pub const Options = struct {
     guest_env: []const []const u8 = &.{},
     guest_working_dir: ?[]const u8 = null,
     interactive: bool = false,
+    tty: bool = false,
     memory: memory_config.Config = .{},
     vcpus: topology.VcpuCount = 1,
     guest_port: u32 = 10700,
@@ -265,6 +267,7 @@ pub const RunEvent = union(enum) {
     network: NetworkAuditEvent,
     stdout: OutputEvent,
     stderr: OutputEvent,
+    terminal: OutputEvent,
     exit: ExitEvent,
     failure: FailureEvent,
 };
@@ -308,6 +311,7 @@ pub const EventEmitter = struct {
     terminal_emitted: bool = false,
     stdout_offset: u64 = 0,
     stderr_offset: u64 = 0,
+    terminal_offset: u64 = 0,
     write_failed: bool = false,
 
     pub fn init(sink: ?EventSink, command: []const u8) EventEmitter {
@@ -334,16 +338,19 @@ pub const EventEmitter = struct {
         const offset = switch (output) {
             .stdout => self.stdout_offset,
             .stderr => self.stderr_offset,
+            .terminal => self.terminal_offset,
         };
         const event: RunEvent = switch (output) {
             .stdout => .{ .stdout = .{ .command = self.command, .backend = self.backend, .offset = offset, .bytes = bytes } },
             .stderr => .{ .stderr = .{ .command = self.command, .backend = self.backend, .offset = offset, .bytes = bytes } },
+            .terminal => .{ .terminal = .{ .command = self.command, .backend = self.backend, .offset = offset, .bytes = bytes } },
         };
         if (self.sink) |sink| try sink.emit(event);
         const inc: u64 = @intCast(bytes.len);
         switch (output) {
             .stdout => self.stdout_offset += inc,
             .stderr => self.stderr_offset += inc,
+            .terminal => self.terminal_offset += inc,
         }
     }
 
@@ -428,6 +435,7 @@ pub const EventWriter = struct {
     terminal_emitted: bool = false,
     stdout_offset: u64 = 0,
     stderr_offset: u64 = 0,
+    terminal_offset: u64 = 0,
     write_failed: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, writer: *Io.Writer, command: []const u8) EventWriter {
@@ -457,6 +465,7 @@ pub const EventWriter = struct {
             .network => |value| try self.emitNetworkEvent(value),
             .stdout => |value| try self.emitOutputEvent("stdout", value),
             .stderr => |value| try self.emitOutputEvent("stderr", value),
+            .terminal => |value| try self.emitOutputEvent("terminal", value),
             .exit => |value| try self.emitExitEvent(value),
             .failure => |value| try self.emitFailure(value.classified),
         }
@@ -592,6 +601,7 @@ pub const EventWriter = struct {
         const offset = switch (output) {
             .stdout => self.stdout_offset,
             .stderr => self.stderr_offset,
+            .terminal => self.terminal_offset,
         };
         const data_base64 = try base64Alloc(self.allocator, bytes);
         defer self.allocator.free(data_base64);
@@ -617,6 +627,7 @@ pub const EventWriter = struct {
         switch (output) {
             .stdout => self.stdout_offset += inc,
             .stderr => self.stderr_offset += inc,
+            .terminal => self.terminal_offset += inc,
         }
     }
 
@@ -664,10 +675,17 @@ pub const EventWriter = struct {
 };
 
 pub fn classifyFailure(err: anyerror) ClassifiedFailure {
+    if (err == error.TtyRunFromSporeUnsupported) {
+        return machine_output.CliError.init(
+            .usage_invalid_argument,
+            "spore run: -t with --from is not supported yet",
+            @errorName(err),
+        );
+    }
     if (err == error.InteractiveStreamProtocolFailed) {
         return machine_output.CliError.init(
             .runtime_start_failed,
-            "spore run: interactive stream protocol failed; ensure the guest initrd supports start-v1 or omit -i",
+            "spore run: interactive stream protocol failed; ensure the guest initrd supports start-v1 or omit -i/-t",
             @errorName(err),
         );
     }
@@ -738,6 +756,7 @@ pub const CliOptions = struct {
     network_policy: spore_net_policy.Config = .{},
     event_mode: EventMode = .none,
     interactive: bool = false,
+    tty: bool = false,
     command_mode: CommandMode = .argv,
     command: []const []const u8,
 };
@@ -784,6 +803,7 @@ pub const cli_usage =
     \\  --console-log PATH      Write guest console output to PATH
     \\  --events=jsonl          Emit lifecycle and guest output events as JSONL on stdout
     \\  -i, --interactive       Keep stdin open and forward it to the guest process
+    \\  -t, --tty               Allocate a guest terminal for the process
     \\  -- <argv...>            Run exact argv instead of /bin/sh -lc
     \\  -h, --help              Show this help
     \\
@@ -805,6 +825,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     var network_policy = spore_net_policy.Config{};
     var event_mode: EventMode = .none;
     var interactive = false;
+    var tty = false;
     var command_mode: CommandMode = .shell;
     var command_had_delimiter = false;
     var command: ?[]const []const u8 = null;
@@ -865,6 +886,11 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
             };
         } else if (std.mem.eql(u8, args[i], "-i") or std.mem.eql(u8, args[i], "--interactive")) {
             interactive = true;
+        } else if (std.mem.eql(u8, args[i], "-t") or std.mem.eql(u8, args[i], "--tty")) {
+            tty = true;
+        } else if (std.mem.eql(u8, args[i], "-it") or std.mem.eql(u8, args[i], "-ti")) {
+            interactive = true;
+            tty = true;
         } else if (std.mem.eql(u8, args[i], "--net")) {
             network = .spore;
             network_requested = true;
@@ -960,6 +986,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         .network_policy = network_policy,
         .event_mode = event_mode,
         .interactive = interactive,
+        .tty = tty,
         .command_mode = command_mode,
         .command = argv,
     };
@@ -1860,37 +1887,42 @@ fn failRunSetup(comptime fmt: []const u8, args: anytype) noreturn {
     std.process.exit(2);
 }
 
-const SpinLock = struct {
-    locked: std.atomic.Value(bool) = .init(false),
-
-    fn lock(self: *SpinLock) void {
-        while (self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
-            std.Thread.yield() catch {};
-        }
-    }
-
-    fn unlock(self: *SpinLock) void {
-        self.locked.store(false, .release);
-    }
-};
-
 const RunStdinControl = struct {
     stream: *vsock.HostStream,
+    terminal: bool,
+    forward_input: bool,
+    resize_fd: std.c.fd_t,
     thread: ?std.Thread = null,
     stop_pipe: [2]std.c.fd_t = .{ -1, -1 },
     stop: std.atomic.Value(bool) = .init(false),
     failed: std.atomic.Value(bool) = .init(false),
-    wake_lock: SpinLock = .{},
-    wake: ?vsock.Wake = null,
+    resize_count: std.atomic.Value(u32) = .init(0),
+    resize_seen: u32 = 0,
+    wake_context_addr: std.atomic.Value(usize) = .init(0),
+    wake_fn_addr: std.atomic.Value(usize) = .init(0),
+    resize_registration: ?TerminalResizeRegistration = null,
+    raw_terminal: ?RawTerminal = null,
 
-    fn init(stream: *vsock.HostStream) RunStdinControl {
-        return .{ .stream = stream };
+    fn init(stream: *vsock.HostStream, terminal: bool, forward_input: bool, resize_fd: std.c.fd_t) RunStdinControl {
+        return .{
+            .stream = stream,
+            .terminal = terminal,
+            .forward_input = forward_input,
+            .resize_fd = resize_fd,
+        };
     }
 
-    fn start(self: *RunStdinControl) !void {
-        if (std.c.pipe(&self.stop_pipe) != 0) return error.StdinPumpStartFailed;
-        errdefer self.closeStopPipe();
-        self.thread = try std.Thread.spawn(.{}, stdinThreadMain, .{self});
+    fn start(self: *RunStdinControl, raw_terminal: bool) !void {
+        errdefer self.deinit();
+        if (raw_terminal) self.raw_terminal = try RawTerminal.enable();
+        if (self.terminal) {
+            self.resize_registration = TerminalResizeRegistration.install(self);
+            self.notifyResize();
+        }
+        if (self.forward_input) {
+            if (std.c.pipe(&self.stop_pipe) != 0) return error.StdinPumpStartFailed;
+            self.thread = try std.Thread.spawn(.{}, stdinThreadMain, .{self});
+        }
     }
 
     fn deinit(self: *RunStdinControl) void {
@@ -1902,6 +1934,14 @@ const RunStdinControl = struct {
         if (self.thread) |thread| {
             thread.join();
             self.thread = null;
+        }
+        if (self.resize_registration) |*registration| {
+            registration.deinit();
+            self.resize_registration = null;
+        }
+        if (self.raw_terminal) |*raw| {
+            raw.deinit();
+            self.raw_terminal = null;
         }
         self.closeStopPipe();
     }
@@ -1956,7 +1996,11 @@ const RunStdinControl = struct {
                 }
             }
             if (n == 0) {
-                _ = self.stream.enqueueStdinCloseBlocking(&self.stop) catch {
+                const queued = if (self.terminal)
+                    self.stream.enqueueTerminalCloseBlocking(&self.stop)
+                else
+                    self.stream.enqueueStdinCloseBlocking(&self.stop);
+                _ = queued catch {
                     self.markFailed();
                     return;
                 };
@@ -1964,7 +2008,10 @@ const RunStdinControl = struct {
                 return;
             }
             const bytes = buf[0..@intCast(n)];
-            const queued = self.stream.enqueueStdinDataBlocking(bytes, &self.stop) catch {
+            const queued = (if (self.terminal)
+                self.stream.enqueueTerminalDataBlocking(bytes, &self.stop)
+            else
+                self.stream.enqueueStdinDataBlocking(bytes, &self.stop)) catch {
                 self.markFailed();
                 return;
             };
@@ -1978,23 +2025,39 @@ const RunStdinControl = struct {
         self.wakeBackend();
     }
 
+    fn notifyResize(self: *RunStdinControl) void {
+        _ = self.resize_count.fetchAdd(1, .acq_rel);
+        self.wakeBackend();
+    }
+
     fn wakeBackend(self: *RunStdinControl) void {
-        self.wake_lock.lock();
-        const wake = self.wake;
-        self.wake_lock.unlock();
-        if (wake) |target| target.wake();
+        const wake_fn_addr = self.wake_fn_addr.load(.acquire);
+        if (wake_fn_addr == 0) return;
+        const wake_context_addr = self.wake_context_addr.load(.acquire);
+        const wake = vsock.Wake{
+            .context = @ptrFromInt(wake_context_addr),
+            .wakeFn = @ptrFromInt(wake_fn_addr),
+        };
+        wake.wake();
     }
 
     fn poll(self: *RunStdinControl, dev: *vsock.Vsock) !vsock.ControlAction {
         if (self.failed.load(.acquire)) self.stream.fail();
+        if (self.terminal) {
+            const count = self.resize_count.load(.acquire);
+            if (count != self.resize_seen) {
+                self.resize_seen = count;
+                const resize = terminalSizeOrDefault(self.resize_fd);
+                _ = try self.stream.enqueueResizeBlocking(resize, &self.stop);
+            }
+        }
         _ = try dev.flushHostStreamOutbound();
         return .keep_running;
     }
 
     fn setWake(self: *RunStdinControl, wake: vsock.Wake) void {
-        self.wake_lock.lock();
-        defer self.wake_lock.unlock();
-        self.wake = wake;
+        self.wake_context_addr.store(@intFromPtr(wake.context), .release);
+        self.wake_fn_addr.store(@intFromPtr(wake.wakeFn), .release);
     }
 
     fn completeSnapshot(_: *RunStdinControl, _: []const u8) !void {}
@@ -2022,6 +2085,62 @@ const RunStdinControl = struct {
     }
 };
 
+const RawTerminal = struct {
+    saved: std.c.termios,
+    active: bool = true,
+
+    fn enable() !RawTerminal {
+        var current: std.c.termios = undefined;
+        if (std.c.tcgetattr(0, &current) != 0) return error.TerminalRawModeFailed;
+        var raw = current;
+        raw.iflag.ICRNL = false;
+        raw.iflag.IXON = false;
+        raw.lflag.ICANON = false;
+        raw.lflag.ECHO = false;
+        raw.lflag.ISIG = false;
+        raw.oflag.OPOST = false;
+        if (std.c.tcsetattr(0, .NOW, &raw) != 0) return error.TerminalRawModeFailed;
+        return .{ .saved = current };
+    }
+
+    fn deinit(self: *RawTerminal) void {
+        if (!self.active) return;
+        var saved = self.saved;
+        _ = std.c.tcsetattr(0, .NOW, &saved);
+        self.active = false;
+    }
+};
+
+var active_terminal_resize: ?*RunStdinControl = null;
+
+const TerminalResizeRegistration = struct {
+    old_action: std.posix.Sigaction,
+    active: bool = true,
+
+    fn install(control: *RunStdinControl) TerminalResizeRegistration {
+        active_terminal_resize = control;
+        var old_action: std.posix.Sigaction = undefined;
+        const action = std.posix.Sigaction{
+            .handler = .{ .sigaction = handleTerminalResize },
+            .mask = std.posix.sigemptyset(),
+            .flags = std.posix.SA.SIGINFO,
+        };
+        std.posix.sigaction(.WINCH, &action, &old_action);
+        return .{ .old_action = old_action };
+    }
+
+    fn deinit(self: *TerminalResizeRegistration) void {
+        if (!self.active) return;
+        std.posix.sigaction(.WINCH, &self.old_action, null);
+        if (active_terminal_resize != null) active_terminal_resize = null;
+        self.active = false;
+    }
+};
+
+fn handleTerminalResize(_: std.posix.SIG, _: *const std.posix.siginfo_t, _: ?*anyopaque) callconv(.c) void {
+    if (active_terminal_resize) |control| control.notifyResize();
+}
+
 pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !Result {
     var events = EventEmitter.init(opts.events, "run");
     try events.emitStart(opts.backend);
@@ -2030,6 +2149,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     const setup_start = monotonicMs();
     try topology.validateVcpuCount(opts.vcpus);
     try spore.validateAnnotations(opts.annotations);
+    if (opts.tty and opts.resume_dir != null) return error.TtyRunFromSporeUnsupported;
 
     const backend = try opts.backend.resolveForHost();
     events.setBackend(backend);
@@ -2073,7 +2193,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     const boot_args = if (resuming) "" else try cmdline(allocator, opts.guest_port, opts.rootfs_path != null, rootfsWritable(opts), opts.network);
     const request_start = monotonicMs();
     const request = try execRequestForRun(context, allocator, opts, memory_plan.virtio_mem_region_size != 0);
-    var stream = try vsock.HostStream.initWithProtocol(opts.guest_port, request, if (opts.interactive) .spore_stream_v1 else .legacy_text);
+    var stream = try vsock.HostStream.initWithProtocol(opts.guest_port, request, if (opts.interactive or opts.tty) .spore_stream_v1 else .legacy_text);
     const request_ms = monotonicMs() -| request_start;
     if (resuming) stream.host_port = vsock.HostStream.deriveHostPort(request);
     if (opts.events != null) {
@@ -2082,8 +2202,8 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     } else if (opts.stream_output) {
         stream.setOutputSink(null, runOutputSink);
     }
-    var stdin_control = if (opts.interactive) RunStdinControl.init(&stream) else null;
-    if (stdin_control) |*control| try control.start();
+    var stdin_control = if (opts.interactive or opts.tty) RunStdinControl.init(&stream, opts.tty, opts.interactive, terminalSizeFd()) else null;
+    if (stdin_control) |*control| try control.start(opts.tty and opts.interactive);
     defer if (stdin_control) |*control| control.deinit();
     const exec_control = if (stdin_control) |*control| control.control() else null;
     var capture_request = capture.Request{};
@@ -2175,7 +2295,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
             });
         },
     }) catch |err| {
-        if (opts.interactive and err == error.VsockProbeFailed) return error.InteractiveStreamProtocolFailed;
+        if ((opts.interactive or opts.tty) and err == error.VsockProbeFailed) return error.InteractiveStreamProtocolFailed;
         if (capture_plan.isSignalCapture() and capture_request.isCompleted() and isCaptureAborted(err)) {
             var result = resultFromAbortedSignalCapture(backend, opts, &stream);
             if (resuming) result = result.withMemoryRestore(local_backing);
@@ -2362,6 +2482,7 @@ fn runOutputSink(_: ?*anyopaque, output: vsock.HostStreamOutput, bytes: []const 
     const fd: std.c.fd_t = switch (output) {
         .stdout => 1,
         .stderr => 2,
+        .terminal => 1,
     };
     fd_util.writeAllBestEffort(fd, bytes);
 }
@@ -2410,6 +2531,32 @@ pub fn execRequest(allocator: std.mem.Allocator, argv: []const []const u8) ![]co
     return execRequestWithSession(allocator, argv, "default");
 }
 
+fn terminalName(environ: *const std.process.Environ.Map) []const u8 {
+    return environ.get("TERM") orelse "xterm";
+}
+
+fn ioctlRequest(comptime request: anytype) c_int {
+    const raw: u32 = @truncate(@as(usize, request));
+    return @bitCast(raw);
+}
+
+fn terminalSizeOrDefault(fd: std.c.fd_t) spore_stream.Resize {
+    var size: std.posix.winsize = .{
+        .row = 0,
+        .col = 0,
+        .xpixel = 0,
+        .ypixel = 0,
+    };
+    if (std.c.ioctl(fd, ioctlRequest(std.posix.T.IOCGWINSZ), &size) == 0 and size.row > 0 and size.col > 0) {
+        return .{ .rows = size.row, .cols = size.col };
+    }
+    return .{ .rows = 24, .cols = 80 };
+}
+
+fn terminalSizeFd() std.c.fd_t {
+    return if (std.c.isatty(1) != 0) 1 else if (std.c.isatty(0) != 0) 0 else 1;
+}
+
 fn execRequestForRun(context: Context, allocator: std.mem.Allocator, opts: Options, memory_pressure: bool) ![]const u8 {
     const resume_time_unix_ns: u64 = @intCast(Io.Clock.real.now(context.io).nanoseconds);
     if (opts.resume_dir != null and opts.command.len == 0) return attachRequest(allocator);
@@ -2419,6 +2566,9 @@ fn execRequestForRun(context: Context, allocator: std.mem.Allocator, opts: Optio
         .resume_time_unix_ns = resume_time_unix_ns,
         .memory_pressure = memory_pressure,
         .interactive = opts.interactive,
+        .tty = opts.tty,
+        .terminal_name = terminalName(context.environ_map),
+        .terminal_size = terminalSizeOrDefault(terminalSizeFd()),
     });
 
     const now = Io.Clock.real.now(context.io).nanoseconds;
@@ -2430,6 +2580,9 @@ fn execRequestForRun(context: Context, allocator: std.mem.Allocator, opts: Optio
         .resume_time_unix_ns = resume_time_unix_ns,
         .memory_pressure = memory_pressure,
         .interactive = opts.interactive,
+        .tty = opts.tty,
+        .terminal_name = terminalName(context.environ_map),
+        .terminal_size = terminalSizeOrDefault(terminalSizeFd()),
     });
 }
 
@@ -2477,12 +2630,15 @@ const GuestExecOptions = struct {
     resume_time_unix_ns: u64 = 0,
     memory_pressure: bool = false,
     interactive: bool = false,
+    tty: bool = false,
+    terminal_name: []const u8 = "xterm",
+    terminal_size: spore_stream.Resize = .{ .rows = 24, .cols = 80 },
 };
 
 fn execRequestWithSessionOptions(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, options: GuestExecOptions) ![]const u8 {
     try validateGuestArgv(argv);
     try validateGuestExecOptions(options);
-    if (options.interactive) return execV1RequestWithSessionOptions(allocator, argv, session_id, options);
+    if (options.interactive or options.tty) return execV1RequestWithSessionOptions(allocator, argv, session_id, options);
 
     const payload = struct {
         type: []const u8 = "start",
@@ -2515,7 +2671,10 @@ fn execV1RequestWithSessionOptions(allocator: std.mem.Allocator, argv: []const [
         argv: []const []const u8,
         env: []const []const u8,
         working_dir: []const u8,
-        stdio: []const u8 = "pipe",
+        stdio: []const u8,
+        term: []const u8,
+        terminal_rows: u16,
+        terminal_cols: u16,
         memory_pressure: bool,
         closed_env: bool = true,
     }{
@@ -2524,6 +2683,10 @@ fn execV1RequestWithSessionOptions(allocator: std.mem.Allocator, argv: []const [
         .argv = argv,
         .env = options.env,
         .working_dir = options.working_dir orelse "",
+        .stdio = if (options.tty) "tty" else "pipe",
+        .term = options.terminal_name,
+        .terminal_rows = options.terminal_size.rows,
+        .terminal_cols = options.terminal_size.cols,
         .memory_pressure = options.memory_pressure,
     };
     const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
@@ -2913,7 +3076,32 @@ test "interactive stream protocol failure has a clear public message" {
     const classified = classifyFailure(error.InteractiveStreamProtocolFailed);
     try std.testing.expectEqual(machine_output.ErrorCode.runtime_start_failed, classified.code);
     try std.testing.expect(std.mem.indexOf(u8, classified.message, "start-v1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, classified.message, "omit -i") != null);
+    try std.testing.expect(std.mem.indexOf(u8, classified.message, "omit -i/-t") != null);
+}
+
+test "tty run-from unsupported failure has a clear public message" {
+    const classified = classifyFailure(error.TtyRunFromSporeUnsupported);
+    try std.testing.expectEqual(machine_output.ErrorCode.usage_invalid_argument, classified.code);
+    try std.testing.expect(std.mem.indexOf(u8, classified.message, "-t with --from") != null);
+}
+
+test "event writer emits terminal output records" {
+    const allocator = std.testing.allocator;
+    var out: Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var events = EventWriter.init(allocator, &out.writer, "run");
+    const sink = events.sink();
+
+    try sink.emit(.{ .terminal = .{ .command = "run", .backend = .hvf, .offset = 0, .bytes = "$ " } });
+
+    var lines = std.mem.splitScalar(u8, out.written(), '\n');
+    const ready_line = lines.next().?;
+    const terminal_line = lines.next().?;
+    try std.testing.expectEqualStrings("", lines.next().?);
+    try expectJsonStringField(allocator, ready_line, "event", "ready");
+    try expectJsonStringField(allocator, terminal_line, "event", "terminal");
+    try expectJsonStringField(allocator, terminal_line, "data_base64", "JCA=");
+    try expectJsonIntegerField(allocator, terminal_line, "offset", 0);
 }
 
 test "event writer emits network denied events" {
@@ -2985,6 +3173,20 @@ test "interactive run request uses start v1 pipe stdio" {
     try std.testing.expect(std.mem.indexOf(u8, request, "\"argv\":[\"/bin/cat\"]") != null);
 }
 
+test "tty run request uses start v1 terminal metadata" {
+    const request = try execRequestWithSessionOptions(std.testing.allocator, &.{"/bin/sh"}, "default", .{
+        .tty = true,
+        .terminal_name = "xterm-256color",
+        .terminal_size = .{ .rows = 40, .cols = 120 },
+    });
+    defer std.testing.allocator.free(request);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"type\":\"start-v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"stdio\":\"tty\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"term\":\"xterm-256color\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"terminal_rows\":40") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"terminal_cols\":120") != null);
+}
+
 fn testDiskGuardManifest(with_disk: bool) spore.Manifest {
     return .{
         .platform = .{
@@ -3052,9 +3254,24 @@ test "run cli parser accepts command after separator" {
 test "run cli parser accepts interactive stdin" {
     const opts = try parseCliArgs(&.{ "-i", "--image", "docker.io/library/alpine:3.20", "--", "/bin/cat" });
     try std.testing.expect(opts.interactive);
+    try std.testing.expect(!opts.tty);
     try std.testing.expectEqual(CommandMode.argv, opts.command_mode);
     try std.testing.expectEqual(@as(usize, 1), opts.command.len);
     try std.testing.expectEqualStrings("/bin/cat", opts.command[0]);
+}
+
+test "run cli parser accepts tty and combined interactive tty" {
+    const tty_opts = try parseCliArgs(&.{ "-t", "--image", "docker.io/library/alpine:3.20", "--", "/bin/sh" });
+    try std.testing.expect(!tty_opts.interactive);
+    try std.testing.expect(tty_opts.tty);
+    try std.testing.expectEqual(CommandMode.argv, tty_opts.command_mode);
+    try std.testing.expectEqualStrings("/bin/sh", tty_opts.command[0]);
+
+    const it_opts = try parseCliArgs(&.{ "-it", "--image", "docker.io/library/alpine:3.20", "--", "/bin/sh" });
+    try std.testing.expect(it_opts.interactive);
+    try std.testing.expect(it_opts.tty);
+    try std.testing.expectEqual(CommandMode.argv, it_opts.command_mode);
+    try std.testing.expectEqualStrings("/bin/sh", it_opts.command[0]);
 }
 
 test "run cli parser accepts shell command without separator" {

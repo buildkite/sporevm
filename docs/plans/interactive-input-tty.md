@@ -118,24 +118,26 @@ different. It must be explicit.
   is not the `spore run -i` architecture because it is backend-specific, writes
   to the guest console rather than the exec session, and cannot carry named exec
   or attach semantics.
-- The minimal initrd mounts `/proc`, `sysfs`, cgroup2, and `devtmpfs`; it does
-  not currently mount devpts for PTY allocation.
-- `docs/lifecycle.md` now documents `spore run -i` as pipe-style stdin and
-  keeps TTY/named interactive exec listed as future work.
+- The minimal initrd mounts `/proc`, `sysfs`, cgroup2, `devtmpfs`, and devpts
+  for one-shot PTY allocation.
+- `docs/lifecycle.md` now documents `spore run -i` pipe-style stdin and
+  `spore run -t/-it` one-shot TTY mode. Named interactive exec and TTY attach
+  remain future work.
 
 ## Progress Snapshot
 
-- Slice 1 is implemented and locally reviewed on `lox/tty-input-plan`.
-- The branch adds the host SPIO frame codec, v1 host stream parsing, bounded
-  host-to-guest stdin frame queues, and a one-shot stdin pump wired through the
-  existing backend control hook.
-- The minimal initrd agent accepts `start-v1` with `stdio:"pipe"`, gives the
-  child a stdin pipe, reads bounded SPIO stdin frames from the client, and sends
-  stdout/stderr/event/exit frames back over SPIO for v1 sessions.
-- Validation passed with `mise run test`, `mise run smoke:run-stdin`, and
-  `git diff --check`.
-- TTY, interactive attach, streaming named exec, and public `spore attach`
-  remain future slices.
+- Slice 1 is implemented, locally reviewed, and committed on
+  `lox/tty-input-plan`.
+- Slice 2 is implemented locally. `spore run -t` requests `stdio:"tty"`,
+  allocates a guest PTY, streams terminal output on SPIO stream 4, emits JSONL
+  `terminal` events, applies resize frames, and uses raw host stdin for `-it`.
+- The CLI rejects `-t --from` until the attach slice owns restored-session input
+  semantics.
+- Validation passed with `mise run test`, `mise run build`, `git diff --check`,
+  `mise run smoke:run`, `mise run smoke:run-stdin`, and
+  `mise run smoke:run-tty`.
+- Interactive attach, streaming named exec, and public `spore attach` remain
+  future slices.
 
 ## Target User Model
 
@@ -644,17 +646,12 @@ Security and regression checks:
   travels over the same guest-agent session stream on every backend.
 - TTY output is one terminal stream and should be represented distinctly in
   machine events.
+- Slice 2 emits JSONL `terminal` events for `--events=jsonl --tty` instead of
+  rejecting that combination.
 - Host attachment state is not part of a spore. Guest PTY/process state can be
   captured and forked; each restored child gets fresh host attachment ownership.
 
 ## Deferred Questions
-
-- Should `--events=jsonl --tty` land with a terminal event in Slice 2, or should
-  Slice 2 reject that combination and add JSONL terminal events later?
-
-  Recommended default: add the terminal event in Slice 2. Rejecting the
-  combination is simpler, but it creates a second behavioral migration for
-  embedders as soon as TTY support becomes useful.
 
 - Should `-t` imply `-i`?
 

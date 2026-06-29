@@ -93,8 +93,12 @@ spawned. `mise run smoke:monitor-jail` covers the denied-operation path.
 
 ## Limits
 
-- `spore run -i` supports pipe-style stdin forwarding for one-shot runs. TTY
-  allocation and named interactive `spore exec -it` are not implemented yet.
+- `spore run -i` supports pipe-style stdin forwarding for one-shot runs.
+- `spore run -t` allocates a guest PTY for one-shot runs, and `spore run -it`
+  forwards host terminal input in raw mode. TTY mode has one merged terminal
+  output stream; JSONL emits it as `event:"terminal"`.
+- `spore run -t --from` and named interactive `spore exec -it` are not
+  implemented yet.
 - No multi-vCPU named live fork yet.
 - No disk-backed or networked named live fork yet.
 - No live network-flow checkpointing.

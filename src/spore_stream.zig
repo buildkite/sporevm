@@ -101,6 +101,24 @@ pub fn readExitPayload(payload: []const u8) !u32 {
     return std.mem.readInt(u32, payload[0..4], .little);
 }
 
+pub const Resize = struct {
+    rows: u16,
+    cols: u16,
+};
+
+pub fn writeResizePayload(buf: *[4]u8, resize: Resize) void {
+    std.mem.writeInt(u16, buf[0..2], resize.rows, .little);
+    std.mem.writeInt(u16, buf[2..4], resize.cols, .little);
+}
+
+pub fn readResizePayload(payload: []const u8) !Resize {
+    if (payload.len != 4) return error.BadResizePayload;
+    return .{
+        .rows = std.mem.readInt(u16, payload[0..2], .little),
+        .cols = std.mem.readInt(u16, payload[2..4], .little),
+    };
+}
+
 test "round-trips frame headers" {
     var buf: [header_len]u8 = undefined;
     writeHeader(&buf, .{
@@ -156,4 +174,12 @@ test "writes complete frames" {
     try std.testing.expectEqual(@as(u64, 3), header.offset);
     try std.testing.expectEqual(@as(u32, 3), header.payload_len);
     try std.testing.expectEqualStrings("abc", frame[header_len..]);
+}
+
+test "round-trips resize payloads" {
+    var buf: [4]u8 = undefined;
+    writeResizePayload(&buf, .{ .rows = 40, .cols = 120 });
+    const parsed = try readResizePayload(&buf);
+    try std.testing.expectEqual(@as(u16, 40), parsed.rows);
+    try std.testing.expectEqual(@as(u16, 120), parsed.cols);
 }

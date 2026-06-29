@@ -118,6 +118,14 @@ host stdin:
 printf 'hello\n' | spore run -i -- /bin/cat
 ```
 
+Allocate a guest terminal explicitly with `-t`. Use `-it` for an interactive
+shell; TTY output is a single terminal byte stream, so stdout and stderr are not
+separated in this mode:
+
+```bash
+spore run -it --image docker.io/library/alpine:3.20 -- /bin/sh
+```
+
 Override boot assets when needed:
 
 ```bash
@@ -309,6 +317,7 @@ Useful focused checks:
 ```bash
 mise run smoke:run
 mise run smoke:run-stdin
+mise run smoke:run-tty
 mise run smoke:run-capture
 mise run smoke:rootfs-fanout
 mise run smoke:writable-rootfs

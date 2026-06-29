@@ -7,8 +7,10 @@ The `agent.c` binary runs as `/init`, listens for the host's run request over
 vsock, mounts an optional rootfs read-only or read-write based on the kernel
 cmdline, executes the requested argv, and streams stdout, stderr, and exit
 status frames back to the host. `start-v1` requests use the binary SPIO frame
-envelope and can also forward pipe-style stdin to the child process. The other
-programs are fixed helper binaries used by product and lifecycle smokes.
+envelope and can forward pipe-style stdin or allocate a guest PTY. PTY mode
+mounts devpts, gives the child a controlling terminal, streams terminal bytes on
+SPIO stream 4, and applies resize frames with `TIOCSWINSZ`. The other programs
+are fixed helper binaries used by product and lifecycle smokes.
 `netcheck.c` verifies the static `spore run --net` guest link setup without
 requiring distro networking tools in the initrd.
 `nslookup.c` is a tiny smoke helper for the SporeVM-managed DNS proxy; it sends

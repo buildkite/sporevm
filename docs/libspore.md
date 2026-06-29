@@ -280,6 +280,10 @@ fn emit(ctx: ?*anyopaque, event: libspore.RunEvent) anyerror!void {
             // output.bytes is valid only for this callback.
             _ = output.bytes;
         },
+        .terminal => |output| {
+            // TTY mode merges stdout and stderr into one terminal stream.
+            _ = output.bytes;
+        },
         .exit => |exit| _ = exit.exit_code,
         else => {},
     }
@@ -293,8 +297,9 @@ const result = try libspore.runFromSpore(context, allocator, .{
 ```
 
 Event callbacks run synchronously. Output byte slices are callback-scoped; copy
-them if they must outlive the callback. A run emits at most one terminal event:
-`exit` for guest completion or `failure` for a SporeVM failure.
+them if they must outlive the callback. TTY output arrives as `.terminal`
+events. Every run emits at most one completion event: `exit` for guest
+completion or `failure` for a SporeVM failure.
 
 ## Bundles
 

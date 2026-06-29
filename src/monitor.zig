@@ -406,14 +406,17 @@ const ExecServer = struct {
         const capture = switch (output) {
             .stdout => &self.stdout_capture,
             .stderr => &self.stderr_capture,
+            .terminal => &self.stdout_capture,
         };
         const len = switch (output) {
             .stdout => &self.stdout_capture_len,
             .stderr => &self.stderr_capture_len,
+            .terminal => &self.stdout_capture_len,
         };
         const truncated = switch (output) {
             .stdout => &self.stdout_truncated,
             .stderr => &self.stderr_truncated,
+            .terminal => &self.stdout_truncated,
         };
         const available = capture.len - len.*;
         const n = @min(bytes.len, available);

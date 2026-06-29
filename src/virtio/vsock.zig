@@ -93,6 +93,7 @@ pub const HostStreamState = enum {
 pub const HostStreamOutput = enum {
     stdout,
     stderr,
+    terminal,
 };
 
 pub const HostStreamOutputSink = *const fn (context: ?*anyopaque, output: HostStreamOutput, bytes: []const u8) void;
@@ -146,7 +147,9 @@ pub const HostStream = struct {
     v1_control_payload_len: usize = 0,
     stdout_offset: u64 = 0,
     stderr_offset: u64 = 0,
+    terminal_offset: u64 = 0,
     stdin_offset: u64 = 0,
+    terminal_input_offset: u64 = 0,
     outbound_lock: SpinLock = .{},
     outbound_head: usize = 0,
     outbound_count: usize = 0,
@@ -293,6 +296,7 @@ pub const HostStream = struct {
             const expected = switch (output) {
                 .stdout => self.stdout_offset,
                 .stderr => self.stderr_offset,
+                .terminal => unreachable,
             };
             if (offset != expected) {
                 self.fail();
@@ -390,11 +394,12 @@ pub const HostStream = struct {
                 const expected = switch (header.stream_id) {
                     .stdout => self.stdout_offset,
                     .stderr => self.stderr_offset,
+                    .terminal => self.terminal_offset,
                     else => return false,
                 };
                 return header.offset == expected;
             },
-            .close => return header.payload_len == 0 and (header.stream_id == .stdout or header.stream_id == .stderr),
+            .close => return header.payload_len == 0 and (header.stream_id == .stdout or header.stream_id == .stderr or header.stream_id == .terminal),
             .exit => return header.stream_id == .control and header.offset == 0 and header.payload_len == 4,
             .event => return header.stream_id == .control and header.payload_len <= max_v1_control_payload,
             .err => return header.stream_id == .control and header.payload_len <= max_v1_control_payload,
@@ -408,6 +413,7 @@ pub const HostStream = struct {
                 const output: HostStreamOutput = switch (header.stream_id) {
                     .stdout => .stdout,
                     .stderr => .stderr,
+                    .terminal => .terminal,
                     else => return self.fail(),
                 };
                 self.emitOutput(output, bytes);
@@ -466,6 +472,7 @@ pub const HostStream = struct {
         switch (output) {
             .stdout => self.stdout_offset += len,
             .stderr => self.stderr_offset += len,
+            .terminal => self.terminal_offset += len,
         }
     }
 
@@ -494,6 +501,46 @@ pub const HostStream = struct {
             .stream_id = .stdin,
             .offset = self.stdin_offset,
         }, "");
+        return self.enqueueOutboundBlocking(frame, stop);
+    }
+
+    pub fn enqueueTerminalDataBlocking(self: *HostStream, data: []const u8, stop: *const std.atomic.Value(bool)) !bool {
+        var rest = data;
+        while (rest.len > 0) {
+            if (stop.load(.acquire)) return false;
+            const take = @min(rest.len, spore_stream.max_payload_len);
+            var frame_buf: [spore_stream.max_frame_len]u8 = undefined;
+            const frame = try spore_stream.writeFrame(&frame_buf, .{
+                .frame_type = .data,
+                .stream_id = .terminal,
+                .offset = self.terminal_input_offset,
+            }, rest[0..take]);
+            if (!try self.enqueueOutboundBlocking(frame, stop)) return false;
+            self.terminal_input_offset += take;
+            rest = rest[take..];
+        }
+        return true;
+    }
+
+    pub fn enqueueTerminalCloseBlocking(self: *HostStream, stop: *const std.atomic.Value(bool)) !bool {
+        var frame_buf: [spore_stream.max_frame_len]u8 = undefined;
+        const frame = try spore_stream.writeFrame(&frame_buf, .{
+            .frame_type = .close,
+            .stream_id = .terminal,
+            .offset = self.terminal_input_offset,
+        }, "");
+        return self.enqueueOutboundBlocking(frame, stop);
+    }
+
+    pub fn enqueueResizeBlocking(self: *HostStream, resize: spore_stream.Resize, stop: *const std.atomic.Value(bool)) !bool {
+        var payload: [4]u8 = undefined;
+        spore_stream.writeResizePayload(&payload, resize);
+        var frame_buf: [spore_stream.max_frame_len]u8 = undefined;
+        const frame = try spore_stream.writeFrame(&frame_buf, .{
+            .frame_type = .resize,
+            .stream_id = .terminal,
+            .offset = 0,
+        }, &payload);
         return self.enqueueOutboundBlocking(frame, stop);
     }
 
@@ -966,8 +1013,10 @@ test "stream connect request is answered with rst" {
 const StreamCapture = struct {
     stdout: [64]u8 = [_]u8{0} ** 64,
     stderr: [64]u8 = [_]u8{0} ** 64,
+    terminal: [64]u8 = [_]u8{0} ** 64,
     stdout_len: usize = 0,
     stderr_len: usize = 0,
+    terminal_len: usize = 0,
     ready_count: usize = 0,
 };
 
@@ -986,6 +1035,13 @@ fn captureSink(context: ?*anyopaque, output: HostStreamOutput, bytes: []const u8
             if (n > 0) {
                 @memcpy(capture.stderr[capture.stderr_len..][0..n], bytes[0..n]);
                 capture.stderr_len += n;
+            }
+        },
+        .terminal => {
+            const n = @min(bytes.len, capture.terminal.len - capture.terminal_len);
+            if (n > 0) {
+                @memcpy(capture.terminal[capture.terminal_len..][0..n], bytes[0..n]);
+                capture.terminal_len += n;
             }
         },
     }
@@ -1019,6 +1075,7 @@ test "host stream parses spore stream v1 frames" {
     try appendV1Frame(&stream, .data, .stdout, 0, "hello ");
     try appendV1Frame(&stream, .data, .stdout, 6, "world");
     try appendV1Frame(&stream, .data, .stderr, 0, "err");
+    try appendV1Frame(&stream, .data, .terminal, 0, "tty");
     try appendV1Frame(&stream, .event, .control, 0, "memory-pressure");
     try appendV1Frame(&stream, .event, .control, 0, "timing listen=1 accept=2 decode=3 spawn=4 exit=5 now=6");
     var exit_payload: [4]u8 = undefined;
@@ -1031,6 +1088,7 @@ test "host stream parses spore stream v1 frames" {
     try std.testing.expect(stream.guest_timing_ms != null);
     try std.testing.expectEqualStrings("hello world", capture.stdout[0..capture.stdout_len]);
     try std.testing.expectEqualStrings("err", capture.stderr[0..capture.stderr_len]);
+    try std.testing.expectEqualStrings("tty", capture.terminal[0..capture.terminal_len]);
 }
 
 test "host stream v1 parser fails closed on malformed frames" {
@@ -1099,6 +1157,41 @@ test "host stream queues stdin v1 frames with offsets" {
     try std.testing.expectEqual(spore_stream.StreamId.stdin, close_header.stream_id);
     try std.testing.expectEqual(@as(u64, 2), close_header.offset);
     try std.testing.expectEqual(@as(u32, 0), close_header.payload_len);
+    try std.testing.expect(stream.dequeueOutbound(&payload_buf) == null);
+}
+
+test "host stream queues terminal v1 frames and resize" {
+    var stream = try HostStream.initWithProtocol(10700, "{}\n", .spore_stream_v1);
+    var stop = std.atomic.Value(bool).init(false);
+    try std.testing.expect(try stream.enqueueTerminalDataBlocking("ab", &stop));
+    try std.testing.expect(try stream.enqueueResizeBlocking(.{ .rows = 40, .cols = 120 }, &stop));
+    try std.testing.expect(try stream.enqueueTerminalCloseBlocking(&stop));
+
+    var payload_buf: [max_payload]u8 = undefined;
+    const data_frame = stream.dequeueOutbound(&payload_buf).?;
+    var header_buf: [spore_stream.header_len]u8 = undefined;
+    @memcpy(&header_buf, data_frame[0..spore_stream.header_len]);
+    const data_header = try spore_stream.readHeader(&header_buf);
+    try std.testing.expectEqual(spore_stream.FrameType.data, data_header.frame_type);
+    try std.testing.expectEqual(spore_stream.StreamId.terminal, data_header.stream_id);
+    try std.testing.expectEqual(@as(u64, 0), data_header.offset);
+    try std.testing.expectEqualStrings("ab", data_frame[spore_stream.header_len..]);
+
+    const resize_frame = stream.dequeueOutbound(&payload_buf).?;
+    @memcpy(&header_buf, resize_frame[0..spore_stream.header_len]);
+    const resize_header = try spore_stream.readHeader(&header_buf);
+    try std.testing.expectEqual(spore_stream.FrameType.resize, resize_header.frame_type);
+    try std.testing.expectEqual(spore_stream.StreamId.terminal, resize_header.stream_id);
+    const resize = try spore_stream.readResizePayload(resize_frame[spore_stream.header_len..]);
+    try std.testing.expectEqual(@as(u16, 40), resize.rows);
+    try std.testing.expectEqual(@as(u16, 120), resize.cols);
+
+    const close_frame = stream.dequeueOutbound(&payload_buf).?;
+    @memcpy(&header_buf, close_frame[0..spore_stream.header_len]);
+    const close_header = try spore_stream.readHeader(&header_buf);
+    try std.testing.expectEqual(spore_stream.FrameType.close, close_header.frame_type);
+    try std.testing.expectEqual(spore_stream.StreamId.terminal, close_header.stream_id);
+    try std.testing.expectEqual(@as(u64, 2), close_header.offset);
     try std.testing.expect(stream.dequeueOutbound(&payload_buf) == null);
 }
 
