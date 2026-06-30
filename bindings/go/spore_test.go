@@ -2,9 +2,11 @@ package spore
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"unsafe"
 )
 
 func TestBuildInfo(t *testing.T) {
@@ -36,6 +38,43 @@ func TestClientHostInfo(t *testing.T) {
 	}
 	if len(info.Backends) == 0 {
 		t.Fatal("expected backend facts")
+	}
+}
+
+func TestClientNetworkCapabilities(t *testing.T) {
+	client, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	caps, err := client.NetworkCapabilities(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !caps.Supported {
+		t.Fatal("network support unexpectedly disabled")
+	}
+	if !caps.TCPIPv4 {
+		t.Fatal("expected TCP IPv4 support")
+	}
+	if caps.TCPIPv6 {
+		t.Fatal("TCP IPv6 unexpectedly supported")
+	}
+	if !caps.UDPDNS {
+		t.Fatal("expected UDP DNS support")
+	}
+	if !caps.ExactHostPort {
+		t.Fatal("expected exact host/port support")
+	}
+	if caps.StagePolicyUpdate {
+		t.Fatal("stage policy updates unexpectedly supported")
+	}
+	if !caps.BoundServices {
+		t.Fatal("expected bound service support")
+	}
+	if !caps.DecisionEvents {
+		t.Fatal("expected decision event support")
 	}
 }
 
@@ -136,6 +175,119 @@ func TestNamedLifecycleOptionsCarryBoundServices(t *testing.T) {
 	}
 	if got := resume.BoundServiceBindings[0].UnixPath; got != "/tmp/fresh-cleanroom-gateway.sock" {
 		t.Fatalf("resume binding path = %q", got)
+	}
+}
+
+func TestCreateNamedNetworkMarshaling(t *testing.T) {
+	allowCIDRs, freeAllowCIDRs := cStringList([]string{"93.184.216.34/32"})
+	defer freeAllowCIDRs()
+	allowHosts, freeAllowHosts := cStringList([]string{"example.com"})
+	defer freeAllowHosts()
+	rules, freeRules := cNetworkRules([]NetworkRule{{
+		Host:  "github.com",
+		Ports: []uint16{443, 8443},
+	}})
+	defer freeRules()
+	services, freeServices := cBoundUnixServices([]BoundUnixService{{
+		Name:      "cleanroom-gateway",
+		GuestHost: "gateway.cleanroom.internal",
+		GuestPort: 8170,
+		UnixPath:  "/tmp/cleanroom-gateway.sock",
+	}})
+	defer freeServices()
+
+	if got := goString(allowCIDRs[0]); got != "93.184.216.34/32" {
+		t.Fatalf("allow cidr = %q", got)
+	}
+	if got := goString(allowHosts[0]); got != "example.com" {
+		t.Fatalf("allow host = %q", got)
+	}
+	if got := goString(rules[0].host); got != "github.com" {
+		t.Fatalf("rule host = %q", got)
+	}
+	if got := int(rules[0].port_count); got != 2 {
+		t.Fatalf("rule port count = %d", got)
+	}
+	ports := unsafe.Slice(rules[0].ports, int(rules[0].port_count))
+	if uint16(ports[0]) != 443 || uint16(ports[1]) != 8443 {
+		t.Fatalf("rule ports = [%d %d]", ports[0], ports[1])
+	}
+	if got := goString(services[0].name); got != "cleanroom-gateway" {
+		t.Fatalf("service name = %q", got)
+	}
+	if got := goString(services[0].guest_host); got != "gateway.cleanroom.internal" {
+		t.Fatalf("service guest host = %q", got)
+	}
+	if got := uint16(services[0].guest_port); got != 8170 {
+		t.Fatalf("service guest port = %d", got)
+	}
+	if got := goString(services[0].unix_path); got != "/tmp/cleanroom-gateway.sock" {
+		t.Fatalf("service unix path = %q", got)
+	}
+}
+
+func TestCreateNamedNetworkingFailsClosedWhenDisabled(t *testing.T) {
+	client, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if !supportsNamedLifecycle(t, client) {
+		t.Skip("named lifecycle backend is not supported on this host")
+	}
+
+	tests := []struct {
+		name    string
+		options CreateNamedOptions
+	}{
+		{
+			name: "allow cidr",
+			options: CreateNamedOptions{
+				AllowCIDRs: []string{"93.184.216.34/32"},
+			},
+		},
+		{
+			name: "allow host",
+			options: CreateNamedOptions{
+				AllowHosts: []string{"example.com"},
+			},
+		},
+		{
+			name: "exact host port",
+			options: CreateNamedOptions{
+				NetworkRules: []NetworkRule{{
+					Host:  "github.com",
+					Ports: []uint16{443},
+				}},
+			},
+		},
+		{
+			name: "bound service",
+			options: CreateNamedOptions{
+				BoundServices: []BoundUnixService{{
+					Name:      "metadata",
+					GuestHost: "metadata.spore.internal",
+					GuestPort: 80,
+					UnixPath:  "/tmp/metadata.sock",
+				}},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := client.CreateNamed(context.Background(), tt.options)
+			if err == nil {
+				t.Fatal("expected create to reject disabled networking with policy")
+			}
+			var callErr *CallError
+			if !errors.As(err, &callErr) {
+				t.Fatalf("expected CallError, got %T: %v", err, err)
+			}
+			if callErr.Message != "InvalidNetworkPolicy" {
+				t.Fatalf("error message = %q", callErr.Message)
+			}
+		})
 	}
 }
 
@@ -291,6 +443,20 @@ func mustWrite(t *testing.T, path, contents string) {
 	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func supportsNamedLifecycle(t *testing.T, client *Client) bool {
+	t.Helper()
+	info, err := client.HostInfo(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, backend := range info.Backends {
+		if backend.Supported && (backend.Name == "hvf" || backend.Name == "kvm") {
+			return true
+		}
+	}
+	return false
 }
 
 const tinyManifest = `{

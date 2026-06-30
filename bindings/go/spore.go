@@ -126,6 +126,19 @@ func (c *Client) HostInfo(ctx context.Context) (HostInfo, error) {
 	return decodeJSON[HostInfo](goBytes(out), "host info")
 }
 
+// NetworkCapabilities returns libspore's enforceable network capability facts.
+func (c *Client) NetworkCapabilities(ctx context.Context) (NetworkCapabilities, error) {
+	if err := c.ready(ctx); err != nil {
+		return NetworkCapabilities{}, err
+	}
+	var out C.SporeOwnedString
+	if result := Result(C.spore_network_capabilities_json(c.ctx, &out)); result != Success {
+		return NetworkCapabilities{}, c.callError(result)
+	}
+	defer C.spore_free_string(c.ctx, out)
+	return decodeJSON[NetworkCapabilities](goBytes(out), "network capabilities")
+}
+
 // InspectBundle returns metadata for a local bundle reference.
 func (c *Client) InspectBundle(ctx context.Context, options InspectBundleOptions) (InspectBundleResult, error) {
 	if err := c.ready(ctx); err != nil {
