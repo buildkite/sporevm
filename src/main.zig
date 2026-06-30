@@ -901,6 +901,7 @@ test "stable lifecycle commands support global json where output is one document
     try std.testing.expect(supportsJson("rm"));
     try std.testing.expect(supportsJson("resume"));
     try std.testing.expect(supportsJson("suspend"));
+    try std.testing.expect(!supportsJson("attach"));
     try std.testing.expect(!supportsJson("exec"));
 }
 

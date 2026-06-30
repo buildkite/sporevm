@@ -48,6 +48,19 @@
 #define SPORE_NET_RESOLV_CONF "nameserver 100.96.0.1\n"
 #define FILE_STDOUT_PATH "/tmp/spore-run.stdout"
 #define FILE_STDERR_PATH "/tmp/spore-run.stderr"
+#define SPIO_MAGIC "SPIO"
+#define SPIO_VERSION 1
+#define SPIO_HEADER_LEN 24
+#define SPIO_DATA 1
+#define SPIO_CLOSE 2
+#define SPIO_EXIT 3
+#define SPIO_RESIZE 4
+#define SPIO_EVENT 7
+#define SPIO_CONTROL_STREAM 0
+#define SPIO_STDIN_STREAM 1
+#define SPIO_STDOUT_STREAM 2
+#define SPIO_STDERR_STREAM 3
+#define SPIO_TERMINAL_STREAM 4
 #define GEN_BASE 0x0c001000ULL
 #define GEN_WINDOW_SIZE 0x1000U
 #define GEN_MAGIC 0x4e475053U
@@ -95,20 +108,50 @@ struct session {
   pid_t pid;
   int stdout_fd;
   int stderr_fd;
+  int stdin_fd;
+  int terminal_fd;
   int stdout_open;
   int stderr_open;
+  int stdin_open;
+  int stdin_capable;
+  int stdin_close_pending;
+  int tty;
+  int terminal_close_pending;
   int file_stdio;
   int exit_code;
   uint64_t stdout_offset;
   uint64_t stderr_offset;
+  uint64_t stdin_offset;
+  uint64_t terminal_offset;
+  uint64_t terminal_input_offset;
+  unsigned char stdin_pending[MAX_FRAME_PAYLOAD];
+  size_t stdin_pending_len;
+  size_t stdin_pending_off;
+  unsigned char terminal_pending[MAX_FRAME_PAYLOAD];
+  size_t terminal_pending_len;
+  size_t terminal_pending_off;
   struct replay_buffer stdout_replay;
   struct replay_buffer stderr_replay;
 };
 
 struct client {
   int fd;
+  int protocol_v1;
   uint64_t stdout_offset;
   uint64_t stderr_offset;
+  uint64_t stdin_offset;
+  uint64_t terminal_offset;
+  uint64_t terminal_input_offset;
+  int stdin_input_owner;
+  int terminal_input_owner;
+  unsigned char v1_header[SPIO_HEADER_LEN];
+  size_t v1_header_len;
+  uint8_t v1_type;
+  uint32_t v1_stream_id;
+  uint64_t v1_offset;
+  uint32_t v1_payload_len;
+  unsigned char v1_payload[MAX_FRAME_PAYLOAD];
+  size_t v1_payload_read;
 };
 
 struct detached_children {
@@ -165,6 +208,10 @@ static void prepare_dev(void) {
   mkdir("/dev", 0755);
   if (mount("devtmpfs", "/dev", "devtmpfs", 0, "") != 0 && errno != EBUSY) {
     dprintf(2, "mount devtmpfs failed: errno=%d\n", errno);
+  }
+  mkdir("/dev/pts", 0755);
+  if (mount("devpts", "/dev/pts", "devpts", 0, "mode=0620,ptmxmode=0666") != 0 && errno != EBUSY) {
+    dprintf(2, "mount devpts failed: errno=%d\n", errno);
   }
   if (mknod("/dev/null", S_IFCHR | 0666, (dev_t)((1u << 8) | 3u)) != 0 && errno != EEXIST) {
     dprintf(2, "mknod /dev/null failed: errno=%d\n", errno);
@@ -690,10 +737,79 @@ static int send_stream_data(int fd, const char *name, uint64_t offset, const uns
   return 0;
 }
 
-static int send_timing_frame(int fd) {
+static void write_le16(unsigned char *out, uint16_t value) {
+  out[0] = (unsigned char)(value & 0xff);
+  out[1] = (unsigned char)((value >> 8) & 0xff);
+}
+
+static void write_le32(unsigned char *out, uint32_t value) {
+  out[0] = (unsigned char)(value & 0xff);
+  out[1] = (unsigned char)((value >> 8) & 0xff);
+  out[2] = (unsigned char)((value >> 16) & 0xff);
+  out[3] = (unsigned char)((value >> 24) & 0xff);
+}
+
+static void write_le64(unsigned char *out, uint64_t value) {
+  for (int i = 0; i < 8; i++) {
+    out[i] = (unsigned char)((value >> (8 * i)) & 0xff);
+  }
+}
+
+static uint16_t read_le16(const unsigned char *in) {
+  return (uint16_t)in[0] | ((uint16_t)in[1] << 8);
+}
+
+static uint32_t read_le32(const unsigned char *in) {
+  return (uint32_t)in[0] | ((uint32_t)in[1] << 8) | ((uint32_t)in[2] << 16) | ((uint32_t)in[3] << 24);
+}
+
+static uint64_t read_le64(const unsigned char *in) {
+  uint64_t value = 0;
+  for (int i = 0; i < 8; i++) {
+    value |= ((uint64_t)in[i]) << (8 * i);
+  }
+  return value;
+}
+
+static int send_spio_frame(int fd, uint8_t type, uint32_t stream_id, uint64_t offset, const unsigned char *payload, size_t len) {
+  if (len > MAX_FRAME_PAYLOAD) return -1;
+  unsigned char header[SPIO_HEADER_LEN];
+  memcpy(header, SPIO_MAGIC, 4);
+  header[4] = SPIO_VERSION;
+  header[5] = type;
+  write_le16(header + 6, 0);
+  write_le32(header + 8, stream_id);
+  write_le64(header + 12, offset);
+  write_le32(header + 20, (uint32_t)len);
+  if (write_all(fd, header, sizeof(header)) != 0) return -1;
+  if (len > 0 && write_all(fd, payload, len) != 0) return -1;
+  return 0;
+}
+
+static int send_spio_data(int fd, uint32_t stream_id, uint64_t offset, const unsigned char *buf, size_t len) {
+  size_t sent = 0;
+  while (sent < len) {
+    size_t chunk = len - sent;
+    if (chunk > MAX_FRAME_PAYLOAD) chunk = MAX_FRAME_PAYLOAD;
+    if (send_spio_frame(fd, SPIO_DATA, stream_id, offset + sent, buf + sent, chunk) != 0) return -1;
+    sent += chunk;
+  }
+  return 0;
+}
+
+static int send_spio_event(int fd, const char *event) {
+  return send_spio_frame(fd, SPIO_EVENT, SPIO_CONTROL_STREAM, 0, (const unsigned char *)event, strlen(event));
+}
+
+static int send_spio_exit(int fd, int exit_code) {
+  unsigned char payload[4];
+  write_le32(payload, (uint32_t)exit_code);
+  return send_spio_frame(fd, SPIO_EXIT, SPIO_CONTROL_STREAM, 0, payload, sizeof(payload));
+}
+
+static int format_timing(char *frame, size_t cap) {
   int64_t now = now_ms();
-  char frame[128];
-  int n = snprintf(frame, sizeof(frame),
+  int n = snprintf(frame, cap,
                    "timing listen=%lld accept=%lld decode=%lld spawn=%lld exit=%lld now=%lld\n",
                    (long long)(t_listen_ready ? t_listen_ready - t_init_start : -1),
                    (long long)(t_request_accept ? t_request_accept - t_init_start : -1),
@@ -701,8 +817,23 @@ static int send_timing_frame(int fd) {
                    (long long)(t_command_start ? t_command_start - t_init_start : -1),
                    (long long)(t_command_exit ? t_command_exit - t_init_start : -1),
                    (long long)(now ? now - t_init_start : -1));
-  if (n <= 0 || (size_t)n >= sizeof(frame)) return -1;
+  if (n <= 0 || (size_t)n >= cap) return -1;
+  return n;
+}
+
+static int send_timing_frame(int fd) {
+  char frame[128];
+  int n = format_timing(frame, sizeof(frame));
+  if (n < 0) return -1;
   return write_all(fd, frame, (size_t)n);
+}
+
+static int send_spio_timing_frame(int fd) {
+  char frame[128];
+  int n = format_timing(frame, sizeof(frame));
+  if (n < 0) return -1;
+  if (n > 0 && frame[n - 1] == '\n') n--;
+  return send_spio_frame(fd, SPIO_EVENT, SPIO_CONTROL_STREAM, 0, (const unsigned char *)frame, (size_t)n);
 }
 
 static int send_memory_pressure_frame(int fd) {
@@ -813,16 +944,48 @@ static void close_client(struct client *client) {
     close(client->fd);
     client->fd = -1;
   }
+  client->protocol_v1 = 0;
+  client->stdout_offset = 0;
+  client->stderr_offset = 0;
+  client->stdin_offset = 0;
+  client->terminal_offset = 0;
+  client->terminal_input_offset = 0;
+  client->stdin_input_owner = 0;
+  client->terminal_input_owner = 0;
+  client->v1_header_len = 0;
+  client->v1_type = 0;
+  client->v1_stream_id = 0;
+  client->v1_offset = 0;
+  client->v1_payload_len = 0;
+  client->v1_payload_read = 0;
 }
 
 static int send_client_output(struct client *client, const char *name, uint64_t *client_offset, uint64_t offset, const unsigned char *buf, size_t len) {
   if (client->fd < 0) return -1;
   if (*client_offset != offset) return 0;
-  if (send_stream_data(client->fd, name, offset, buf, len) != 0) {
+  int rc;
+  if (client->protocol_v1) {
+    uint32_t stream_id = strcmp(name, "stdout") == 0 ? SPIO_STDOUT_STREAM : SPIO_STDERR_STREAM;
+    rc = send_spio_data(client->fd, stream_id, offset, buf, len);
+  } else {
+    rc = send_stream_data(client->fd, name, offset, buf, len);
+  }
+  if (rc != 0) {
     close_client(client);
     return -1;
   }
   *client_offset += len;
+  return 0;
+}
+
+static int send_client_terminal_output(struct client *client, uint64_t offset, const unsigned char *buf, size_t len) {
+  if (client->fd < 0 || !client->protocol_v1) return -1;
+  if (client->terminal_offset != offset) return 0;
+  if (send_spio_data(client->fd, SPIO_TERMINAL_STREAM, offset, buf, len) != 0) {
+    close_client(client);
+    return -1;
+  }
+  client->terminal_offset += len;
   return 0;
 }
 
@@ -1001,6 +1164,12 @@ struct run_request {
   uint64_t stdout_offset;
   uint64_t stderr_offset;
   uint64_t resume_time_unix_ns;
+  int protocol_v1;
+  int stdin_enabled;
+  int tty;
+  int interactive;
+  uint16_t terminal_rows;
+  uint16_t terminal_cols;
   int memory_pressure;
   int detached;
   char generation_params[GEN_PARAMS_MAX];
@@ -1049,6 +1218,8 @@ static int parse_bool_field(const char *req, const char *name, int *out) {
 static int parse_request(const char *req, struct run_request *out) {
   memset(out, 0, sizeof(*out));
   out->kind = REQUEST_START;
+  out->terminal_rows = 24;
+  out->terminal_cols = 80;
 
   char type[32];
   int type_rc = parse_string_field(req, "type", type, sizeof(type));
@@ -1056,8 +1227,14 @@ static int parse_request(const char *req, struct run_request *out) {
   if (type_rc > 0) {
     if (strcmp(type, "start") == 0) {
       out->kind = REQUEST_START;
+    } else if (strcmp(type, "start-v1") == 0) {
+      out->kind = REQUEST_START;
+      out->protocol_v1 = 1;
     } else if (strcmp(type, "attach") == 0) {
       out->kind = REQUEST_ATTACH;
+    } else if (strcmp(type, "attach-v1") == 0) {
+      out->kind = REQUEST_ATTACH;
+      out->protocol_v1 = 1;
     } else if (strcmp(type, "generation") == 0) {
       out->kind = REQUEST_GENERATION;
     } else {
@@ -1093,6 +1270,30 @@ static int parse_request(const char *req, struct run_request *out) {
     if (out->kind == REQUEST_GENERATION && params_rc <= 0) return -1;
     if (params_rc < 0) return -1;
   }
+  if (out->protocol_v1 && (out->kind == REQUEST_START || out->kind == REQUEST_ATTACH)) {
+    char stdio[16];
+    int stdio_rc = parse_string_field(req, "stdio", stdio, sizeof(stdio));
+    if (stdio_rc <= 0) return -1;
+    if (strcmp(stdio, "pipe") == 0) {
+      out->stdin_enabled = 1;
+    } else if (strcmp(stdio, "tty") == 0) {
+      out->tty = 1;
+      uint64_t rows = 0;
+      uint64_t cols = 0;
+      int rows_rc = parse_u64_field(req, "terminal_rows", &rows);
+      int cols_rc = parse_u64_field(req, "terminal_cols", &cols);
+      if (rows_rc < 0 || cols_rc < 0) return -1;
+      if (rows_rc > 0 && rows > 0 && rows <= UINT16_MAX) out->terminal_rows = (uint16_t)rows;
+      if (cols_rc > 0 && cols > 0 && cols <= UINT16_MAX) out->terminal_cols = (uint16_t)cols;
+    } else {
+      return -1;
+    }
+    int interactive = 0;
+    int interactive_rc = parse_bool_field(req, "interactive", &interactive);
+    if (interactive_rc < 0) return -1;
+    if (interactive_rc > 0) out->interactive = interactive;
+    if (out->kind == REQUEST_ATTACH && out->stdin_enabled && !out->interactive) return -1;
+  }
   if (out->kind == REQUEST_START) {
     if (parse_argv(req, out->arg_storage, out->argv) <= 0) return -1;
     if (parse_env(req, out->env_storage, out->envp) < 0) return -1;
@@ -1107,6 +1308,9 @@ static int parse_request(const char *req, struct run_request *out) {
     int detached_rc = parse_bool_field(req, "detached", &detached);
     if (detached_rc < 0) return -1;
     if (detached_rc > 0) out->detached = detached;
+    if (out->protocol_v1) {
+      if (out->detached) return -1;
+    }
   }
   return 0;
 }
@@ -1114,6 +1318,26 @@ static int parse_request(const char *req, struct run_request *out) {
 static int send_error_exit(int fd, int code, const char *message) {
   (void)send_stream_data(fd, "stderr", 0, (const unsigned char *)message, strlen(message));
   return send_exit_frame(fd, code);
+}
+
+static int send_client_error_exit(struct client *client, int code, const char *message) {
+  if (client->fd < 0) return -1;
+  if (!client->protocol_v1) return send_error_exit(client->fd, code, message);
+
+  size_t len = strlen(message);
+  if (len > 0) {
+    if (send_spio_data(client->fd, SPIO_STDERR_STREAM, client->stderr_offset, (const unsigned char *)message, len) != 0) return -1;
+    client->stderr_offset += len;
+  }
+  if (send_spio_timing_frame(client->fd) != 0) return -1;
+  return send_spio_exit(client->fd, code);
+}
+
+static int send_client_exit(struct client *client, int code) {
+  if (client->fd < 0) return -1;
+  if (!client->protocol_v1) return send_exit_frame(client->fd, code);
+  if (send_spio_timing_frame(client->fd) != 0) return -1;
+  return send_spio_exit(client->fd, code);
 }
 
 static void pump_session_file(struct session *session, struct client *client, int is_stdout) {
@@ -1153,12 +1377,56 @@ static void close_file_stdio(struct session *session) {
   unlink(FILE_STDERR_PATH);
 }
 
-static int start_session(struct session *session, const char *session_id, char *const argv[], char *const envp[], const char *working_dir, int use_rootfs, int file_stdio, int memory_pressure) {
+static int apply_terminal_size(int fd, uint16_t rows, uint16_t cols) {
+  struct winsize ws;
+  memset(&ws, 0, sizeof(ws));
+  ws.ws_row = rows;
+  ws.ws_col = cols;
+  return ioctl(fd, TIOCSWINSZ, &ws);
+}
+
+static int open_session_pty(int *master_out, int *slave_out, uint16_t rows, uint16_t cols) {
+  int master = posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC);
+  if (master < 0) return -1;
+  if (grantpt(master) != 0 || unlockpt(master) != 0) {
+    close(master);
+    return -1;
+  }
+  char *slave_path = ptsname(master);
+  if (slave_path == NULL) {
+    close(master);
+    return -1;
+  }
+  int slave = open(slave_path, O_RDWR | O_NOCTTY | O_CLOEXEC);
+  if (slave < 0) {
+    close(master);
+    return -1;
+  }
+  if (set_nonblock(master) != 0) {
+    close(slave);
+    close(master);
+    return -1;
+  }
+  (void)apply_terminal_size(slave, rows, cols);
+  *master_out = master;
+  *slave_out = slave;
+  return 0;
+}
+
+static int start_session(struct session *session, const char *session_id, char *const argv[], char *const envp[], const char *working_dir, int use_rootfs, int file_stdio, int memory_pressure, int stdin_enabled, int tty, uint16_t terminal_rows, uint16_t terminal_cols) {
   t_command_start = now_ms();
+  int stdin_pipe[2] = { -1, -1 };
   int stdout_pipe[2] = { -1, -1 };
   int stderr_pipe[2] = { -1, -1 };
+  int pty_master = -1;
+  int pty_slave = -1;
   int start_pipe[2] = { -1, -1 };
-  if (file_stdio) {
+  if (tty) {
+    if (open_session_pty(&pty_master, &pty_slave, terminal_rows, terminal_cols) != 0) {
+      t_command_exit = now_ms();
+      return 127;
+    }
+  } else if (file_stdio) {
     stdout_pipe[1] = open(FILE_STDOUT_PATH, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC | O_NOFOLLOW, 0600);
     stderr_pipe[1] = open(FILE_STDERR_PATH, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC | O_NOFOLLOW, 0600);
     stdout_pipe[0] = open(FILE_STDOUT_PATH, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
@@ -1191,7 +1459,35 @@ static int start_session(struct session *session, const char *session_id, char *
       return 127;
     }
   }
+  if (stdin_enabled) {
+    if (pipe2(stdin_pipe, O_CLOEXEC) != 0) {
+      if (pty_master >= 0) close(pty_master);
+      if (pty_slave >= 0) close(pty_slave);
+      if (stdout_pipe[0] >= 0) close(stdout_pipe[0]);
+      if (stdout_pipe[1] >= 0) close(stdout_pipe[1]);
+      if (stderr_pipe[0] >= 0) close(stderr_pipe[0]);
+      if (stderr_pipe[1] >= 0) close(stderr_pipe[1]);
+      t_command_exit = now_ms();
+      return 127;
+    }
+    if (set_nonblock(stdin_pipe[1]) != 0) {
+      close(stdin_pipe[0]);
+      close(stdin_pipe[1]);
+      if (pty_master >= 0) close(pty_master);
+      if (pty_slave >= 0) close(pty_slave);
+      if (stdout_pipe[0] >= 0) close(stdout_pipe[0]);
+      if (stdout_pipe[1] >= 0) close(stdout_pipe[1]);
+      if (stderr_pipe[0] >= 0) close(stderr_pipe[0]);
+      if (stderr_pipe[1] >= 0) close(stderr_pipe[1]);
+      t_command_exit = now_ms();
+      return 127;
+    }
+  }
   if (pipe2(start_pipe, O_CLOEXEC) != 0) {
+    if (stdin_pipe[0] >= 0) close(stdin_pipe[0]);
+    if (stdin_pipe[1] >= 0) close(stdin_pipe[1]);
+    if (pty_master >= 0) close(pty_master);
+    if (pty_slave >= 0) close(pty_slave);
     if (stdout_pipe[0] >= 0) close(stdout_pipe[0]);
     if (stdout_pipe[1] >= 0) close(stdout_pipe[1]);
     if (stderr_pipe[0] >= 0) close(stderr_pipe[0]);
@@ -1208,12 +1504,32 @@ static int start_session(struct session *session, const char *session_id, char *
     }
     if (start_byte != 1) _exit(127);
     close(start_pipe[0]);
+    if (stdin_pipe[1] >= 0) close(stdin_pipe[1]);
+    if (pty_master >= 0) close(pty_master);
     if (stdout_pipe[0] >= 0) close(stdout_pipe[0]);
     if (stderr_pipe[0] >= 0) close(stderr_pipe[0]);
-    if (dup2(stdout_pipe[1], STDOUT_FILENO) < 0) _exit(127);
-    if (dup2(stderr_pipe[1], STDERR_FILENO) < 0) _exit(127);
-    close(stdout_pipe[1]);
-    close(stderr_pipe[1]);
+    if (tty) {
+      if (setsid() < 0) _exit(127);
+      (void)ioctl(pty_slave, TIOCSCTTY, 0);
+      if (dup2(pty_slave, STDIN_FILENO) < 0) _exit(127);
+      if (dup2(pty_slave, STDOUT_FILENO) < 0) _exit(127);
+      if (dup2(pty_slave, STDERR_FILENO) < 0) _exit(127);
+      close(pty_slave);
+    } else if (stdin_enabled) {
+      if (dup2(stdin_pipe[0], STDIN_FILENO) < 0) _exit(127);
+      close(stdin_pipe[0]);
+    } else {
+      int null_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+      if (null_fd < 0) _exit(127);
+      if (dup2(null_fd, STDIN_FILENO) < 0) _exit(127);
+      close(null_fd);
+    }
+    if (!tty) {
+      if (dup2(stdout_pipe[1], STDOUT_FILENO) < 0) _exit(127);
+      if (dup2(stderr_pipe[1], STDERR_FILENO) < 0) _exit(127);
+      close(stdout_pipe[1]);
+      close(stderr_pipe[1]);
+    }
     if (use_rootfs) {
       if (chroot("/mnt/rootfs") != 0) _exit(126);
     }
@@ -1223,11 +1539,15 @@ static int start_session(struct session *session, const char *session_id, char *
     execve(argv[0], argv, envp[0] != NULL ? envp : empty_env);
     _exit(127);
   }
-  close(stdout_pipe[1]);
-  close(stderr_pipe[1]);
+  if (stdin_pipe[0] >= 0) close(stdin_pipe[0]);
+  if (pty_slave >= 0) close(pty_slave);
+  if (stdout_pipe[1] >= 0) close(stdout_pipe[1]);
+  if (stderr_pipe[1] >= 0) close(stderr_pipe[1]);
   close(start_pipe[0]);
   if (pid < 0) {
     close(start_pipe[1]);
+    if (stdin_pipe[1] >= 0) close(stdin_pipe[1]);
+    if (pty_master >= 0) close(pty_master);
     if (stdout_pipe[0] >= 0) close(stdout_pipe[0]);
     if (stderr_pipe[0] >= 0) close(stderr_pipe[0]);
     t_command_exit = now_ms();
@@ -1242,6 +1562,8 @@ static int start_session(struct session *session, const char *session_id, char *
     int status = 0;
     while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
     }
+    if (stdin_pipe[1] >= 0) close(stdin_pipe[1]);
+    if (pty_master >= 0) close(pty_master);
     if (stdout_pipe[0] >= 0) close(stdout_pipe[0]);
     if (stderr_pipe[0] >= 0) close(stderr_pipe[0]);
     close_memory_pressure(session);
@@ -1253,10 +1575,15 @@ static int start_session(struct session *session, const char *session_id, char *
   session->started = 1;
   snprintf(session->session_id, sizeof(session->session_id), "%s", session_id);
   session->pid = pid;
-  session->stdout_fd = stdout_pipe[0];
+  session->stdin_fd = stdin_pipe[1];
+  session->terminal_fd = pty_master;
+  session->stdout_fd = tty ? pty_master : stdout_pipe[0];
   session->stderr_fd = stderr_pipe[0];
-  session->stdout_open = 1;
-  session->stderr_open = 1;
+  session->stdin_open = stdin_pipe[1] >= 0;
+  session->stdin_capable = stdin_enabled;
+  session->tty = tty;
+  session->stdout_open = tty ? pty_master >= 0 : 1;
+  session->stderr_open = tty ? 0 : 1;
   session->file_stdio = file_stdio;
   return 0;
 }
@@ -1395,9 +1722,13 @@ static void reset_session(struct session *session) {
   close_memory_pressure(session);
   if (session->stdout_fd >= 0) close(session->stdout_fd);
   if (session->stderr_fd >= 0) close(session->stderr_fd);
+  if (session->stdin_fd >= 0) close(session->stdin_fd);
+  if (session->terminal_fd >= 0 && session->terminal_fd != session->stdout_fd) close(session->terminal_fd);
   memset(session, 0, sizeof(*session));
   session->stdout_fd = -1;
   session->stderr_fd = -1;
+  session->stdin_fd = -1;
+  session->terminal_fd = -1;
   session->memory_pressure_fd = -1;
 }
 
@@ -1411,9 +1742,7 @@ static int send_replay(struct client *client, const struct replay_buffer *replay
   if (*client_offset >= replay_end) return 0;
   size_t start = (size_t)(*client_offset - replay->base_offset);
   size_t len = replay->len - start;
-  if (send_stream_data(client->fd, name, *client_offset, replay->data + start, len) != 0) return -1;
-  *client_offset += len;
-  return 0;
+  return send_client_output(client, name, client_offset, *client_offset, replay->data + start, len);
 }
 
 static int attach_client(struct session *session, struct client *client, uint64_t stdout_offset, uint64_t stderr_offset) {
@@ -1421,12 +1750,12 @@ static int attach_client(struct session *session, struct client *client, uint64_
   client->stderr_offset = stderr_offset;
   if (send_replay(client, &session->stdout_replay, "stdout", &client->stdout_offset, session->stdout_offset) != 0 ||
       send_replay(client, &session->stderr_replay, "stderr", &client->stderr_offset, session->stderr_offset) != 0) {
-    (void)send_error_exit(client->fd, 125, "spore run: requested replay offset is unavailable\n");
+    (void)send_client_error_exit(client, 125, "spore run: requested replay offset is unavailable\n");
     close_client(client);
     return -1;
   }
   if (session->exited && !session->stdout_open && !session->stderr_open) {
-    (void)send_exit_frame(client->fd, session->exit_code);
+    (void)send_client_exit(client, session->exit_code);
     close_client(client);
   }
   return 0;
@@ -1469,6 +1798,231 @@ static void pump_session_stream(struct session *session, struct client *client, 
   }
 }
 
+static void pump_session_terminal(struct session *session, struct client *client) {
+  if (!session->tty || !session->stdout_open || session->terminal_fd < 0) return;
+  unsigned char buf[MAX_FRAME_PAYLOAD];
+  for (;;) {
+    ssize_t n = read(session->terminal_fd, buf, sizeof(buf));
+    if (n > 0) {
+      (void)write_all(STDOUT_FILENO, buf, (size_t)n);
+      session->terminal_offset += (uint64_t)n;
+      if (client->fd >= 0) {
+        (void)send_client_terminal_output(client, client->terminal_offset, buf, (size_t)n);
+      }
+      continue;
+    }
+    if (n == 0) {
+      close(session->terminal_fd);
+      session->terminal_fd = -1;
+      session->stdout_fd = -1;
+      session->stdout_open = 0;
+      return;
+    }
+    if (errno == EINTR) continue;
+    if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+    close(session->terminal_fd);
+    session->terminal_fd = -1;
+    session->stdout_fd = -1;
+    session->stdout_open = 0;
+    return;
+  }
+}
+
+static void close_session_terminal_input(struct session *session) {
+  if (!session->tty) return;
+  if (session->terminal_pending_len == 0) {
+    session->terminal_pending[0] = 4;
+    session->terminal_pending_len = 1;
+    session->terminal_pending_off = 0;
+  } else {
+    session->terminal_close_pending = 1;
+  }
+}
+
+static void drain_session_terminal(struct session *session) {
+  while (session->tty && session->terminal_fd >= 0 && session->terminal_pending_off < session->terminal_pending_len) {
+    size_t remaining = session->terminal_pending_len - session->terminal_pending_off;
+    ssize_t n = write(session->terminal_fd, session->terminal_pending + session->terminal_pending_off, remaining);
+    if (n > 0) {
+      session->terminal_pending_off += (size_t)n;
+      continue;
+    }
+    if (n < 0 && errno == EINTR) continue;
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+    session->terminal_pending_len = 0;
+    session->terminal_pending_off = 0;
+    session->terminal_close_pending = 0;
+    return;
+  }
+  if (session->terminal_pending_off >= session->terminal_pending_len) {
+    session->terminal_pending_off = 0;
+    session->terminal_pending_len = 0;
+    if (session->terminal_close_pending) {
+      session->terminal_close_pending = 0;
+      close_session_terminal_input(session);
+    }
+  }
+}
+
+static void close_session_stdin(struct session *session) {
+  if (session->stdin_fd >= 0) {
+    close(session->stdin_fd);
+    session->stdin_fd = -1;
+  }
+  session->stdin_open = 0;
+  session->stdin_pending_len = 0;
+  session->stdin_pending_off = 0;
+  session->stdin_close_pending = 0;
+}
+
+static void drain_session_stdin(struct session *session) {
+  while (session->stdin_open && session->stdin_pending_off < session->stdin_pending_len) {
+    size_t remaining = session->stdin_pending_len - session->stdin_pending_off;
+    ssize_t n = write(session->stdin_fd, session->stdin_pending + session->stdin_pending_off, remaining);
+    if (n > 0) {
+      session->stdin_pending_off += (size_t)n;
+      continue;
+    }
+    if (n < 0 && errno == EINTR) continue;
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+    close_session_stdin(session);
+    return;
+  }
+  if (session->stdin_pending_off >= session->stdin_pending_len) {
+    session->stdin_pending_off = 0;
+    session->stdin_pending_len = 0;
+    if (session->stdin_close_pending) close_session_stdin(session);
+  }
+}
+
+static int parse_spio_header(struct client *client) {
+  if (memcmp(client->v1_header, SPIO_MAGIC, 4) != 0) return -1;
+  if (client->v1_header[4] != SPIO_VERSION) return -1;
+  client->v1_type = client->v1_header[5];
+  uint16_t flags = read_le16(client->v1_header + 6);
+  if (flags != 0) return -1;
+  client->v1_stream_id = read_le32(client->v1_header + 8);
+  client->v1_offset = read_le64(client->v1_header + 12);
+  client->v1_payload_len = read_le32(client->v1_header + 20);
+  if (client->v1_payload_len > MAX_FRAME_PAYLOAD) return -1;
+  client->v1_payload_read = 0;
+  return 0;
+}
+
+static int handle_spio_frame(struct session *session, struct client *client) {
+  if (client->v1_type == SPIO_DATA) {
+    if (client->v1_stream_id == SPIO_TERMINAL_STREAM) {
+      if (!session->tty || session->terminal_fd < 0) return -1;
+      if (!client->terminal_input_owner) return -1;
+      if (client->v1_offset != client->terminal_input_offset) return -1;
+      if (session->terminal_pending_len != 0) return -1;
+      memcpy(session->terminal_pending, client->v1_payload, client->v1_payload_len);
+      session->terminal_pending_len = client->v1_payload_len;
+      session->terminal_pending_off = 0;
+      client->terminal_input_offset += client->v1_payload_len;
+      session->terminal_input_offset = client->terminal_input_offset;
+      drain_session_terminal(session);
+      return 0;
+    }
+    if (client->v1_stream_id != SPIO_STDIN_STREAM) return -1;
+    if (!client->stdin_input_owner) return -1;
+    if (!session->stdin_open) return -1;
+    if (client->v1_offset != client->stdin_offset) return -1;
+    if (session->stdin_pending_len != 0) return -1;
+    memcpy(session->stdin_pending, client->v1_payload, client->v1_payload_len);
+    session->stdin_pending_len = client->v1_payload_len;
+    session->stdin_pending_off = 0;
+    client->stdin_offset += client->v1_payload_len;
+    session->stdin_offset = client->stdin_offset;
+    drain_session_stdin(session);
+    return 0;
+  }
+  if (client->v1_type == SPIO_CLOSE) {
+    if (client->v1_stream_id == SPIO_TERMINAL_STREAM) {
+      if (!session->tty || client->v1_payload_len != 0) return -1;
+      if (!client->terminal_input_owner) return -1;
+      if (client->v1_offset != client->terminal_input_offset) return -1;
+      close_session_terminal_input(session);
+      return 0;
+    }
+    if (client->v1_stream_id != SPIO_STDIN_STREAM || client->v1_payload_len != 0) return -1;
+    if (!client->stdin_input_owner) return -1;
+    if (client->v1_offset != client->stdin_offset) return -1;
+    if (session->stdin_pending_len == 0) {
+      close_session_stdin(session);
+    } else {
+      session->stdin_close_pending = 1;
+    }
+    return 0;
+  }
+  if (client->v1_type == SPIO_RESIZE) {
+    if (!session->tty || client->v1_stream_id != SPIO_TERMINAL_STREAM || client->v1_payload_len != 4) return -1;
+    uint16_t rows = read_le16(client->v1_payload);
+    uint16_t cols = read_le16(client->v1_payload + 2);
+    if (rows == 0 || cols == 0) return -1;
+    if (session->terminal_fd >= 0) (void)apply_terminal_size(session->terminal_fd, rows, cols);
+    return 0;
+  }
+  return -1;
+}
+
+static void pump_client_v1(struct session *session, struct client *client) {
+  if (client->fd < 0 || !client->protocol_v1) return;
+  if (session->stdin_pending_len != 0 || session->terminal_pending_len != 0) return;
+
+  for (;;) {
+    if (client->v1_header_len < SPIO_HEADER_LEN) {
+      ssize_t n = recv(client->fd, client->v1_header + client->v1_header_len, SPIO_HEADER_LEN - client->v1_header_len, MSG_DONTWAIT);
+      if (n > 0) {
+        client->v1_header_len += (size_t)n;
+        if (client->v1_header_len < SPIO_HEADER_LEN) return;
+        if (parse_spio_header(client) != 0) {
+          close_client(client);
+          return;
+        }
+        if (client->v1_payload_len == 0) {
+          if (handle_spio_frame(session, client) != 0) close_client(client);
+          client->v1_header_len = 0;
+          return;
+        }
+      } else if (n == 0) {
+        close_client(client);
+        return;
+      } else {
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+        close_client(client);
+        return;
+      }
+    }
+
+    while (client->v1_payload_read < client->v1_payload_len) {
+      ssize_t n = recv(client->fd, client->v1_payload + client->v1_payload_read, client->v1_payload_len - client->v1_payload_read, MSG_DONTWAIT);
+      if (n > 0) {
+        client->v1_payload_read += (size_t)n;
+        continue;
+      }
+      if (n == 0) {
+        close_client(client);
+        return;
+      }
+      if (errno == EINTR) continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+      close_client(client);
+      return;
+    }
+
+    if (handle_spio_frame(session, client) != 0) {
+      close_client(client);
+      return;
+    }
+    client->v1_header_len = 0;
+    client->v1_payload_len = 0;
+    client->v1_payload_read = 0;
+    if (session->stdin_pending_len != 0 || session->terminal_pending_len != 0) return;
+  }
+}
+
 static void poll_session_exit(struct session *session, struct client *client) {
   if (!session->started || session->exited) return;
 
@@ -1486,6 +2040,7 @@ static void poll_session_exit(struct session *session, struct client *client) {
     session->exit_code = 1;
   }
   session->exited = 1;
+  close_session_stdin(session);
 
   /*
    * Do not wait indefinitely for pipe EOF after the direct command exits;
@@ -1495,6 +2050,14 @@ static void poll_session_exit(struct session *session, struct client *client) {
     pump_session_file(session, client, 1);
     pump_session_file(session, client, 0);
     close_file_stdio(session);
+  } else if (session->tty) {
+    pump_session_terminal(session, client);
+    if (session->terminal_fd >= 0) {
+      close(session->terminal_fd);
+      session->terminal_fd = -1;
+      session->stdout_fd = -1;
+      session->stdout_open = 0;
+    }
   } else {
     pump_session_stream(session, client, 1);
     pump_session_stream(session, client, 0);
@@ -1515,7 +2078,14 @@ static void poll_session_exit(struct session *session, struct client *client) {
 static void maybe_send_session_exit(struct session *session, struct client *client) {
   if (client->fd < 0) return;
   if (!session->started || !session->exited || session->stdout_open || session->stderr_open) return;
-  if (send_exit_frame(client->fd, session->exit_code) != 0) {
+  int rc;
+  if (client->protocol_v1) {
+    rc = send_spio_timing_frame(client->fd);
+    if (rc == 0) rc = send_spio_exit(client->fd, session->exit_code);
+  } else {
+    rc = send_exit_frame(client->fd, session->exit_code);
+  }
+  if (rc != 0) {
     close_client(client);
     return;
   }
@@ -1525,7 +2095,8 @@ static void maybe_send_session_exit(struct session *session, struct client *clie
 static void maybe_send_memory_pressure(struct session *session, struct client *client) {
   if (client->fd < 0 || !session->started || session->exited || session->memory_pressure_fd < 0) return;
   drain_memory_pressure_events(session);
-  if (send_memory_pressure_frame(client->fd) != 0) {
+  int rc = client->protocol_v1 ? send_spio_event(client->fd, "memory-pressure") : send_memory_pressure_frame(client->fd);
+  if (rc != 0) {
     close_client(client);
     return;
   }
@@ -1562,16 +2133,22 @@ static void accept_request(int listener, struct session *session, struct client 
 
   close_client(client);
   client->fd = conn;
+  client->protocol_v1 = request.protocol_v1;
+  client->stdout_offset = 0;
+  client->stderr_offset = 0;
+  client->stdin_offset = 0;
+  client->stdin_input_owner = request.protocol_v1 && request.stdin_enabled;
+  client->terminal_input_owner = request.protocol_v1 && request.tty && (request.kind == REQUEST_START || request.interactive);
 
   if (request.kind == REQUEST_GENERATION) {
     if (use_rootfs && !rootfs_ready) {
-      (void)send_error_exit(client->fd, 126, rootfs_error[0] != '\0' ? rootfs_error : "spore run: rootfs unavailable\n");
+      (void)send_client_error_exit(client, 126, rootfs_error[0] != '\0' ? rootfs_error : "spore run: rootfs unavailable\n");
       close_client(client);
       return;
     }
     const char *root = generation_root_path(use_rootfs, rootfs_ready);
     if (write_generation_files(root, request.generation_params) != 0) {
-      (void)send_error_exit(client->fd, 126, "spore run: generation helper write failed\n");
+      (void)send_client_error_exit(client, 126, "spore run: generation helper write failed\n");
       close_client(client);
       return;
     }
@@ -1583,12 +2160,12 @@ static void accept_request(int listener, struct session *session, struct client 
 
   if (request.kind == REQUEST_START) {
     if (use_rootfs && !rootfs_ready) {
-      (void)send_error_exit(client->fd, 126, rootfs_error[0] != '\0' ? rootfs_error : "spore run: rootfs unavailable\n");
+      (void)send_client_error_exit(client, 126, rootfs_error[0] != '\0' ? rootfs_error : "spore run: rootfs unavailable\n");
       close_client(client);
       return;
     }
     if (network_requested && !network_ready) {
-      (void)send_error_exit(client->fd, 126, network_error[0] != '\0' ? network_error : "spore run: network unavailable\n");
+      (void)send_client_error_exit(client, 126, network_error[0] != '\0' ? network_error : "spore run: network unavailable\n");
       close_client(client);
       return;
     }
@@ -1596,7 +2173,7 @@ static void accept_request(int listener, struct session *session, struct client 
     if (request.detached) {
       int rc = start_detached(request.argv, request.envp, request.working_dir, use_rootfs, detached);
       if (rc != 0) {
-        (void)send_error_exit(client->fd, rc, "spore run: exec setup failed\n");
+        (void)send_client_error_exit(client, rc, "spore run: exec setup failed\n");
         close_client(client);
         return;
       }
@@ -1611,17 +2188,17 @@ static void accept_request(int listener, struct session *session, struct client 
         return;
       }
       if (!session_finished(session)) {
-        (void)send_error_exit(client->fd, 2, "spore run: session already started\n");
+        (void)send_client_error_exit(client, 2, "spore run: session already started\n");
         close_client(client);
         return;
       }
       // ponytail: completed-base resumes lose pipe wakeups under ReleaseSafe; keep the file fallback resumed-only.
-      file_stdio = 1;
+      file_stdio = request.tty ? 0 : 1;
       reset_session(session);
     }
-    int rc = start_session(session, request.session_id, request.argv, request.envp, request.working_dir, use_rootfs, file_stdio, request.memory_pressure);
+    int rc = start_session(session, request.session_id, request.argv, request.envp, request.working_dir, use_rootfs, file_stdio, request.memory_pressure, request.stdin_enabled, request.tty, request.terminal_rows, request.terminal_cols);
     if (rc != 0) {
-      (void)send_error_exit(client->fd, rc, "spore run: exec setup failed\n");
+      (void)send_client_error_exit(client, rc, "spore run: exec setup failed\n");
       close_client(client);
       return;
     }
@@ -1631,24 +2208,60 @@ static void accept_request(int listener, struct session *session, struct client 
   }
 
   if (!session->started || strcmp(request.session_id, session->session_id) != 0) {
-    (void)send_error_exit(client->fd, 2, "spore run: no session\n");
+    (void)send_client_error_exit(client, 2, "spore run: no session\n");
     close_client(client);
     return;
   }
 
   if (request.generation_params[0] != '\0') {
     if (use_rootfs && !rootfs_ready) {
-      (void)send_error_exit(client->fd, 126, rootfs_error[0] != '\0' ? rootfs_error : "spore run: rootfs unavailable\n");
+      (void)send_client_error_exit(client, 126, rootfs_error[0] != '\0' ? rootfs_error : "spore run: rootfs unavailable\n");
       close_client(client);
       return;
     }
     const char *root = generation_root_path(use_rootfs, rootfs_ready);
     if (write_generation_files(root, request.generation_params) != 0) {
-      (void)send_error_exit(client->fd, 126, "spore run: generation helper write failed\n");
+      (void)send_client_error_exit(client, 126, "spore run: generation helper write failed\n");
       close_client(client);
       return;
     }
     apply_generation_identity(request.generation_params);
+  }
+  if (request.protocol_v1) {
+    if (request.stdin_enabled) {
+      if (!session->stdin_capable) {
+        (void)send_client_error_exit(client, 2, "spore run: captured session has no interactive stdin\n");
+        close_client(client);
+        return;
+      }
+      if (!session->stdin_open) {
+        (void)send_client_error_exit(client, 2, "spore run: captured session stdin is closed\n");
+        close_client(client);
+        return;
+      }
+      (void)attach_client(session, client, request.stdout_offset, request.stderr_offset);
+      return;
+    }
+    if (request.tty) {
+      if (!session->tty) {
+        (void)send_client_error_exit(client, 2, "spore run: captured session has no terminal\n");
+        close_client(client);
+        return;
+      }
+      if (request.interactive && session->terminal_fd < 0) {
+        (void)send_client_error_exit(client, 2, "spore run: captured session terminal is closed\n");
+        close_client(client);
+        return;
+      }
+      if (session->terminal_fd >= 0) {
+        (void)apply_terminal_size(session->terminal_fd, request.terminal_rows, request.terminal_cols);
+      }
+      if (session->exited && !session->stdout_open) {
+        (void)send_client_exit(client, session->exit_code);
+        close_client(client);
+      }
+      return;
+    }
   }
   (void)attach_client(session, client, request.stdout_offset, request.stderr_offset);
 }
@@ -1702,6 +2315,8 @@ int main(void) {
 
   struct session session;
   memset(&session, 0, sizeof(session));
+  session.stdin_fd = -1;
+  session.terminal_fd = -1;
   session.stdout_fd = -1;
   session.stderr_fd = -1;
   session.memory_pressure_fd = -1;
@@ -1727,8 +2342,8 @@ int main(void) {
       maybe_send_session_exit(&session, &client);
     }
 
-    struct pollfd fds[6];
-    int roles[6];
+    struct pollfd fds[8];
+    int roles[8];
     nfds_t nfds = 0;
     fds[nfds].fd = listener;
     fds[nfds].events = POLLIN;
@@ -1736,13 +2351,14 @@ int main(void) {
     roles[nfds++] = 0;
     if (client.fd >= 0) {
       fds[nfds].fd = client.fd;
-      fds[nfds].events = POLLHUP | POLLERR;
+      fds[nfds].events = POLLHUP | POLLERR | (client.protocol_v1 ? POLLIN : 0);
       fds[nfds].revents = 0;
       roles[nfds++] = 1;
     }
     if (session.stdout_open && !session.file_stdio) {
       fds[nfds].fd = session.stdout_fd;
       fds[nfds].events = POLLIN | POLLHUP | POLLERR;
+      if (session.tty && session.terminal_pending_len != 0) fds[nfds].events |= POLLOUT;
       fds[nfds].revents = 0;
       roles[nfds++] = 2;
     }
@@ -1762,6 +2378,12 @@ int main(void) {
       fds[nfds].revents = 0;
       roles[nfds++] = 5;
     }
+    if (session.stdin_open && session.stdin_pending_len != 0) {
+      fds[nfds].fd = session.stdin_fd;
+      fds[nfds].events = POLLOUT | POLLERR;
+      fds[nfds].revents = 0;
+      roles[nfds++] = 6;
+    }
 
     int poll_timeout_ms = session.file_stdio && session.started && !session.exited ? 10 : 100;
     int pr = poll(fds, nfds, poll_timeout_ms);
@@ -1771,10 +2393,20 @@ int main(void) {
         if (fds[i].revents == 0) continue;
         if (roles[i] == 0 && (fds[i].revents & POLLIN)) {
           accept_request(listener, &session, &client, &detached, use_rootfs, rootfs_ready, rootfs_error, use_network, network_ready, network_error);
-        } else if (roles[i] == 1 && (fds[i].revents & (POLLHUP | POLLERR))) {
-          close_client(&client);
+        } else if (roles[i] == 1) {
+          if (fds[i].revents & POLLIN) {
+            pump_client_v1(&session, &client);
+          }
+          if (fds[i].revents & (POLLHUP | POLLERR)) {
+            close_client(&client);
+          }
         } else if (roles[i] == 2) {
-          pump_session_stream(&session, &client, 1);
+          if (session.tty) {
+            if (fds[i].revents & POLLOUT) drain_session_terminal(&session);
+            if (fds[i].revents & (POLLIN | POLLHUP | POLLERR)) pump_session_terminal(&session, &client);
+          } else {
+            pump_session_stream(&session, &client, 1);
+          }
         } else if (roles[i] == 3) {
           pump_session_stream(&session, &client, 0);
         } else if (roles[i] == 4) {
@@ -1782,9 +2414,13 @@ int main(void) {
           reap_detached_children(&detached);
         } else if (roles[i] == 5 && (fds[i].revents & (POLLPRI | POLLERR))) {
           maybe_send_memory_pressure(&session, &client);
+        } else if (roles[i] == 6) {
+          drain_session_stdin(&session);
         }
       }
     }
+    drain_session_stdin(&session);
+    drain_session_terminal(&session);
     if (session.file_stdio && !session.exited) {
       pump_session_file(&session, &client, 1);
       pump_session_file(&session, &client, 0);

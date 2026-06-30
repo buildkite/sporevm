@@ -1,4 +1,4 @@
-//! CLI adapter for `spore run`.
+//! CLI adapters for `spore run`.
 //!
 //! This module owns argv parsing glue and stdout/stderr serialization. Runtime
 //! behavior flows through `api.zig`.
@@ -18,6 +18,10 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
 
     const arena = init.arena.allocator();
     const parsed = try run_mod.parseCliArgs(args);
+    try runParsedCli(init, arena, parsed, stdout);
+}
+
+fn runParsedCli(init: std.process.Init, arena: std.mem.Allocator, parsed: run_mod.CliOptions, stdout: *Io.Writer) !void {
     var event_writer = run_mod.EventWriter.init(std.heap.page_allocator, stdout, "run");
     var raw_output = RawOutputSink{};
     const events: ?api.EventSink = switch (parsed.event_mode) {
@@ -38,6 +42,12 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         if (run_mod.isNetworkGatewayError(err)) {
             run_mod.printNetworkGatewayError(err);
             std.process.exit(1);
+        }
+        if (err == error.InteractiveStreamProtocolFailed) {
+            const classified = api.classifyFailure(err);
+            writeStderr(classified.message);
+            writeStderr("\n");
+            std.process.exit(classified.exit_code);
         }
         return err;
     };
@@ -73,6 +83,10 @@ fn runParsed(
                 error.ShellCommandArgumentCountUnsupported => failRunSetup("spore run: shell command form accepts one command string; quote it or use -- for argv", .{}),
                 else => return err,
             };
+        if (parsed.tty and command.len != 0) {
+            failRunSetup("spore run: -t with --from command execution is not supported yet; omit the command to attach", .{});
+        }
+        validateTerminalPolicy(parsed);
         return api.runFromSpore(.{
             .io = init.io,
             .environ_map = init.environ_map,
@@ -80,6 +94,8 @@ fn runParsed(
             .backend = parsed.backend,
             .spore_dir = spore_dir,
             .command = command,
+            .interactive = parsed.interactive,
+            .tty = parsed.tty,
             .vcpus = parsed.shared.vcpus,
             .guest_port = parsed.shared.guest_port,
             .timeout_ms = parsed.shared.timeout_ms,
@@ -91,6 +107,8 @@ fn runParsed(
             .events = events,
         });
     }
+
+    validateTerminalPolicy(parsed);
 
     if (parsed.capture_path != null and parsed.rootfs_path != null and parsed.image_ref == null) {
         failRunSetup("spore run: --rootfs with --capture is not portable yet; use --image so capture can record immutable rootfs identity", .{});
@@ -115,6 +133,8 @@ fn runParsed(
         .image_ref = parsed.image_ref,
         .image_pull_policy = parsed.pull_policy,
         .command = command,
+        .interactive = parsed.interactive,
+        .tty = parsed.tty,
         .memory = parsed.shared.memory,
         .vcpus = parsed.shared.vcpus,
         .guest_port = parsed.shared.guest_port,
@@ -140,10 +160,21 @@ const RawOutputSink = struct {
         switch (event) {
             .stdout => |output| fd_util.writeAllBestEffort(1, output.bytes),
             .stderr => |output| fd_util.writeAllBestEffort(2, output.bytes),
+            .terminal => |output| fd_util.writeAllBestEffort(1, output.bytes),
             else => {},
         }
     }
 };
+
+fn validateTerminalPolicy(parsed: run_mod.CliOptions) void {
+    if (!parsed.tty) return;
+    if (parsed.event_mode == .none and std.c.isatty(1) == 0) {
+        failRunSetup("spore run: -t requires stdout to be a terminal unless --events=jsonl is used", .{});
+    }
+    if (parsed.interactive and std.c.isatty(0) == 0) {
+        failRunSetup("spore run: -it requires stdin to be a terminal", .{});
+    }
+}
 
 fn writeStderr(bytes: []const u8) void {
     fd_util.writeAllBestEffort(2, bytes);

@@ -36,6 +36,18 @@ description = "Build local release archives without publishing"
 run = "mise run build && scripts/smoke-run.sh"
 description = "Smoke product spore run streaming and exit status"
 
+[tasks."smoke:run-stdin"]
+run = "mise run build && scripts/smoke-run-stdin.sh"
+description = "Smoke product spore run interactive stdin forwarding"
+
+[tasks."smoke:run-tty"]
+run = "mise run build && scripts/smoke-run-tty.sh"
+description = "Smoke product spore run one-shot TTY mode"
+
+[tasks."smoke:run-attach"]
+run = "mise run build && scripts/smoke-run-attach.sh"
+description = "Smoke product spore run interactive attach"
+
 [tasks."smoke:run-file-locking"]
 run = "mise run build && scripts/smoke-run-file-locking.sh"
 description = "Smoke product spore run guest file locking support"
@@ -63,6 +75,10 @@ description = "Smoke multi-vCPU boot, capture, run-from, and resume"
 [tasks."smoke:lifecycle"]
 run = "mise run build && scripts/smoke-lifecycle.sh"
 description = "Smoke named lifecycle create, exec, ls, and rm"
+
+[tasks."smoke:lifecycle-tty"]
+run = "mise run build && scripts/smoke-lifecycle-tty.sh"
+description = "Smoke named lifecycle interactive exec streaming"
 
 [tasks."smoke:monitor-jail"]
 run = "mise run build && scripts/smoke-monitor-jail.sh"

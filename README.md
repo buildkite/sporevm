@@ -110,6 +110,22 @@ spore run -- /bin/writeout
 `spore run` uses the managed SporeVM run kernel and the embedded minimal exec
 initrd.
 
+Forward host stdin explicitly with `-i` when the guest process should read
+input. Without `-i`, runs keep the script-friendly default and do not attach
+host stdin:
+
+```bash
+printf 'hello\n' | spore run -i -- /bin/cat
+```
+
+Allocate a guest terminal explicitly with `-t`. Use `-it` for an interactive
+shell; TTY output is a single terminal byte stream, so stdout and stderr are not
+separated in this mode:
+
+```bash
+spore run -it --image docker.io/library/alpine:3.20 -- /bin/sh
+```
+
 Override boot assets when needed:
 
 ```bash
@@ -183,6 +199,13 @@ spore exec child-0 'cat /tick; sleep 1; cat /tick'
 spore exec child-1 'cat /tick; sleep 1; cat /tick'
 ```
 
+Named exec can also be interactive when you opt in to input or a terminal:
+
+```bash
+printf 'hello\n' | spore exec -i child-0 -- /bin/cat
+spore exec -it child-0 -- /bin/sh
+```
+
 `spore create`, `spore run`, and `spore exec` run shell commands as
 `/bin/sh -lc`. Use `-- <argv...>` when you need exact argv.
 
@@ -196,13 +219,24 @@ spore run --image docker.io/library/alpine:3.20 \
   'echo warmed > /var/tmp/example'
 ```
 
-Run another command from that completed base spore, or omit the command to
-attach to the captured default session:
+Run another command from that completed base spore, or attach to the captured
+default session:
 
 ```bash
 spore run --from base.spore 'cat /var/tmp/example'
 spore run --from base.spore
 ```
+
+If the captured session was still running with a guest terminal, reattach with
+the same explicit terminal flags:
+
+```bash
+spore run -it --from live-shell.spore
+```
+
+Input attach fails closed when the captured session was not started with
+interactive stdin or a terminal. The spore contains guest process and PTY
+state, not the original host terminal connection.
 
 `--from` resumes the spore and either attaches to the captured default session
 or runs a fresh command through the restored exec agent. See
@@ -300,7 +334,11 @@ Useful focused checks:
 
 ```bash
 mise run smoke:run
+mise run smoke:run-stdin
+mise run smoke:run-tty
+mise run smoke:run-attach
 mise run smoke:run-capture
+mise run smoke:lifecycle-tty
 mise run smoke:rootfs-fanout
 mise run smoke:writable-rootfs
 mise run smoke:run-net-dns
