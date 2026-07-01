@@ -42,6 +42,18 @@ type PathFact struct {
 	Source   string  `json:"source"`
 }
 
+// NetworkCapabilities is the decoded libspore network capability contract.
+type NetworkCapabilities struct {
+	Supported         bool `json:"supported"`
+	TCPIPv4           bool `json:"tcp_ipv4"`
+	TCPIPv6           bool `json:"tcp_ipv6"`
+	UDPDNS            bool `json:"udp_dns"`
+	ExactHostPort     bool `json:"exact_host_port"`
+	StagePolicyUpdate bool `json:"stage_policy_update"`
+	BoundServices     bool `json:"bound_services"`
+	DecisionEvents    bool `json:"decision_events"`
+}
+
 // InspectBundleOptions selects local bundle metadata to inspect.
 type InspectBundleOptions struct {
 	Source     string

@@ -537,6 +537,14 @@ if err != nil {
     return err
 }
 
+network, err := client.NetworkCapabilities(ctx)
+if err != nil {
+    return err
+}
+if !network.Supported || !network.ExactHostPort || !network.BoundServices {
+    return fmt.Errorf("requested network policy is not supported by libspore")
+}
+
 bundle, err := client.InspectBundle(ctx, spore.InspectBundleOptions{
     Source: "file:///tmp/base.bundle",
 })
@@ -556,6 +564,12 @@ if err != nil {
 created, err := client.CreateNamed(ctx, spore.CreateNamedOptions{
     Name: "worker",
     NetworkEnabled: true,
+    AllowCIDRs: []string{"93.184.216.34/32"},
+    AllowHosts: []string{"example.com"},
+    NetworkRules: []spore.NetworkRule{{
+        Host:  "github.com",
+        Ports: []uint16{443},
+    }},
     BoundServices: []spore.BoundUnixService{{
         Name:      "cleanroom-gateway",
         GuestHost: "gateway.cleanroom.internal",
@@ -615,6 +629,7 @@ if err != nil {
 }
 
 _ = info
+_ = network
 _ = bundle
 _ = pulled
 _ = created
@@ -628,14 +643,25 @@ _ = named
 _ = removed
 ```
 
-The surface covers build info, context lifetime, host-info, inspect-bundle,
-pull, context-local environment variables through `SetEnv`, and named lifecycle
-`CreateNamed`, `ExecNamed`, `SnapshotNamed`, `ResumeNamed`, `RemoveNamed`, and
-`ListNamed`. `ExecNamedResult` includes the exit code, stdout, stderr, decoded
-network event JSONL, and truncation flags returned by the C JSON payload. The
-Go binding intentionally omits per-exec network policy updates in this slice;
-the underlying named lifecycle API still fails closed if that unsupported C
-option is set.
+The surface covers build info, context lifetime, host-info, network
+capabilities, inspect-bundle, pull, context-local environment variables through
+`SetEnv`, and named lifecycle `CreateNamed`, `ExecNamed`, `SnapshotNamed`,
+`ResumeNamed`, `RemoveNamed`, and `ListNamed`. `CreateNamedOptions` exposes the
+create-time network policy supported by the C ABI: `NetworkEnabled`,
+`AllowCIDRs`, `AllowHosts`, exact host/port `NetworkRules`, and
+`BoundServices` for host Unix sockets exposed to the guest. Passing CIDRs,
+hosts, exact rules, or bound services while `NetworkEnabled` is false is
+rejected by libspore instead of being silently ignored.
+
+`NetworkCapabilities` is the typed wrapper around
+`spore_network_capabilities_json`. Call it before accepting a higher-level
+policy so unsupported features can fail closed in the caller. Stage-scoped exec
+network policy updates remain unsupported today:
+`NetworkCapabilities.StagePolicyUpdate` is false, and the Go binding
+intentionally omits per-exec network policy update options rather than exposing
+a field that cannot be enforced. `ExecNamedResult` includes the exit code,
+stdout, stderr, decoded network event JSONL, and truncation flags returned by
+the C JSON payload.
 
 When setting `SPOREVM_RUNTIME_DIR`, pass an absolute directory that exists and
 is private to the current user, matching the named lifecycle registry rules.
